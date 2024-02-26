@@ -1,0 +1,26 @@
+#!/bin/sh
+
+mkdir /proc
+mount -t proc none /proc
+mkdir /sys
+mount -t sysfs none /sys
+
+udhcpc -i eth0
+
+cat <<!
+
+
+Boot took $(cut -d' ' -f1 /proc/uptime) seconds
+
+        _       _     __ _                  
+  /\/\ (_)_ __ (_)   / /(_)_ __  _   ___  __
+ /    \| | '_ \| |  / / | | '_ \| | | \ \/ /
+/ /\/\ \ | | | | | / /__| | | | | |_| |>  < 
+\/    \/_|_| |_|_| \____/_|_| |_|\__,_/_/\_\ 
+
+
+Welcome to mini_linux
+
+
+!
+exec /bin/sh
