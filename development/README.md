@@ -2,6 +2,9 @@
 Create an Azure VM with a Ubuntu 22.04 image and at least 8 cores.
 Turn off Secure Boot so we can load kernel modules.
 
+- [Linux dev environment setup](#linux-dev-environment-setup)
+- [Everyday development](#everyday-development)
+
 
 ## Linux dev environment setup
 We will run Linux in QEMU so whenever our device mapper crashes, it doesn't take down the VM.
@@ -80,4 +83,24 @@ find . | cpio -H newc -o | gzip > ../ramdisk.img
 ```bash
 cd ~/linux
 qemu-system-x86_64 -nographic -kernel arch/x86_64/boot/bzImage --append "console=tty0 console=ttyS0" -initrd ../busybox/ramdisk.img -nic user,model=rtl8139,hostfwd=tcp::5556-:8080
+```
+
+
+## Everyday development
+After modifying the kernel module, compile it with:
+```bash
+cd src
+make
+```
+Note that `Makefile` uses the headers from the `~/linux` directory, so it will only work for the Linux image above. If we want it to work for the VM we're running instructions from, we'll have to comment out that line and un-comment the line above it.
+
+Copy the compiled module to the startup directory:
+```bash
+cp hello.ko ~/busybox/_install
+find . | cpio -H newc -o | gzip > ../ramdisk.img
+```
+
+Now [run Linux](#running-linux), and load the module with:
+```bash
+insmod hello.ko
 ```
