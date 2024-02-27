@@ -50,3 +50,9 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# VSCode IntelliSense files
+*.vc.db
+*.vc.db-shm
+*.vc.db-wal
+settings.json
