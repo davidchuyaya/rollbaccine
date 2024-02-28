@@ -1,90 +1,72 @@
 # Development setup
-Create an Azure VM with a Ubuntu 22.04 image and at least 8 cores.
-Turn off Secure Boot so we can load kernel modules.
 
-- [Linux dev environment setup](#linux-dev-environment-setup)
+- [Setup](#setup)
 - [Everyday development](#everyday-development)
+- [Benchmarking](#benchmarking)
 
 
-## Linux dev environment setup
-We will run Linux in QEMU so whenever our device mapper crashes, it doesn't take down the VM.
-This section was created by referencing [Setting Up an Environment for Writing Linux Kernel Modules](https://www.youtube.com/watch?v=tPs1uRqOnlk) and [Build and run minimal Linux / Busybox systems in Qemu](https://gist.github.com/chrisdone/02e165a0004be33734ac2334f215380e).
+## Setup
+Create a Ubuntu 20.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I installed [UTM](https://mac.getutm.app/).
 
-SSH into your VM and run the following commands.
+### Creating the VM with UTM
+Download a [Ubuntu 20.04 LTS image](https://releases.ubuntu.com/focal/). I downloaded the server install image since I don't need the GUI.
 
-### Install necessary dependencies
+Configure the VM:
+- Open UTM, then click "+"
+- Virtualize
+- Linux
+- Browse, find the ISO image you downloaded earlier
+- Configure memory and CPU
+- Configure disk size
+- For the shared directory path, navigate to and select the directory of this repo (clone this repo if you haven't already).
+- Give the VM a name and save.
+
+Install Ubuntu:
+- Start the VM
+- Install Ubuntu Server
+- Enter your preferred username and password
+- Wait until the install finishes, then select "Reboot now"
+- In UTM, select CD/DVD and clear (this simulates ejecting disk)
+- Enter your username and password
+
+Start the SSH server on the VM:
+```bash
+sudo apt install -y openssh-server
+sudo service ssh restart
+```
+
+Write down the IPv4 address of the VM. It should be under the "Welcome to Ubuntu" message in the VM.
+Then execute `ssh user@ip` on your machine, where `user` is the username you chose and `ip` is the IP address of the VM. You're in!
+
+Enable sharing directories with VirtFS on the VM:
+```bash
+sudo mkdir rollbaccine
+sudo mount -t 9p -o trans=virtio share rollbaccine -oversion=9p2000.L
+sudo chown -R $USER rollbaccine
+```
+Now this repo should be visible from within the VM! Automatically mount this directory on startup with:
+```bash
+echo "share	rollbaccine	9p	trans=virtio,version=9p2000.L,rw,_netdev,nofail	0	0" | sudo tee -a /etc/fstab
+```
+
+For convenience SSHing into the VM, add the following to your machine's `~/.ssh/config`:
+```bash
+Host localvm
+  HostName 192.168.64.3
+  User davidchu
+```
+Replacing the IP address and username with your VM's.
+
+To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions.
+
+
+### Setting up the VM
+Install the necessary packages:
 ```bash
 sudo apt update
 sudo apt install -y build-essential
-# Required for building linux kernel (so we can test without crashing the kernel)
-sudo apt install -y libssl-dev flex libelf-dev bison qemu-kvm
 ```
-You will be prompted to restart packagekit.service. Let it restart.
-
-### Build the Linux kernel
-```bash
-git clone --depth=1 https://github.com/torvalds/linux.git
-cd linux
-make defconfig
-scripts/config --disable SYSTEM_TRUSTED_KEYS
-scripts/config --disable SYSTEM_REVOCATION_KEYS
-make -j8
-```
-You'll need to press enter a few times to generate some certificates. This will take a while. `-j8` makes it faster but I'm not sure if it works with the certificate generation stuff, so you can try running it without `-j8` at first.
-
-### Build Busybox
-Clone this repo so we can copy `init`, the startup script for Linux.
-```bash
-cd ~
-git clone https://github.com/davidchuyaya/rollbaccine.git
-```
-
-Now build Busybox.
-```bash
-cd ~
-git clone --depth=1 https://github.com/mirror/busybox.git
-cd busybox
-make defconfig
-make menuconfig
-# Select Settings -> Build static binary
-make -j8
-make install
-cd _install
-cp ~/rollbaccine/init .
-chmod +x init
-```
-
-Stop tty from printing a lot of errors on startup.
-```bash
-cd ~/busybox/_install
-mkdir etc
-cp ../examples/inittab etc
-vim etc/inittab 
-```
-Comment out lines starting with tty in etc/inittab.
-
-Allow Linux to access the network.
-```bash
-mkdir -p usr/share/udhcpc
-cp ../examples/udhcp/simple.script usr/share/udhcpc/default.script
-```
-
-Copy all these files into the Linux image.
-```bash
-cd ~/busybox/_install
-find . | cpio -H newc -o | gzip > ../ramdisk.img
-```
-
-> [!TIP]
-> Run the line above any time the startup directory or init script changes. You can also add files to `_install` for them to be visible to Linux.
-
-
-### Running Linux
-```bash
-cd ~/linux
-qemu-system-x86_64 -nographic -kernel arch/x86_64/boot/bzImage --append "console=tty0 console=ttyS0" -initrd ../busybox/ramdisk.img -nic user,model=rtl8139,hostfwd=tcp::5556-:8080
-```
-
+[Install the GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt).
 
 ## Everyday development
 After modifying the kernel module, compile it with:
@@ -104,3 +86,7 @@ Now [run Linux](#running-linux), and load the module with:
 ```bash
 insmod hello.ko
 ```
+
+## Benchmarking
+Create an Azure VM with a Ubuntu 22.04 image and at least 8 cores.
+Turn off Secure Boot so we can load kernel modules.
