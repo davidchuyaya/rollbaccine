@@ -46,8 +46,9 @@ sudo chown -R $USER rollbaccine
 ```
 Now this repo should be visible from within the VM! Automatically mount this directory on startup with:
 ```bash
-echo "share	rollbaccine	9p	trans=virtio,version=9p2000.L,rw,_netdev,nofail	0	0" | sudo tee -a /etc/fstab
+echo "share	/home/davidchu/rollbaccine	9p	trans=virtio,version=9p2000.L,rw,_netdev,nofail	0	0" | sudo tee -a /etc/fstab
 ```
+Replace `davidchu` with your username.
 
 For convenience SSHing into the VM, add the following to your machine's `~/.ssh/config`:
 ```bash
@@ -57,7 +58,7 @@ Host localvm
 ```
 Replacing the IP address and username with your VM's.
 
-To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions.
+To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
 
 
 ### Setting up the VM
@@ -66,25 +67,42 @@ Install the necessary packages:
 sudo apt update
 sudo apt install -y build-essential
 ```
-[Install the GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt).
+[Install the GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt) so you can push changes after developing in the VM.
+
+Outside the VM, run the following so we don't need to re-enter the password every time we SSH into the VM:
+```bash
+ssh-copy-id localvm
+```
+
 
 ## Everyday development
-After modifying the kernel module, compile it with:
+After modifying the kernel module, compile it with and install it with:
 ```bash
 cd src
 make
-```
-Note that `Makefile` uses the headers from the `~/linux` directory, so it will only work for the Linux image above. If we want it to work for the VM we're running instructions from, we'll have to comment out that line and un-comment the line above it.
-
-Copy the compiled module to the startup directory:
-```bash
-cp hello.ko ~/busybox/_install
-find . | cpio -H newc -o | gzip > ../ramdisk.img
+sudo insmod rollbaccine.ko
 ```
 
-Now [run Linux](#running-linux), and load the module with:
+> [!TIP]  
+> To view the outputs of your module, execute `sudo dmesg | tail -10`. To see all loaded kernel modules, run `sudo lsmod`.
+
+
+Now that the module is loaded, we have to create the device with `dmsetup`.
 ```bash
-insmod hello.ko
+echo "0 `sudo blockdev --getsz /dev/loop0` rollbaccine" | sudo dmsetup create rollbaccine 
+```
+Here's the syntax, explained:
+- `dmsetup create rollbaccine`: Create a device mapper and name it rollbaccine.
+- `echo ...`: A table (from stdin) of the form `logical_start_sector num_sectors target_type target_args`.
+  - `logical_start_sector`: 0, the start of the device.
+  - `num_sectors`: The number of sectors in the device. We get this with `blockdev --getsz $1`, where `$1` is the device.
+  - `target_type`: The name of the device mapper.
+  - `target_args`: None for now.
+
+Once we're done, unload the module and uninstall the module with:
+```bash
+sudo dmsetup remove rollbaccine
+sudo rmmod rollbaccine
 ```
 
 ## Benchmarking

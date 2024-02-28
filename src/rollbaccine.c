@@ -11,11 +11,12 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 }
 
 static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
-	printk(KERN_INFO "Rollbaccine map called\n");
+	// printk(KERN_INFO "Rollbaccine map called\n");
 
     switch (bio_op(bio)) {
         case REQ_OP_READ:
             printk(KERN_INFO "Read request\n");
+            zero_fill_bio(bio);
             break;
         case REQ_OP_WRITE:
 			printk(KERN_INFO "Write request\n");
@@ -29,8 +30,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         default:
             return DM_MAPIO_KILL;
     }
+
+	bio_endio(bio);
         
-	return DM_MAPIO_REMAPPED;
+	return DM_MAPIO_SUBMITTED;
 }
 
 static struct target_type rollbaccine_target = {
