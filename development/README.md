@@ -89,15 +89,15 @@ sudo insmod rollbaccine.ko
 
 Now that the module is loaded, we have to create the device with `dmsetup`.
 ```bash
-echo "0 `sudo blockdev --getsz /dev/loop0` rollbaccine" | sudo dmsetup create rollbaccine 
+echo "0 `sudo blockdev --getsz /dev/sda3` rollbaccine /dev/sda3" | sudo dmsetup create rollbaccine 
 ```
 Here's the syntax, explained:
 - `dmsetup create rollbaccine`: Create a device mapper and name it rollbaccine.
 - `echo ...`: A table (from stdin) of the form `logical_start_sector num_sectors target_type target_args`.
   - `logical_start_sector`: 0, the start of the device.
-  - `num_sectors`: The number of sectors in the device. We get this with `blockdev --getsz $1`, where `$1` is the device.
+  - `num_sectors`: The number of sectors in the device. You can get the number of sectors of a device with `blockdev --getsz $1`, where `$1` is the device.
   - `target_type`: The name of the device mapper.
-  - `target_args`: None for now.
+  - `target_args`: Device to map onto.
 
 Once we're done, unload the module and uninstall the module with:
 ```bash

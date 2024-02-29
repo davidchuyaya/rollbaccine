@@ -2,13 +2,10 @@
     "env": {
         "myIncludePath": [
             "${workspaceFolder}/src",
-            "/usr/src/linux-headers-5.4.0-172/arch/x86/include",
-            "/usr/src/linux-headers-5.4.0-172/arch/x86/include/generated",
-            "/usr/src/linux-headers-5.4.0-172/include",
-            "/usr/src/linux-headers-5.4.0-172/arch/x86/include/uapi",
-            "/usr/src/linux-headers-5.4.0-172/arch/x86/include/generated/uapi",
-            "/usr/src/linux-headers-5.4.0-172/include/uapi",
-            "/usr/src/linux-headers-5.4.0-172/include/generated/uapi"
+            "/usr/lib/modules/5.4.0-172-generic/build/arch/x86/include",
+            "/usr/lib/modules/5.4.0-172-generic/build/include",
+            "/usr/lib/modules/5.4.0-172-generic/build/arch/x86/include/generated",
+            "/usr/lib/gcc/x86_64-linux-gnu/9/include"
         ],
         "myDefines": [
             "DEBUG",
