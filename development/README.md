@@ -108,3 +108,47 @@ sudo rmmod rollbaccine
 ## Benchmarking
 Create an Azure VM with a Ubuntu 22.04 image and at least 8 cores.
 Turn off Secure Boot so we can load kernel modules.
+
+We will benchmark everything using `fio` against direct writes to RAM.
+We use RAM instead of actual disk becuase storage hardware is "noisy".
+First, create a 4GB ramdisk for testing, as described [here](https://blog.cloudflare.com/speeding-up-linux-disk-encryption). We'll use the actual disk for testing [fsync](#fsync).
+```bash
+sudo modprobe brd rd_nr=1 rd_size=4194304
+```
+There should now be a device at `/dev/ram0`.
+
+Now we will measure the throughput of having no device mapper using `fio`.
+```bash
+sudo apt install -y fio
+sudo fio --filename=/dev/ram0 --readwrite=readwrite --bs=4k --direct=1 --loops=20 --name=plain
+```
+
+
+### Passthrough
+Load the passthrough device driver and measure its throughput.
+```bash
+cd src/passthrough
+make
+sudo insmod passthrough.ko
+echo "0 `sudo blockdev --getsz /dev/ram0` passthrough /dev/ram0" | sudo dmsetup create passthrough
+sudo fio --filename=/dev/mapper/passthrough --readwrite=readwrite --bs=4k --direct=1 --loops=20 --name=passthrough
+```
+
+
+### Encryption
+Measure the throughput overhead of dm-crypt. If you already ran `dmsetup` over `/dev/ram0`, you'll need to remove it with `sudo dmsetup remove <name>`, where `<name>` is the name of the previous device mapper.
+```bash
+sudo cryptsetup luksFormat /dev/ram0
+sudo cryptsetup open --type luks /dev/ram0 secure
+sudo fio --filename=/dev/mapper/secure --readwrite=readwrite --bs=4k --direct=1 --loops=2 --name=secure
+```
+
+Measure the throughput of our custom encrypting device mapper.
+
+
+### Integrity
+Our custom integrity checker vs dm-integrity.
+
+### Fsync
+Replicating fsyncs vs flushing to disk.
+
