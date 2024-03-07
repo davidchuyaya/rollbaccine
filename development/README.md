@@ -59,12 +59,18 @@ Host localvm
   User davidchu
 ```
 Replacing the IP address and username with your VM's.
+
+Outside the VM, run the following so we don't need to re-enter the password every time we SSH into the VM:
+```bash
+ssh-copy-id localvm
+```
 </details>
 
 ## Windows Setup
 <details>
 <summary>Windows Setup</summary>
 <br>
+
 Create a Ubuntu 20.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I downloaded [oracle virtual box](https://www.virtualbox.org/wiki/Downloads).
 
 Download a [Ubuntu 20.04 LTS image](https://releases.ubuntu.com/focal/). I downloaded the server install image since I don't need the GUI.
@@ -127,11 +133,6 @@ sudo apt update
 sudo apt install -y build-essential
 ```
 [Install the GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt) so you can push changes after developing in the VM.
-
-Outside the VM, run the following so we don't need to re-enter the password every time we SSH into the VM:
-```bash
-ssh-copy-id localvm
-```
 
 
 ## Everyday development
