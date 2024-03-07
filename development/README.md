@@ -4,8 +4,10 @@
 - [Everyday development](#everyday-development)
 - [Benchmarking](#benchmarking)
 
-
-## Setup
+## Mac Setup
+<details Mac>
+<summary>Mac Setup</summary>
+<br>
 Create a Ubuntu 20.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I installed [UTM](https://mac.getutm.app/).
 
 ### Creating the VM with UTM
@@ -59,6 +61,67 @@ Host localvm
 Replacing the IP address and username with your VM's.
 
 To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
+</details>
+
+## Windows Setup
+<details>
+<summary>Windows Setup</summary>
+<br>
+# Creating the VM with Oracle Virtual Box
+
+For windows OS, download [oracle virtual box](https://www.virtualbox.org/wiki/Downloads).
+
+Download a [Ubuntu 20.04 LTS image](https://releases.ubuntu.com/focal/). I downloaded the server install image since I don't need the GUI.
+
+Configure the VM:
+
+1. Create new machine and browse to find the ISO image you downloaded earlier
+2. Create username and password
+3. Check Guest Additions (allows for shared directories between host and VM)
+4. Configure memory and CPU
+5. Configure disk size
+6. Give the VM name and save
+
+Install Ubuntu:
+
+1. Start the VM
+2. The default options for setup are sufficient
+3. Input the same username and password from earlier
+4. Check Install OpenSSH Server
+5. Wait for System to install
+
+Enabling Sharing Directories
+
+1. Select Devices>Shared Folders>Shared Folder Settings
+2. Add a new folder and select this repo to share. Set mount point to `/home/<username>/rollbaccine` and check `Auto-Mount` , `Make Permanent` 
+3. `sudo apt-get install virtualbox-guest-utils` 
+4. `sudo usermod -aG vboxsf <your_username>` for access privilege’s
+5. restart VM to see folder
+
+Setting Up SSH
+
+1. `sudo apt install net-tools`
+2. Write down your `ifconfig -a` to find IP address next to `inet` on the top left of the output command 
+3. To open a port to connect to run
+
+```makefile
+sudo ufw allow ssh
+sudo ufw status verbose
+```
+
+1. Go to Devices>Network>Network Settings, ensure `NAT` is selected and click on `Advanced`
+2. Select `Port Forwarding` and add a new entry with `Name: ssh, Protocol: TCP, Host Port: 2222, Guest Port: 22`
+3. Entering `ssh -p 2222 virtualbox-user-name@localhost` on host machine will ssh into VM!
+4. For convenience SSHing into the VM, add the following to your host machine's `~/.ssh/config`:
+
+```
+Host localvm
+  HostName localhost
+  Port 2222
+  User <vm_username>
+```
+5. To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
+</details>
 
 
 ### Setting up the VM
