@@ -59,17 +59,13 @@ Host localvm
   User davidchu
 ```
 Replacing the IP address and username with your VM's.
-
-To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
 </details>
 
 ## Windows Setup
 <details>
 <summary>Windows Setup</summary>
 <br>
-# Creating the VM with Oracle Virtual Box
-
-For windows OS, download [oracle virtual box](https://www.virtualbox.org/wiki/Downloads).
+Create a Ubuntu 20.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I downloaded [oracle virtual box](https://www.virtualbox.org/wiki/Downloads).
 
 Download a [Ubuntu 20.04 LTS image](https://releases.ubuntu.com/focal/). I downloaded the server install image since I don't need the GUI.
 
@@ -92,27 +88,26 @@ Install Ubuntu:
 
 Enabling Sharing Directories
 
-1. Select Devices>Shared Folders>Shared Folder Settings
-2. Add a new folder and select this repo to share. Set mount point to `/home/<username>/rollbaccine` and check `Auto-Mount` , `Make Permanent` 
+1. Select `Devices>Shared Folders>Shared Folder Settings`
+2. Add a new folder and select this repo to share. Set mount point to `/home/<username>/rollbaccine` and check `Auto-Mount`, `Make Permanent` 
 3. `sudo apt-get install virtualbox-guest-utils` 
 4. `sudo usermod -aG vboxsf <your_username>` for access privilege’s
-5. restart VM to see folder
+5. restart VM to see `rollbaccine` folder
 
 Setting Up SSH
 
 1. `sudo apt install net-tools`
-2. Write down your `ifconfig -a` to find IP address next to `inet` on the top left of the output command 
-3. To open a port to connect to run
-
-```makefile
+2. Run `ifconfig -a` to find IP address next to `inet` on the top left of the output command and write it down
+3. To open a port and allow the host machine to connect the VM run
+```
 sudo ufw allow ssh
 sudo ufw status verbose
 ```
 
-1. Go to Devices>Network>Network Settings, ensure `NAT` is selected and click on `Advanced`
-2. Select `Port Forwarding` and add a new entry with `Name: ssh, Protocol: TCP, Host Port: 2222, Guest Port: 22`
-3. Entering `ssh -p 2222 virtualbox-user-name@localhost` on host machine will ssh into VM!
-4. For convenience SSHing into the VM, add the following to your host machine's `~/.ssh/config`:
+4. Go to `Devices>Network>Network Settings`, ensure `NAT` is selected and click on `Advanced`
+5. Select `Port Forwarding` and add a new entry with `Name: ssh, Protocol: TCP, Host Port: 2222, Guest Port: 22`
+6. Now entering `ssh -p 2222 virtualbox-user-name@localhost` on host machine will ssh into VM!
+7. For convenience SSHing into the VM, add the following to your host machine's `~/.ssh/config`:
 
 ```
 Host localvm
@@ -120,8 +115,9 @@ Host localvm
   Port 2222
   User <vm_username>
 ```
-5. To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
 </details>
+
+ To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
 
 
 ### Setting up the VM
