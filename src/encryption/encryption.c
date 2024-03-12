@@ -46,6 +46,8 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         return -EINVAL;
     }
 
+    // initialize cipher handle (instance) of sha256
+    // look into other params?
     rbd->alg = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(rbd->alg))
     {
@@ -55,7 +57,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
     struct crypt *sdesc;
     int size;
-
+    // allocate size of struct + size of operational state for algorithm
     size = sizeof(struct crypt) + crypto_shash_descsize(rbd->alg);
     rbd->encryptor = kmalloc(size, GFP_KERNEL);
     if (!rbd->encryptor)
@@ -63,8 +65,9 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         pr_info("can't alloc encryptor\n");
         return PTR_ERR(sdesc);
     }
+    // Setting our algorithm for encryption to sha256
     rbd->encryptor->shash.tfm = rbd->alg;
-    //rbd->encryptor->shash.flags = 0x0;
+    // rbd->encryptor->shash.flags = 0x0;
     ti->private = rbd;
 
     return 0;
@@ -77,6 +80,7 @@ static void encryption_destructor(struct dm_target *ti)
     struct encryption_device *rbd = ti->private;
     dm_put_device(ti, rbd->dev);
     crypto_free_shash(rbd->alg);
+    kfree(rbd->encryptor);
     kfree(rbd);
 }
 
@@ -94,12 +98,17 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     if (bio_has_data(bio))
     {
         ret = crypto_shash_digest(&rbd->encryptor->shash, bio_data(bio), SHA256_LENGTH, digest);
-        if (ret == 0)
-        {
-            int i;
-            for (i = 0; i < sizeof(digest); i++)
-                printk(KERN_INFO "%02x", digest[i]);
+        if (ret) {
+            // TODO: Error Handling
+            pr_err("error ret = %d", ret);
+            return -1
         }
+        // if (ret == 0)
+        // {
+        //     int i;
+        //     for (i = 0; i < sizeof(digest); i++)
+        //         printk(KERN_INFO "%02x", digest[i]);
+        // }
     }
 
     return DM_MAPIO_REMAPPED;
