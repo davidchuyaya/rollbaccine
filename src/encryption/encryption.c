@@ -5,6 +5,17 @@
 #include <linux/crypto.h>
 #include <crypto/internal/hash.h> /* SHA-256 Hash*/
 #include <linux/bio.h>
+#include <linux/scatterlist.h>
+#include <linux/string.h>
+#include <linux/gfp.h>
+#include <linux/err.h>
+#include <linux/jiffies.h>
+#include <linux/timex.h>
+#include <linux/random.h>
+#include <crypto/skcipher.h>
+#include <crypto/hash.h>
+#include <crypto/if_alg.h>
+#include <crypto/drbg.h>
 
 #define DM_MSG_PREFIX "encryption"
 
@@ -25,6 +36,15 @@ struct encryption_device
     // documentation: https://elixir.bootlin.com/linux/latest/source/include/crypto/hash.h
     struct crypto_shash *alg;
     struct crypt *encryptor;
+    // AES-CBC
+    // TODO: alloc on heap
+    struct scatterlist sg;
+    // transform
+    struct crypto_skcipher *skcipher;
+    struct skcipher_request *req;
+    struct crypto_wait wait;
+    char *ivdata;
+    char *key;
 };
 
 static int encryption_constructor(struct dm_target *ti, unsigned int argc, char **argv)
@@ -46,6 +66,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         return -EINVAL;
     }
 
+    /* Set up fields needed for checksums */
     // initialize cipher handle (instance) of sha256
     // look into other params?
     rbd->alg = crypto_alloc_shash("sha256", 0, 0);
@@ -68,9 +89,56 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // Setting our algorithm for encryption to sha256
     rbd->encryptor->shash.tfm = rbd->alg;
     // rbd->encryptor->shash.flags = 0x0;
+
+    /* Set up fields needed for Encryption */
+    rbd->skcipher->tfm = crypto_alloc_skcipher("cbc-aes-aesni", 0, 0);
+    if (IS_ERR(skcipher)) {
+        pr_info("could not allocate skcipher handle\n");
+        return PTR_ERR(skcipher);
+    }
+
+    rbd->req = skcipher_request_alloc(rbd->skcipher, GFP_KERNEL);
+    if (!req) {
+        pr_info("could not allocate skcipher request\n");
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    skcipher_request_set_callback(rbd->req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &rbd->wait);
+
+    /* AES 256 with random key */
+    rbd->key = kmalloc(128, GFP_KERNEL);
+    if (!rbd->key) {
+        pr_info("could not allocate key\n");
+        goto out;
+    }
+    get_random_bytes(&rbd->key, 128);
+    if (crypto_skcipher_setkey(rbd->skcipher, key, 128)) {
+        pr_info("key could not be set\n");
+        ret = -EAGAIN;
+        goto out;
+    }
+
+    /* IV will be random */
+    rbd->ivdata = kmalloc(128, GFP_KERNEL);
+    if (!rbd->ivdata) {
+        pr_info("could not allocate ivdata\n");
+        goto out;
+    }
+    get_random_bytes(rbd->ivdata, 128);
+
     ti->private = rbd;
 
     return 0;
+
+    out:
+        if (rbd->skcipher)
+            crypto_free_skcipher(skcipher);
+        if (rbd->req)
+            skcipher_request_free(req);
+        if (rbd->ivdata)
+            kfree(ivdata);
+    return ret;
 }
 
 static void encryption_destructor(struct dm_target *ti)
@@ -103,6 +171,9 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
             pr_err("error ret = %d", ret);
             return -1
         }
+        sg_init_one(&rbd->sg, bio_data(bio), 4096);
+        skcipher_request_set_crypt(rbd->req, &rbd->sg, &rbd->sg, 4096, ivdata);
+        crypto_init_wait(&rbd->wait);
         // if (ret == 0)
         // {
         //     int i;
@@ -110,6 +181,21 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         //         printk(KERN_INFO "%02x", digest[i]);
         // }
     }
+    
+    int rc;
+    switch (bio_op(bio)) {
+        case REQ_OP_READ:
+            printk(KERN_INFO "Read request\n");
+            rc = crypto_wait_req(crypto_skcipher_decrypt(rbd->req), &rbd->wait);
+            break;
+        case REQ_OP_WRITE:
+			printk(KERN_INFO "Write request\n");
+            rc = crypto_wait_req(crypto_skcipher_encrypt(rbd->req), &rbd->wait);
+
+			break;
+    }
+    if (rc)
+            pr_info(KERN_INFO "skcipher encrypt returned with result %d\n", rc);
 
     return DM_MAPIO_REMAPPED;
 }
