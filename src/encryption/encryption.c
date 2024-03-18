@@ -20,7 +20,6 @@
 #define DM_MSG_PREFIX "encryption"
 
 #define SHA256_LENGTH 256
-#define BLOCK_SIZE 4096
 #define IVLEN 36
 
 
@@ -36,9 +35,11 @@ struct encrypt_ctx {
     struct crypto_skcipher *tfm;
     // TODO (verify logic): make request to hw chip?
     struct skcipher_request *req;
+    struct scatterlist sg;
+
     // generic implementation struct for waiting for crypto op to complete
     struct crypto_wait wait;
-}
+};
 
 // Data attached to each bio
 struct encryption_device
@@ -50,14 +51,13 @@ struct encryption_device
     struct crypt *encryptor;
     // AES-CBC
     // TODO: alloc on heap
-    struct scatterlist sg;
     struct encrypt_ctx* skcipher_handle;
     // persist key
     char *key;
 };
 
 
-void cleanup(void)
+void cleanup(struct encryption_device* rbd)
 {
     if (rbd->key)
         kfree(rbd->key);
@@ -68,7 +68,7 @@ void cleanup(void)
     if (rbd->skcipher_handle)
         kfree(rbd->skcipher_handle);
     if (rbd->encryptor)
-        kfree(encryptor);
+        kfree(rbd->encryptor);
     if (rbd->alg)
         crypto_free_shash(rbd->alg);
     if (rbd)
@@ -101,16 +101,15 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // initialize cipher handle (instance) of sha256
     // look into other params?
     // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
-    rbd->alg = crypto_alloc_shash("sha256", 0, CRYPTO_ALG_ASYNC)
+    rbd->alg = crypto_alloc_shash("sha256", 0, CRYPTO_ALG_ASYNC);
     if (IS_ERR(rbd->alg))
     {
         ti->error = "Cannot allocate algorithm sha56";
         ret = -ENOMEM;
         goto out;
     }
-    int size;
     // allocate size of struct + size of operational state for algorithm
-    size = sizeof(struct crypt) + crypto_shash_descsize(rbd->alg);
+    int size = sizeof(struct crypt) + crypto_shash_descsize(rbd->alg);
     rbd->encryptor = kmalloc(size, GFP_KERNEL);
     if (rbd->encryptor == NULL)
     {
@@ -123,7 +122,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // rbd->encryptor->shash.flags = 0x0;
 
     /* Initialize Encryption Structs*/
-    rbd->skcipher_handle = kmalloc(sizeof(struct encrypt_ctx), GFP_KERNEL)
+    rbd->skcipher_handle = kmalloc(sizeof(struct encrypt_ctx), GFP_KERNEL);
     if (rbd->skcipher_handle == NULL) {
         ti->error = "Cannot allocate skcipher_handle";
         ret = -ENOMEM;
@@ -138,8 +137,8 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     }
 
     /* Create a request */
-    rbd->skcipher_handle->req = skcipher_request_alloc(rbd->skcipher, GFP_KERNEL);
-    if (!rbd->skcipher_handle->req) {
+    rbd->skcipher_handle->req = skcipher_request_alloc(rbd->skcipher_handle->tfm, GFP_KERNEL);
+    if (!rbd->skcipher_handle->tfm) {
         ti->error = "could not allocate skcipher request";
         ret = -ENOMEM;
         goto out;
@@ -163,7 +162,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     }
     get_random_bytes(&rbd->key, 32);
 
-    if (crypto_skcipher_setkey(rbd->skcipher, key, 32)) {
+    if (crypto_skcipher_setkey(rbd->skcipher_handle->tfm, rbd->key, 32)) {
         ti->error = "Key could not be set";
         ret = -EAGAIN;
         goto out;
@@ -174,20 +173,23 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     return 0;
 
     out:
-        cleanup();
+        cleanup(rbd);
     return ret;
 }
 
 
 static unsigned int skcipher_encdec(struct encrypt_ctx *sk, int enc) {
     int rc;
-    if (enc)
+    if (enc) {
         rc = crypto_wait_req(crypto_skcipher_encrypt(sk->req), &sk->wait);
-    else
+    }
+    else {
         rc = crypto_wait_req(crypto_skcipher_decrypt(sk->req), &sk->wait);
-	if (rc)
+    }
+	if (rc) {
 		pr_info(KERN_INFO "skcipher encrypt returned with result %d\n", rc);
-    return rc;  
+    }
+    return rc;
 }
 
 static void encryption_destructor(struct dm_target *ti)
@@ -196,14 +198,15 @@ static void encryption_destructor(struct dm_target *ti)
 
     struct encryption_device *rbd = ti->private;
     dm_put_device(ti, rbd->dev);
-    cleanup();
+    cleanup(rbd);
 }
 
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
     // printk(KERN_INFO "encryption map called\n");
-    int ret;
+    int ret = 0;
     unsigned char digest[256];
+    char *ivdata;
     struct encryption_device *rbd = ti->private;
     
     ivdata = kmalloc(IVLEN, GFP_KERNEL);
@@ -218,12 +221,11 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         ret = crypto_shash_digest(&rbd->encryptor->shash, bio_data(bio), SHA256_LENGTH, digest);
         if (ret) {
             // TODO: Error Handling
-            pr_err("error ret = %d", ret);
-            return -1
+            goto out;
         }
         sg_init_one(&rbd->skcipher_handle->sg, bio_data(bio), BLOCK_SIZE);
         skcipher_request_set_crypt(rbd->skcipher_handle->req, &rbd->skcipher_handle->sg, &rbd->skcipher_handle->sg, BLOCK_SIZE, ivdata);
-        crypto_init_wait(&rbd->wait);
+        crypto_init_wait(&rbd->skcipher_handle->wait);
         // if (ret == 0)
         // {
         //     int i;
@@ -233,21 +235,19 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     }
     switch (bio_op(bio)) {
         case REQ_OP_READ:
-            ret = skcipher_encdec(rbd->skcipher_handle, 1)
+            ret = skcipher_encdec(rbd->skcipher_handle, 1);
             break;
         case REQ_OP_WRITE:
-			ret = skcipher_encdec(rbd->skcipher_handle, 1)
+			ret = skcipher_encdec(rbd->skcipher_handle, 1);
             break;
-
-			break;
     }
-    if (rc)
+    if (ret)
         goto out;
 
     return DM_MAPIO_REMAPPED;
 
     out:
-        cleanup();
+        cleanup(rbd);
 
     return ret;
 }
