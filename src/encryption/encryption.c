@@ -101,7 +101,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // initialize cipher handle (instance) of sha256
     // look into other params?
     // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
-    rbd->alg = crypto_alloc_shash("sha256", 0, CRYPTO_ALG_ASYNC);
+    rbd->alg = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(rbd->alg))
     {
         ti->error = "Cannot allocate algorithm sha56";
@@ -129,7 +129,8 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         goto out;
     }
 
-    rbd->skcipher_handle->tfm = crypto_alloc_skcipher("cbc-aes-aesni", 0, CRYPTO_ALG_ASYNC);
+    // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
+    rbd->skcipher_handle->tfm = crypto_alloc_skcipher("cbc-aes-aesni", 0, 0);
     if (IS_ERR(rbd->skcipher_handle->tfm)) {
         ti->error = "Cannot allocate skcipher_handle transform";
         ret = -ENOMEM;
@@ -160,7 +161,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         ret = -ENOMEM;
         goto out;
     }
-    get_random_bytes(&rbd->key, 32);
+    get_random_bytes(rbd->key, 32);
 
     if (crypto_skcipher_setkey(rbd->skcipher_handle->tfm, rbd->key, 32)) {
         ti->error = "Key could not be set";
@@ -232,8 +233,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         //     for (i = 0; i < sizeof(digest); i++)
         //         printk(KERN_INFO "%02x", digest[i]);
         // }
-    }
-    switch (bio_op(bio)) {
+        switch (bio_op(bio)) {
         case REQ_OP_READ:
             ret = skcipher_encdec(rbd->skcipher_handle, 1);
             break;
@@ -241,6 +241,8 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
 			ret = skcipher_encdec(rbd->skcipher_handle, 1);
             break;
     }
+    }
+   
     if (ret)
         goto out;
 
