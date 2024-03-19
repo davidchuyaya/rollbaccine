@@ -23,12 +23,6 @@
 #define IVLEN 36
 
 
-// Struct that contains that actual synchronous hash
-// stored seperately since size of struct needs to include operational state of hash
-struct crypt
-{
-    struct shash_desc shash;
-};
 
 struct encrypt_ctx {
     // symmetric key algorithm instance
@@ -45,12 +39,7 @@ struct encrypt_ctx {
 struct encryption_device
 {
     struct dm_dev *dev;
-    // Synchronous cryptographic hash type
-    // documentation: https://elixir.bootlin.com/linux/latest/source/include/crypto/hash.h
-    struct crypto_shash *alg;
-    struct crypt *encryptor;
     // AES-CBC
-    // TODO: alloc on heap
     struct encrypt_ctx* skcipher_handle;
     // persist key
     char *key;
@@ -67,10 +56,6 @@ void cleanup(struct encryption_device* rbd)
         crypto_free_skcipher(rbd->skcipher_handle->tfm);
     if (rbd->skcipher_handle)
         kfree(rbd->skcipher_handle);
-    if (rbd->encryptor)
-        kfree(rbd->encryptor);
-    if (rbd->alg)
-        crypto_free_shash(rbd->alg);
     if (rbd)
         kfree(rbd);
 }
@@ -101,24 +86,6 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // initialize cipher handle (instance) of sha256
     // look into other params?
     // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
-    rbd->alg = crypto_alloc_shash("sha256", 0, 0);
-    if (IS_ERR(rbd->alg))
-    {
-        ti->error = "Cannot allocate algorithm sha56";
-        ret = -ENOMEM;
-        goto out;
-    }
-    // allocate size of struct + size of operational state for algorithm
-    int size = sizeof(struct crypt) + crypto_shash_descsize(rbd->alg);
-    rbd->encryptor = kmalloc(size, GFP_KERNEL);
-    if (rbd->encryptor == NULL)
-    {
-        ti->error = "Cannot allocate crypt instance";
-        ret = -ENOMEM;
-        goto out;
-    }
-    // Setting our algorithm for encryption to sha256
-    rbd->encryptor->shash.tfm = rbd->alg;
     // rbd->encryptor->shash.flags = 0x0;
 
     /* Initialize Encryption Structs*/
@@ -144,6 +111,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         ret = -ENOMEM;
         goto out;
     }
+    printk(KERN_INFO "encryption algorithm instance and request instance initialized properly\n");
     /* Assign callback to request 
 
      Once hardware chip finishes encryption, notifies CPU 
@@ -152,7 +120,8 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
      */
 
      // TODO: learn more about callback function being called twice
-    skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &rbd->skcipher_handle->wait);
+    //skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &rbd->skcipher_handle->wait);
+    printk(KERN_INFO "callback properly initialized\n");
 
     /* AES 256 with random key */
     rbd->key = kmalloc(32, GFP_KERNEL);
@@ -162,7 +131,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         goto out;
     }
     get_random_bytes(rbd->key, 32);
-
+    printk(KERN_INFO "key properly initialized\n");
     if (crypto_skcipher_setkey(rbd->skcipher_handle->tfm, rbd->key, 32)) {
         ti->error = "Key could not be set";
         ret = -EAGAIN;
@@ -204,7 +173,7 @@ static void encryption_destructor(struct dm_target *ti)
 
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
-    // printk(KERN_INFO "encryption map called\n");
+    printk(KERN_INFO "encryption map called\n");
     int ret = 0;
     unsigned char digest[256];
     char *ivdata;
@@ -219,20 +188,9 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     get_random_bytes(ivdata, IVLEN);
     if (bio_has_data(bio))
     {
-        ret = crypto_shash_digest(&rbd->encryptor->shash, bio_data(bio), SHA256_LENGTH, digest);
-        if (ret) {
-            // TODO: Error Handling
-            goto out;
-        }
         sg_init_one(&rbd->skcipher_handle->sg, bio_data(bio), BLOCK_SIZE);
         skcipher_request_set_crypt(rbd->skcipher_handle->req, &rbd->skcipher_handle->sg, &rbd->skcipher_handle->sg, BLOCK_SIZE, ivdata);
         crypto_init_wait(&rbd->skcipher_handle->wait);
-        // if (ret == 0)
-        // {
-        //     int i;
-        //     for (i = 0; i < sizeof(digest); i++)
-        //         printk(KERN_INFO "%02x", digest[i]);
-        // }
         switch (bio_op(bio)) {
         case REQ_OP_READ:
             ret = skcipher_encdec(rbd->skcipher_handle, 1);
@@ -240,7 +198,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         case REQ_OP_WRITE:
 			ret = skcipher_encdec(rbd->skcipher_handle, 1);
             break;
-    }
+        }
     }
    
     if (ret)
