@@ -8,10 +8,10 @@
 <details Mac>
 <summary>Mac Setup</summary>
 <br>
-Create a Ubuntu 20.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I installed [UTM](https://mac.getutm.app/).
+Create a Ubuntu 22.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I installed [UTM](https://mac.getutm.app/).
 
 ### Creating the VM with UTM
-Download a [Ubuntu 20.04 LTS image](https://releases.ubuntu.com/focal/). I downloaded the server install image since I don't need the GUI.
+Download a [Ubuntu 22.04 LTS image](https://releases.ubuntu.com/jammy/). I downloaded the server install image since I don't need the GUI.
 
 Configure the VM:
 - Open UTM, then click "+"
@@ -71,9 +71,9 @@ ssh-copy-id localvm
 <summary>Windows Setup</summary>
 <br>
 
-Create a Ubuntu 20.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I downloaded [oracle virtual box](https://www.virtualbox.org/wiki/Downloads).
+Create a Ubuntu 22.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I downloaded [oracle virtual box](https://www.virtualbox.org/wiki/Downloads).
 
-Download a [Ubuntu 20.04 LTS image](https://releases.ubuntu.com/focal/). I downloaded the server install image since I don't need the GUI.
+Download a [Ubuntu 22.04 LTS image](https://releases.ubuntu.com/jammy/). I downloaded the server install image since I don't need the GUI.
 
 Configure the VM:
 
@@ -105,7 +105,7 @@ Setting Up SSH
 1. `sudo apt install net-tools`
 2. Run `ifconfig -a` to find IP address next to `inet` on the top left of the output command and write it down
 3. To open a port and allow the host machine to connect the VM run
-```
+```bash
 sudo ufw allow ssh
 sudo ufw status verbose
 ```
@@ -115,7 +115,7 @@ sudo ufw status verbose
 6. Now entering `ssh -p 2222 virtualbox-user-name@localhost` on host machine will ssh into VM!
 7. For convenience SSHing into the VM, add the following to your host machine's `~/.ssh/config`:
 
-```
+```bash
 Host localvm
   HostName localhost
   Port 2222
@@ -199,7 +199,7 @@ sudo fio --filename=/dev/mapper/passthrough --readwrite=readwrite --bs=4k --dire
 Measure the throughput overhead of dm-crypt. If you already ran `dmsetup` over `/dev/ram0`, you'll need to remove it with `sudo dmsetup remove <name>`, where `<name>` is the name of the previous device mapper.
 ```bash
 sudo cryptsetup luksFormat /dev/ram0
-sudo cryptsetup open --type luks /dev/ram0 secure
+sudo cryptsetup open --perf-no_read_workqueue --perf-no_write_workqueue --type luks /dev/ram0 secure
 sudo fio --filename=/dev/mapper/secure --readwrite=readwrite --bs=4k --direct=1 --loops=2 --name=secure
 ```
 

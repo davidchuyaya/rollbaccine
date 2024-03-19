@@ -52,7 +52,10 @@ Mkfile.old
 dkms.conf
 
 # VSCode IntelliSense files
-*.vc.db
-*.vc.db-shm
-*.vc.db-wal
+*.db
+*.db-shm
+*.db-wal
 settings.json
+
+# Mac stuff
+.DS_Store

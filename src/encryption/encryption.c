@@ -196,7 +196,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
             ret = skcipher_encdec(rbd->skcipher_handle, 1);
             break;
         case REQ_OP_WRITE:
-			ret = skcipher_encdec(rbd->skcipher_handle, 1);
+			      ret = skcipher_encdec(rbd->skcipher_handle, 0);
             break;
         }
     }

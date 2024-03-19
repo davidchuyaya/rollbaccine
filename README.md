@@ -5,7 +5,7 @@ We will use a device mapper to intercept blocks from the file system to the devi
 2. Check integrity on all sectors, forcing recovery on failure. The checksums are kept in memory.
 3. Replicate all writes to `2f+1` replicas and wait for `f+1` responses before returning from fsync. The leader of this "consensus" is elected through a simple protocol; reconfiguration is performed through CCF.
 
-See how to set up a development environment [here](development).
+See how to set up a development environment [here](src).
 
 ### The old implementation
 See [disk-tees](https://github.com/davidchuyaya/disk-tees) for the previous implementation using FUSE. There are multiple problems with this approach:
