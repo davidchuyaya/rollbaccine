@@ -56,3 +56,6 @@ dkms.conf
 *.db-shm
 *.db-wal
 settings.json
+
+# Mac stuff
+.DS_Store
