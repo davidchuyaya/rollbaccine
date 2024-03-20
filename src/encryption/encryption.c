@@ -194,7 +194,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         // TODO: learn more about callback function being called twice
         skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
         printk(KERN_INFO "callback properly initialized\n");
-        skcipher_request_set_crypt(rbd->skcipher_handle->req, &rbd->skcipher_handle->sg, &rbd->skcipher_handle->sg, BLOCK_SIZE, ivdata);
+        skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, BLOCK_SIZE, ivdata);
         crypto_init_wait(&rbd->skcipher_handle->wait);
         switch (bio_data_dir(bio)) {
         case WRITE:
