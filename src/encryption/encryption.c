@@ -29,7 +29,6 @@ struct encrypt_ctx {
     struct crypto_skcipher *tfm;
     // TODO (verify logic): make request to hw chip?
     struct skcipher_request *req;
-    struct scatterlist sg;
 
     // generic implementation struct for waiting for crypto op to complete
     struct crypto_wait wait;
@@ -95,16 +94,18 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         ret = -ENOMEM;
         goto out;
     }
+    printk(KERN_INFO "cipher handle properly initialized\n");
 
-    // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
-    rbd->skcipher_handle->tfm = crypto_alloc_skcipher("cbc-aes-aesni", 0, 0);
+    // // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
+    rbd->skcipher_handle->tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
     if (IS_ERR(rbd->skcipher_handle->tfm)) {
         ti->error = "Cannot allocate skcipher_handle transform";
         ret = -ENOMEM;
         goto out;
     }
+    printk(KERN_INFO "transform properly initialized\n");
 
-    /* Create a request */
+    // /* Create a request */
     rbd->skcipher_handle->req = skcipher_request_alloc(rbd->skcipher_handle->tfm, GFP_KERNEL);
     if (!rbd->skcipher_handle->tfm) {
         ti->error = "could not allocate skcipher request";
@@ -118,10 +119,6 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
      via IRQ handler and executes callback (crypto_req_done)
      once request processsed 
      */
-
-     // TODO: learn more about callback function being called twice
-    //skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &rbd->skcipher_handle->wait);
-    printk(KERN_INFO "callback properly initialized\n");
 
     /* AES 256 with random key */
     rbd->key = kmalloc(32, GFP_KERNEL);
@@ -173,11 +170,14 @@ static void encryption_destructor(struct dm_target *ti)
 
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
-    printk(KERN_INFO "encryption map called\n");
+    //printk(KERN_INFO "encryption map called\n");
     int ret = 0;
     unsigned char digest[256];
     char *ivdata;
     struct encryption_device *rbd = ti->private;
+
+    bio_set_dev(bio, rbd->dev->bdev);
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     
     ivdata = kmalloc(IVLEN, GFP_KERNEL);
     if (ivdata == NULL) {
@@ -186,24 +186,29 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         goto out;
     }
     get_random_bytes(ivdata, IVLEN);
+    
     if (bio_has_data(bio))
     {
-        sg_init_one(&rbd->skcipher_handle->sg, bio_data(bio), BLOCK_SIZE);
+        struct scatterlist sg;
+        sg_init_one(&sg, bio_data(bio), BLOCK_SIZE);
+        // TODO: learn more about callback function being called twice
+        skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
+        printk(KERN_INFO "callback properly initialized\n");
         skcipher_request_set_crypt(rbd->skcipher_handle->req, &rbd->skcipher_handle->sg, &rbd->skcipher_handle->sg, BLOCK_SIZE, ivdata);
         crypto_init_wait(&rbd->skcipher_handle->wait);
-        switch (bio_op(bio)) {
-        case REQ_OP_READ:
-            ret = skcipher_encdec(rbd->skcipher_handle, 1);
+        switch (bio_data_dir(bio)) {
+        case WRITE:
+            ret = skcipher_encdec(rbd->skcipher_handle, WRITE);
             break;
-        case REQ_OP_WRITE:
-			      ret = skcipher_encdec(rbd->skcipher_handle, 0);
+        case READ:
+			ret = skcipher_encdec(rbd->skcipher_handle, READ);
             break;
         }
     }
-   
+    kfree(ivdata);
     if (ret)
         goto out;
-
+    printk(KERN_INFO "encryption map finished succesfully\n");
     return DM_MAPIO_REMAPPED;
 
     out:
