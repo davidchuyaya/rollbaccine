@@ -18,7 +18,8 @@
 #include <crypto/drbg.h>
 
 #define DM_MSG_PREFIX "encryption"
-
+#define WRITE 1
+#define READ 0
 #define SHA256_LENGTH 256
 #define IVLEN 36
 
@@ -97,7 +98,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     }
 
     // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
-    rbd->skcipher_handle->tfm = crypto_alloc_skcipher("cbc-aes-aesni", 0, 0);
+    rbd->skcipher_handle->tfm = crypto_alloc_skcipher("cbc-aes-aesni", 0, CRYPTO_ALG_ASYNC);
     if (IS_ERR(rbd->skcipher_handle->tfm)) {
         ti->error = "Cannot allocate skcipher_handle transform";
         ret = -ENOMEM;
@@ -106,7 +107,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
     /* Create a request */
     rbd->skcipher_handle->req = skcipher_request_alloc(rbd->skcipher_handle->tfm, GFP_KERNEL);
-    if (!rbd->skcipher_handle->tfm) {
+    if (!rbd->skcipher_handle->req) {
         ti->error = "could not allocate skcipher request";
         ret = -ENOMEM;
         goto out;
@@ -120,7 +121,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
      */
 
      // TODO: learn more about callback function being called twice
-    //skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &rbd->skcipher_handle->wait);
+    skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
     printk(KERN_INFO "callback properly initialized\n");
 
     /* AES 256 with random key */
@@ -175,9 +176,11 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
     printk(KERN_INFO "encryption map called\n");
     int ret = 0;
-    unsigned char digest[256];
     char *ivdata;
     struct encryption_device *rbd = ti->private;
+
+    bio_set_dev(bio, rbd->dev->bdev);
+    //bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     
     ivdata = kmalloc(IVLEN, GFP_KERNEL);
     if (ivdata == NULL) {
@@ -186,25 +189,27 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         goto out;
     }
     get_random_bytes(ivdata, IVLEN);
-    if (bio_has_data(bio))
-    {
-        sg_init_one(&rbd->skcipher_handle->sg, bio_data(bio), BLOCK_SIZE);
-        skcipher_request_set_crypt(rbd->skcipher_handle->req, &rbd->skcipher_handle->sg, &rbd->skcipher_handle->sg, BLOCK_SIZE, ivdata);
-        crypto_init_wait(&rbd->skcipher_handle->wait);
-        switch (bio_op(bio)) {
-        case REQ_OP_READ:
-            ret = skcipher_encdec(rbd->skcipher_handle, 1);
-            break;
-        case REQ_OP_WRITE:
-			      ret = skcipher_encdec(rbd->skcipher_handle, 0);
-            break;
-        }
-    }
-   
+
+    
+    // if (bio_has_data(bio))
+    // {
+    //     sg_init_one(&rbd->skcipher_handle->sg, bio_data(bio), BLOCK_SIZE);
+    //     skcipher_request_set_crypt(rbd->skcipher_handle->req, &rbd->skcipher_handle->sg, &rbd->skcipher_handle->sg, BLOCK_SIZE, ivdata);
+    //     crypto_init_wait(&rbd->skcipher_handle->wait);
+    //     switch (bio_data_dir(bio)) {
+    //     case WRITE:
+    //         ret = skcipher_encdec(rbd->skcipher_handle, 1);
+    //         break;
+    //     case READ:
+	// 		ret = skcipher_encdec(rbd->skcipher_handle, 0);
+    //         break;
+    //     }
+    // }
+    kfree(ivdata);
     if (ret)
         goto out;
 
-    return DM_MAPIO_REMAPPED;
+    return ret;
 
     out:
         cleanup(rbd);
