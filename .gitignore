@@ -59,3 +59,6 @@ settings.json
 
 # Mac stuff
 .DS_Store
+
+# device_tester
+device_tester

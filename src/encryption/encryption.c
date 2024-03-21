@@ -147,11 +147,13 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
 static unsigned int skcipher_encdec(struct encrypt_ctx *sk, int enc) {
     int rc;
-    if (enc) {
-        rc = crypto_wait_req(crypto_skcipher_encrypt(sk->req), &sk->wait);
-    }
-    else {
-        rc = crypto_wait_req(crypto_skcipher_decrypt(sk->req), &sk->wait);
+    switch (enc) {
+        case WRITE:
+            rc = crypto_wait_req(crypto_skcipher_encrypt(sk->req), &sk->wait);
+            break;
+        case READ:
+            rc = crypto_wait_req(crypto_skcipher_decrypt(sk->req), &sk->wait);
+            break;
     }
 	if (rc) {
 		pr_info(KERN_INFO "skcipher encrypt returned with result %d\n", rc);
@@ -196,14 +198,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         printk(KERN_INFO "callback properly initialized\n");
         skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, BLOCK_SIZE, ivdata);
         crypto_init_wait(&rbd->skcipher_handle->wait);
-        switch (bio_data_dir(bio)) {
-        case WRITE:
-            ret = skcipher_encdec(rbd->skcipher_handle, WRITE);
-            break;
-        case READ:
-			ret = skcipher_encdec(rbd->skcipher_handle, READ);
-            break;
-        }
+        ret = skcipher_encdec(rbd->skcipher_handle, bio_data_dir(bio));
     }
     kfree(ivdata);
     if (ret)

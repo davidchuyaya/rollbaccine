@@ -165,6 +165,7 @@ sudo dmsetup remove rollbaccine
 sudo rmmod rollbaccine
 ```
 
+
 ## Benchmarking
 Create an Azure VM with a Ubuntu 22.04 image and at least 8 cores.
 Turn off Secure Boot so we can load kernel modules.
@@ -206,9 +207,36 @@ sudo fio --filename=/dev/mapper/secure --readwrite=readwrite --bs=4k --direct=1 
 Measure the throughput of our custom encrypting device mapper.
 
 
+Load our encryption device mapper:
+```bash
+echo "0 `sudo blockdev --getsz /dev/ram0` encryption /dev/ram0" | sudo dmsetup create encryption
+```
+
+
 ### Integrity
 Our custom integrity checker vs dm-integrity.
 
 ### Fsync
 Replicating fsyncs vs flushing to disk.
 
+
+
+## Testing writes/reads to block device
+We will use `fio` to benchmark performance, as seen in [Benchmarking](#benchmarking). However, `fio` is not ideal for testing to see if a block device works, because it will multiple threads that spam a block device with writes and reads. To see if a block device can handle small individual reads and writes, use [device_tester.c](src/tools/device_tester.c).
+
+Compile the device tester:
+```bash
+cd tools
+make
+```
+
+Set up the block devices as described in [Benchmarking](#benchmarking). Then run the device tester over it. Here we will run the device tester over ramdisk `/dev/ram0`:
+```bash
+sudo ./device_tester /dev/ram0 write
+sudo ./device_tester /dev/ram0 read
+```
+If the block device is correct, then you should see the following outputs:
+```
+Wrote to file: Hello, world!
+Read from file: Hello, world!
+```
