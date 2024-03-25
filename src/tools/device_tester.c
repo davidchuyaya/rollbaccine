@@ -8,7 +8,7 @@
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        printf("Usage: ./device_tester <filename> <read or write>\n");
+        printf("Usage: ./device_tester <filename> <read, write, or clear>\n");
         return 1;
     }
 

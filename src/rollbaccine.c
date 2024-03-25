@@ -40,29 +40,16 @@ static void rollbaccine_destructor(struct dm_target *ti) {
 }
 
 static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
-	printk(KERN_INFO "Rollbaccine map called\n");
-
 	struct rollbaccine_device *rbd = ti->private;
 
 	bio_set_dev(bio, rbd->dev->bdev);
 	bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
-    switch (bio_op(bio)) {
-        case REQ_OP_READ:
-            printk(KERN_INFO "Read request\n");
-            break;
-        case REQ_OP_WRITE:
-			printk(KERN_INFO "Write request\n");
-			break;
-		case REQ_OP_FLUSH:
-			printk(KERN_INFO "Flush request\n");
-			break;
-        case REQ_OP_DISCARD:
-            printk(KERN_INFO "Discard request\n");
-            break;
-        default:
-            break;
-    }
+	// Get bio integrity data
+	struct bio_integrity_payload *bip = bio_integrity(bio);
+	if (bip) {
+		printk(KERN_INFO "Rollbaccine: Integrity data found\n");
+	}
         
 	return DM_MAPIO_REMAPPED;
 }

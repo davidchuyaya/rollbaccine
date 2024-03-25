@@ -47,8 +47,8 @@ struct encryption_device
 
 void cleanup(struct encryption_device* rbd)
 {
-    if (rbd->key)
-        kfree(rbd->key);
+    // if (rbd->key)
+        // kfree(rbd->key);
     if (rbd->skcipher_handle->req)
         skcipher_request_free(rbd->skcipher_handle->req);
     if (rbd->skcipher_handle->tfm)
@@ -121,13 +121,14 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
      */
 
     /* AES 256 with random key */
-    rbd->key = kmalloc(32, GFP_KERNEL);
-    if (rbd->key == NULL) {
-        ti->error = "Could not allocate key";
-        ret = -ENOMEM;
-        goto out;
-    }
-    get_random_bytes(rbd->key, 32);
+    // rbd->key = kmalloc(32, GFP_KERNEL);
+    // if (rbd->key == NULL) {
+    //     ti->error = "Could not allocate key";
+    //     ret = -ENOMEM;
+    //     goto out;
+    // }
+    // get_random_bytes(rbd->key, 32);
+    rbd->key = "Kzj79WMM/6OFcScUhGhq0m6BUXMK7igsVerFoRVo78A=";
     printk(KERN_INFO "key properly initialized\n");
     if (crypto_skcipher_setkey(rbd->skcipher_handle->tfm, rbd->key, 32)) {
         ti->error = "Key could not be set";
@@ -170,46 +171,89 @@ static void encryption_destructor(struct dm_target *ti)
     cleanup(rbd);
 }
 
+static void decrypt_at_end_io(struct bio *bio) {
+    char ivdata[IVLEN] = {0};
+    struct encryption_device *rbd = bio->bi_private;
+    int ret;
+    
+    bio_put(bio);
+
+    // Iterate through bio and decrypt each block
+    while (bio->bi_iter.bi_size) {
+        printk(KERN_INFO "decrypting...\n");
+        struct bio_vec bv = bio_iter_iovec(bio, bio->bi_iter);
+        struct scatterlist sg;
+
+        sg_init_table(&sg, 1);
+        sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
+
+        skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, SECTOR_SIZE, ivdata);
+        ret = skcipher_encdec(rbd->skcipher_handle, WRITE);
+        if (ret) {
+            printk(KERN_INFO "decryption failed\n");
+            return;
+        }
+        bio_advance_iter(bio, &bio->bi_iter, SECTOR_SIZE);
+    }
+
+    printk(KERN_INFO "decryption complete");
+}
+
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
     //printk(KERN_INFO "encryption map called\n");
     int ret = 0;
     unsigned char digest[256];
-    char *ivdata;
+    char ivdata[IVLEN] = {0};
     struct encryption_device *rbd = ti->private;
 
     bio_set_dev(bio, rbd->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     
-    ivdata = kmalloc(IVLEN, GFP_KERNEL);
-    if (ivdata == NULL) {
-        ti->error = "Could not allocate ivdata";
-        ret = -ENOMEM;
-        goto out;
-    }
-    get_random_bytes(ivdata, IVLEN);
-    
+    // get_random_bytes(ivdata, IVLEN);
+    crypto_init_wait(&rbd->skcipher_handle->wait);
+    skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
+
     if (bio_has_data(bio))
     {
-        struct scatterlist sg;
-        sg_init_one(&sg, bio_data(bio), BLOCK_SIZE);
-        // TODO: learn more about callback function being called twice
-        skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
-        printk(KERN_INFO "callback properly initialized\n");
-        skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, BLOCK_SIZE, ivdata);
-        crypto_init_wait(&rbd->skcipher_handle->wait);
-        ret = skcipher_encdec(rbd->skcipher_handle, bio_data_dir(bio));
+        switch (bio_data_dir(bio)) {
+            case WRITE:
+                // Iterate through bio and encrypt each block
+                while (bio->bi_iter.bi_size) {
+                    printk(KERN_INFO "encrypting...\n");
+                    struct bio_vec bv = bio_iter_iovec(bio, bio->bi_iter);
+                    struct scatterlist sg;
+
+                    sg_init_table(&sg, 1);
+                    sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
+                    
+                    skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, SECTOR_SIZE, ivdata);
+                    ret = skcipher_encdec(rbd->skcipher_handle, WRITE);
+                    if (ret) {
+                        printk(KERN_INFO "encryption failed\n");
+                        return 1;
+                    }
+                    bio_advance_iter(bio, &bio->bi_iter, SECTOR_SIZE);
+                }
+                printk(KERN_INFO "encryption finished\n");
+                break;
+            case READ:
+                // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
+                struct bio* clone = bio_alloc_clone(rbd->dev->bdev, bio, GFP_NOWAIT);
+                if (!clone) {
+                    printk(KERN_INFO "decrypt clone failed\n");
+                    return 1;
+                }
+                clone->bi_private = rbd;
+                clone->bi_end_io = decrypt_at_end_io;
+                clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+
+                dm_submit_bio_remap(bio, clone);
+                return DM_MAPIO_REMAPPED;
+        }
     }
-    kfree(ivdata);
-    if (ret)
-        goto out;
-    printk(KERN_INFO "encryption map finished succesfully\n");
+
     return DM_MAPIO_REMAPPED;
-
-    out:
-        cleanup(rbd);
-
-    return ret;
 }
 
 static struct target_type encryption_target = {
