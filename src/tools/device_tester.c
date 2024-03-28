@@ -36,6 +36,11 @@ int main(int argc, char* argv[]) {
         }
 
         printf("Read from file: %s\n", buffer);
+        printf("Hex read from file: ");
+        for (int i = 0; i < len; i++) {
+            printf("%x ", (unsigned char) buffer[i]);
+        }
+        printf("\n");
     }
     // Write "hello world"
     else if (strcmp(read_or_write, "write") == 0) {
@@ -45,7 +50,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        char* write_buffer = "Hello, world!";
+        char* write_buffer = "NEVAHHH!";
         int len = write(file_pointer, write_buffer, strlen(write_buffer));
         if (len == -1) {
             printf("Error writing to file\n");
