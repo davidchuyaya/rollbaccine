@@ -67,12 +67,20 @@ void cleanup(struct encryption_device* rbd)
     kfree(rbd);
 }
 
+static void encryption_destructor(struct dm_target *ti) {
+    struct encryption_device *rbd = ti->private;
+    printk(KERN_INFO "encryption destructor called\n");
+    dm_put_device(ti, rbd->dev);
+    cleanup(rbd);
+}
+
 static int encryption_constructor(struct dm_target *ti, unsigned int argc, char **argv)
 {
-    printk(KERN_INFO "encryption constructor called\n");
     int ret;
+    struct encryption_device *rbd;
+    printk(KERN_INFO "encryption constructor called\n");
 
-    struct encryption_device *rbd = kmalloc(sizeof(struct encryption_device), GFP_KERNEL);
+    rbd = kmalloc(sizeof(struct encryption_device), GFP_KERNEL);
     if (rbd == NULL)
     {
         ti->error = "Cannot allocate context";
@@ -166,27 +174,14 @@ static unsigned int skcipher_encdec(struct encrypt_ctx *sk, int enc) {
     return rc;
 }
 
-static void encryption_destructor(struct dm_target *ti)
-{
-    printk(KERN_INFO "encryption destructor called\n");
-
-    struct encryption_device *rbd = ti->private;
-    dm_put_device(ti, rbd->dev);
-    cleanup(rbd);
-}
-
-static void decrypt_at_end_io(struct bio *clone) {
-    struct encryption_device *rbd = clone->bi_private;
+// Encrypts or decrypts the bio, one sector at a time, based on enc_or_dec.
+// The caller is responsible for resetting the bio's bi_iter to the beginning of the bio after the function executes for writes.
+static void enc_or_dec_bio(struct bio* bio, int enc_or_dec, struct encryption_device* rbd) {
     int ret;
-
-    // the cloned bio is no longer useful
-    struct bio *read_bio = rbd->read_bio;
-    bio_put(clone);
-
-    // Iterate through bio and decrypt each block
-    while (read_bio->bi_iter.bi_size) {
-        struct bio_vec bv = bio_iter_iovec(read_bio, read_bio->bi_iter);
-        struct scatterlist sg;
+    struct bio_vec bv;
+    struct scatterlist sg;
+    while (bio->bi_iter.bi_size) {
+        bv = bio_iter_iovec(bio, bio->bi_iter);
 
         sg_init_table(&sg, 1);
         sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
@@ -194,30 +189,47 @@ static void decrypt_at_end_io(struct bio *clone) {
         crypto_init_wait(&rbd->skcipher_handle->wait);
         skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
         skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, SECTOR_SIZE, rbd->ivdata);
-        ret = skcipher_encdec(rbd->skcipher_handle, READ);
+        ret = skcipher_encdec(rbd->skcipher_handle, enc_or_dec);
         if (ret) {
-            printk(KERN_INFO "decryption failed\n");
+            printk(KERN_INFO "encryption/decryption failed");
+            // TODO: Don't fail silently
             return;
         }
-        bio_advance_iter(read_bio, &read_bio->bi_iter, SECTOR_SIZE);
+        bio_advance_iter(bio, &bio->bi_iter, SECTOR_SIZE);
     }
+}
 
-    printk(KERN_INFO "decryption complete");
+/**
+ * How decrypting read works:
+ * 
+ * 1. In map(), we create a clone of the read. At this point in time, the read does not have the actual data (which may be on disk).
+ * 2. We submit the clone, triggering bio_end_io(), which calls this function.
+ * 3. We release the clone with bio_put(). The data is fetched in the bio_vecs, so we decrypt it now for the read.
+ * 4. We call bio_endio() on the original read, which returns the decrypted data to the user.
+*/
+static void decrypt_at_end_io(struct bio *clone) {
+    struct encryption_device *rbd = clone->bi_private;
+    struct bio *read_bio = rbd->read_bio;
+
+    // the cloned bio is no longer useful
+    bio_put(clone);
+
+    // decrypt
+    enc_or_dec_bio(read_bio, READ, rbd);
+
+    // release the read bio
     bio_endio(read_bio);
 }
 
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
     //printk(KERN_INFO "encryption map called\n");
-    int ret = 0;
-    unsigned char digest[256];
     struct encryption_device *rbd = ti->private;
+    struct bio *clone;
 
     bio_set_dev(bio, rbd->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     
-    struct bio *clone;
-
     if (bio_has_data(bio)) {
         switch (bio_data_dir(bio)) {
             case WRITE:
@@ -225,26 +237,8 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 unsigned int original_size = bio->bi_iter.bi_size;
                 unsigned int original_idx = bio->bi_iter.bi_idx;
 
-                struct scatterlist sg_in;
-                struct bio_vec bv_in;
-                while (bio->bi_iter.bi_size) {
-                    bv_in = bio_iter_iovec(bio, bio->bi_iter);
-                    
-                    sg_init_table(&sg_in, 1);
-                    sg_set_page(&sg_in, bv_in.bv_page, SECTOR_SIZE, bv_in.bv_offset);
-
-                    crypto_init_wait(&rbd->skcipher_handle->wait);
-                    skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
-                    skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg_in, &sg_in, SECTOR_SIZE, rbd->ivdata);
-                    ret = skcipher_encdec(rbd->skcipher_handle, WRITE);
-                    if (ret) {
-                        printk(KERN_INFO "encryption failed\n");
-                        return 1;
-                    }
-
-                    bio_advance_iter(bio, &bio->bi_iter, SECTOR_SIZE);
-                }
-                printk(KERN_INFO "encryption finished\n");
+                // Encrypt
+                enc_or_dec_bio(bio, WRITE, rbd);
 
                 // Reset to the original beginning values of the bio, otherwise nothing will be written
                 bio->bi_iter.bi_sector = original_sector;
@@ -255,7 +249,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
                 clone = bio_clone_fast(bio, GFP_NOWAIT, &rbd->bs);
                 if (!clone) {
-                    printk(KERN_INFO "Could not create clone failed\n");
+                    printk(KERN_INFO "Could not create clone");
                     return 1;
                 }
                 clone->bi_private = rbd;
@@ -265,8 +259,8 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
                 rbd->read_bio = bio;
 
+                // Submit the clone, triggering end_io, where the read will actually have data and we can decrypt
                 submit_bio_noacct(clone);
-                // printk(KERN_INFO "submitted decryption");
 
                 return DM_MAPIO_SUBMITTED;
         }
