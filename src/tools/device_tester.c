@@ -50,7 +50,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        char* write_buffer = "NEVAHHH!";
+        char* write_buffer = "Hello, world!";
         int len = write(file_pointer, write_buffer, strlen(write_buffer));
         if (len == -1) {
             printf("Error writing to file\n");

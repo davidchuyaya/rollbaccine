@@ -45,22 +45,9 @@ struct encryption_device
 
     // not sure what this is, but it's needed to create a clone of the bio
     struct bio_set bs;
-    // pointers to original read/write bios so they can be referenced when endio is triggered by their clones
+    // pointers to original read bios so they can be referenced when endio is triggered by their clones
     struct bio *read_bio;
-    struct bio *write_bio;
-    // memory pool to create write clones from
-    mempool_t page_pool;
 };
-
-/* Start mempool functions */
-static void *encryption_page_alloc(gfp_t gfp_mask, void* data) {
-    return alloc_page(gfp_mask);
-}
-
-static void encryption_free_page(void *page, void* data) {
-    __free_page(page);
-}
-/* End mempool functions */
 
 void cleanup(struct encryption_device* rbd)
 {
@@ -76,7 +63,6 @@ void cleanup(struct encryption_device* rbd)
     if (rbd->skcipher_handle)
         kfree(rbd->skcipher_handle);
     bioset_exit(&rbd->bs);
-    mempool_exit(&rbd->page_pool);
 
     kfree(rbd);
 }
@@ -153,15 +139,8 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     memcpy(rbd->ivdata, "1234567890123456", 16);
 
     bioset_init(&rbd->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
-    ret = mempool_init(&rbd->page_pool, BIO_MAX_VECS, encryption_page_alloc, encryption_free_page, NULL);
-    if (ret) {
-        ti->error = "Cannot allocate page mempool";
-        goto out;
-    }
 
     ti->private = rbd;
-    ti->num_flush_bios = 1;
-    ti->limit_swap_bios = true;
 
     return 0;
 
@@ -227,20 +206,6 @@ static void decrypt_at_end_io(struct bio *clone) {
     bio_endio(read_bio);
 }
 
-static void encrypt_end_io(struct bio *clone) {
-    struct encryption_device *rbd = clone->bi_private;
-    struct bio_vec *bv;
-    struct bvec_iter_all iter_all;
-
-    bio_for_each_segment_all(bv, clone, iter_all) {
-        mempool_free(bv->bv_page, &rbd->page_pool);
-    }
-    printk(KERN_INFO "encryption end io called, pages freed\n");
-
-    bio_put(clone);
-    bio_endio(rbd->write_bio);
-}
-
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
     //printk(KERN_INFO "encryption map called\n");
@@ -256,61 +221,36 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     if (bio_has_data(bio)) {
         switch (bio_data_dir(bio)) {
             case WRITE:
-                // Create clone
-                unsigned int nr_iovecs = (bio->bi_iter.bi_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-                gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
-
-                clone = bio_alloc_bioset(GFP_NOIO, nr_iovecs, &rbd->bs);
-                clone->bi_private = rbd;
-                clone->bi_end_io = encrypt_end_io;
-                bio_set_dev(clone, rbd->dev->bdev);
-                clone->bi_opf = bio->bi_opf;
-
-                unsigned i, len, remaining_size;
-                remaining_size = bio->bi_iter.bi_size;
-                struct page *page;
-                for (i = 0; i < nr_iovecs; i++) {
-                    page = mempool_alloc(&rbd->page_pool, gfp_mask);
-                    len = (remaining_size > PAGE_SIZE) ? PAGE_SIZE : remaining_size;
-                    bio_add_page(clone, page, len, 0);
-                    remaining_size -= len;
-                }
-
-                // Iterate through bio and encrypt each block into the clone
                 sector_t original_sector = bio->bi_iter.bi_sector;
+                unsigned int original_size = bio->bi_iter.bi_size;
+                unsigned int original_idx = bio->bi_iter.bi_idx;
 
-                struct scatterlist sg_in, sg_out;
+                struct scatterlist sg_in;
+                struct bio_vec bv_in;
                 while (bio->bi_iter.bi_size) {
-                    struct bio_vec bv_in = bio_iter_iovec(bio, bio->bi_iter);
-                    struct bio_vec bv_out = bio_iter_iovec(clone, clone->bi_iter);
-                    // printk(KERN_INFO "bio page contents: %x %x %x %x %x %x %x %x", ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset], ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset + 1], ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset + 2], ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset + 3], ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset + 4], ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset + 5], ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset + 6], ((unsigned char *)bv_in.bv_page)[bv_in.bv_offset + 7]);
+                    bv_in = bio_iter_iovec(bio, bio->bi_iter);
                     
                     sg_init_table(&sg_in, 1);
                     sg_set_page(&sg_in, bv_in.bv_page, SECTOR_SIZE, bv_in.bv_offset);
-                    sg_init_table(&sg_out, 1);
-                    sg_set_page(&sg_out, bv_out.bv_page, SECTOR_SIZE, bv_out.bv_offset);
 
                     crypto_init_wait(&rbd->skcipher_handle->wait);
                     skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
-                    skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg_in, &sg_out, SECTOR_SIZE, rbd->ivdata);
+                    skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg_in, &sg_in, SECTOR_SIZE, rbd->ivdata);
                     ret = skcipher_encdec(rbd->skcipher_handle, WRITE);
                     if (ret) {
                         printk(KERN_INFO "encryption failed\n");
                         return 1;
                     }
 
-                    // printk(KERN_INFO "encrypted page contents: %x %x %x %x %x %x %x %x", ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset], ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset + 1], ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset + 2], ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset + 3], ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset + 4], ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset + 5], ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset + 6], ((unsigned char *)bv_out.bv_page)[bv_out.bv_offset + 7]);
-
                     bio_advance_iter(bio, &bio->bi_iter, SECTOR_SIZE);
-                    bio_advance_iter(clone, &clone->bi_iter, SECTOR_SIZE);
                 }
                 printk(KERN_INFO "encryption finished\n");
 
-                rbd->write_bio = bio;
-                clone->bi_iter.bi_sector = original_sector;
-
-                submit_bio_noacct(clone);
-                return DM_MAPIO_SUBMITTED;
+                // Reset to the original beginning values of the bio, otherwise nothing will be written
+                bio->bi_iter.bi_sector = original_sector;
+                bio->bi_iter.bi_size = original_size;
+                bio->bi_iter.bi_idx = original_idx;
+                break;
             case READ:
                 // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
                 clone = bio_clone_fast(bio, GFP_NOWAIT, &rbd->bs);
