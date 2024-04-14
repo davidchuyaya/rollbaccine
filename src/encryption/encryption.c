@@ -23,22 +23,26 @@
 
 #define MIN_IOS 64
 
-struct encrypt_ctx {
-    // symmetric key algorithm instance
-    struct crypto_skcipher *tfm;
-    // TODO (verify logic): make request to hw chip?
-    struct skcipher_request *req;
 
-    // generic implementation struct for waiting for crypto op to complete
-    struct crypto_wait wait;
-};
+// OLD CODE: Don't need struct if synchronization is at block level
+// struct encrypt_ctx {
+//     // symmetric key algorithm instance
+//     struct crypto_skcipher *tfm;
+//     // TODO (verify logic): make request to hw chip?
+//     struct skcipher_request *req;
+
+//     // generic implementation struct for waiting for crypto op to complete
+//     struct crypto_wait wait;
+// };
 
 // Data attached to each bio
 struct encryption_device
 {
     struct dm_dev *dev;
     // AES-CBC
-    struct encrypt_ctx* skcipher_handle;
+    //struct encrypt_ctx* skcipher_handle;
+    // symmetric key algorithm instance
+    struct crypto_skcipher *tfm;
     // persist key
     char *key;
     char *ivdata;
@@ -46,8 +50,26 @@ struct encryption_device
     // not sure what this is, but it's needed to create a clone of the bio
     struct bio_set bs;
     // pointers to original read bios so they can be referenced when endio is triggered by their clones
+    // TODO: this should be attached per bio
     struct bio *read_bio;
 };
+
+/*
+ * per bio private data
+ */
+struct encryption_io {
+    struct bio *bio_in;
+	struct bio *bio_out;
+	struct bvec_iter iter_in;
+	struct bvec_iter iter_out;
+    // TODO do we need?
+    // TODO (verify logic): make request to hw chip?
+    struct skcipher_request *req;
+    // TODO do we need?
+    atomic_t cc_pending;
+    // TODO do we need?
+    struct bio *base_bio;
+}
 
 void cleanup(struct encryption_device* rbd)
 {
@@ -56,12 +78,14 @@ void cleanup(struct encryption_device* rbd)
 
     if (rbd->ivdata)
         kfree(rbd->ivdata);
-    if (rbd->skcipher_handle->req)
-        skcipher_request_free(rbd->skcipher_handle->req);
+    // OLD CODE: moved to per_block_io
+    // if (rbd->skcipher_handle->req)
+    //     skcipher_request_free(rbd->skcipher_handle->req);
     if (rbd->skcipher_handle->tfm)
         crypto_free_skcipher(rbd->skcipher_handle->tfm);
-    if (rbd->skcipher_handle)
-        kfree(rbd->skcipher_handle);
+    // OLD CODE: moved to per_block_io
+    // if (rbd->skcipher_handle)
+    //     kfree(rbd->skcipher_handle);
     bioset_exit(&rbd->bs);
 
     kfree(rbd);
@@ -97,17 +121,18 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     }
 
     /* Initialize Encryption Structs*/
-    rbd->skcipher_handle = kmalloc(sizeof(struct encrypt_ctx), GFP_KERNEL);
-    if (rbd->skcipher_handle == NULL) {
-        ti->error = "Cannot allocate skcipher_handle";
-        ret = -ENOMEM;
-        goto out;
-    }
-    printk(KERN_INFO "cipher handle properly initialized\n");
+    // OLD CODE: moved to per_block_io
+    // rbd->skcipher_handle = kmalloc(sizeof(struct encrypt_ctx), GFP_KERNEL);
+    // if (rbd->skcipher_handle == NULL) {
+    //     ti->error = "Cannot allocate skcipher_handle";
+    //     ret = -ENOMEM;
+    //     goto out;
+    // }
+    // printk(KERN_INFO "cipher handle properly initialized\n");
 
     // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls
-    rbd->skcipher_handle->tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
-    if (IS_ERR(rbd->skcipher_handle->tfm)) {
+    rbd->tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
+    if (IS_ERR(rbd->tfm)) {
         ti->error = "Cannot allocate skcipher_handle transform";
         ret = -ENOMEM;
         goto out;
@@ -115,23 +140,25 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     printk(KERN_INFO "transform properly initialized\n");
 
     /* Create a request */
-    rbd->skcipher_handle->req = skcipher_request_alloc(rbd->skcipher_handle->tfm, GFP_KERNEL);
-    if (!rbd->skcipher_handle->req) {
-        ti->error = "could not allocate skcipher request";
-        ret = -ENOMEM;
-        goto out;
-    }
-    printk(KERN_INFO "encryption algorithm instance and request instance initialized properly\n");
+    // OLD CODE: moved to per_block_io
+    // rbd->skcipher_handle->req = skcipher_request_alloc(rbd->skcipher_handle->tfm, GFP_KERNEL);
+    // if (!rbd->skcipher_handle->req) {
+    //     ti->error = "could not allocate skcipher request";
+    //     ret = -ENOMEM;
+    //     goto out;
+    // }
+    // printk(KERN_INFO "encryption algorithm instance and request instance initialized properly\n");
     /* Assign callback to request 
 
      Once hardware chip finishes encryption, notifies CPU 
      via IRQ handler and executes callback (crypto_req_done)
      once request processsed 
      */
-    skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
+    // TODO: maybe delete since we are caling inside map
+    //skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
 
     rbd->key = "12345678901234567890123456789012";
-    if (crypto_skcipher_setkey(rbd->skcipher_handle->tfm, rbd->key, 32)) {
+    if (crypto_skcipher_setkey(rbd->tfm, rbd->key, 32)) {
         ti->error = "Key could not be set";
         ret = -EAGAIN;
         goto out;
@@ -149,6 +176,10 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     bioset_init(&rbd->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
 
     ti->private = rbd;
+
+    // TODO: Look into putting hashes inside of here too and some rounding?
+    ti->per_io_data_size = sizeof(struct encryption_io);
+
 
     return 0;
 
@@ -176,7 +207,7 @@ static unsigned int skcipher_encdec(struct encrypt_ctx *sk, int enc) {
 
 // Encrypts or decrypts the bio, one sector at a time, based on enc_or_dec.
 // The caller is responsible for resetting the bio's bi_iter to the beginning of the bio after the function executes for writes.
-static void enc_or_dec_bio(struct bio* bio, int enc_or_dec, struct encryption_device* rbd) {
+static void enc_or_dec_bio(struct encryption_io* bio, int enc_or_dec, struct encryption_device* rbd) {
     int ret;
     struct bio_vec bv;
     struct scatterlist sg;
@@ -185,9 +216,12 @@ static void enc_or_dec_bio(struct bio* bio, int enc_or_dec, struct encryption_de
 
         sg_init_table(&sg, 1);
         sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
-
+        // TODO: Concurrency Issue?
         crypto_init_wait(&rbd->skcipher_handle->wait);
+        // TODO: Concurrency Issue?
         skcipher_request_set_callback(rbd->skcipher_handle->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &rbd->skcipher_handle->wait);
+        // TODO: Concurrency Issue?
+
         skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, SECTOR_SIZE, rbd->ivdata);
         ret = skcipher_encdec(rbd->skcipher_handle, enc_or_dec);
         if (ret) {
@@ -209,7 +243,10 @@ static void enc_or_dec_bio(struct bio* bio, int enc_or_dec, struct encryption_de
 */
 static void decrypt_at_end_io(struct bio *clone) {
     struct encryption_device *rbd = clone->bi_private;
-    struct bio *read_bio = rbd->read_bio;
+
+    // TODO: Concurrency Issue?
+    // OLD CODE: struct bio *read_bio = rbd->read_bio;
+    struct encryption_io *read_bio = dm_bio_per_bio_data(clone, clone->bi_private->per_io_data_size);
 
     // the cloned bio is no longer useful
     bio_put(clone);
@@ -227,8 +264,13 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     struct encryption_device *rbd = ti->private;
     struct bio *clone;
 
+
     bio_set_dev(bio, rbd->dev->bdev);
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+    // bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+    // fetch data specific to bio
+    io = dm_per_bio_data(bio, ti->per_bio_data_size);
+    // initialize fields for bio data that will be useful for encryption
+	encryption_io_init(io, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
     
     if (bio_has_data(bio)) {
         switch (bio_data_dir(bio)) {
@@ -244,7 +286,8 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 bio->bi_iter.bi_sector = original_sector;
                 bio->bi_iter.bi_size = original_size;
                 bio->bi_iter.bi_idx = original_idx;
-                break;
+                
+                return DM_MAPIO_REMAPPED;
             case READ:
                 // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
                 clone = bio_clone_fast(bio, GFP_NOWAIT, &rbd->bs);
@@ -265,8 +308,17 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 return DM_MAPIO_SUBMITTED;
         }
     }
+    
+}
 
-    return DM_MAPIO_REMAPPED;
+static void encryption_io_init(struct encryption_io *io, struct bio *bio, sector_t sector) {
+	io->base_bio = bio;
+	io->sector = sector;
+	io->error = 0;
+    // TODO: why they do io + 1?
+	io->ctx.r.req = (struct skcipher_request *)(io + 1);
+    // TODO: Why might we need this?
+    atomic_set(&io->io_pending, 0);
 }
 
 static struct target_type encryption_target = {
