@@ -70,6 +70,8 @@ void cleanup(struct encryption_device* rbd)
 static void encryption_destructor(struct dm_target *ti) {
     struct encryption_device *rbd = ti->private;
     printk(KERN_INFO "encryption destructor called\n");
+    if (rbd == NULL)
+        return;
     dm_put_device(ti, rbd->dev);
     cleanup(rbd);
 }

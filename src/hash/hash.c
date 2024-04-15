@@ -9,106 +9,174 @@
 #define DM_MSG_PREFIX "hash"
 
 #define SHA256_LENGTH 256
-
-// Struct that contains that actual synchronous hash
-// stored seperately since size of struct needs to include operational state of hash
-struct crypt
-{
-    struct shash_desc shash;
-};
+#define MIN_IOS 64
 
 // Data attached to each bio
 struct hash_device
 {
     struct dm_dev *dev;
-    // Synchronous cryptographic hash type
-    // documentation: https://elixir.bootlin.com/linux/latest/source/include/crypto/hash.h
     struct crypto_shash *alg;
-    struct crypt *encryptor;
+    struct shash_desc *shash; // Space used by shash
+    // not sure what this is, but it's needed to create a clone of the bio
+    struct bio_set bs;
+    struct bio *read_bio;
+    int counter;
 };
+
+static void cleanup(struct hash_device *rbd) {
+    if (rbd == NULL) return;
+
+    if (rbd->alg)
+        crypto_free_shash(rbd->alg);
+    bioset_exit(&rbd->bs);
+
+    kfree(rbd->shash);
+    kfree(rbd);
+}
 
 static int hash_constructor(struct dm_target *ti, unsigned int argc, char **argv)
 {
+    int ret;
+    struct hash_device *rbd;
     printk(KERN_INFO "hash constructor called\n");
 
-    struct hash_device *rbd = kmalloc(sizeof(struct hash_device), GFP_KERNEL);
+    rbd = kmalloc(sizeof(struct hash_device), GFP_KERNEL);
     if (rbd == NULL)
     {
         ti->error = "Cannot allocate context";
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
+    rbd->counter = 0;
 
     // Get the device from argv[0] and store it in rbd->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &rbd->dev))
     {
         ti->error = "Device lookup failed";
-        kfree(rbd);
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
 
     // initialize cipher handle (instance) of sha256
-    // look into other params?
     rbd->alg = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(rbd->alg))
     {
         pr_info("can't alloc alg sha256\n");
-        return PTR_ERR(rbd->alg);
+        ret = PTR_ERR(rbd->alg);
+        goto out;
     }
 
-    struct crypt *sdesc;
-    int size;
-    // allocate size of struct + size of operational state for algorithm
-    size = sizeof(struct crypt) + crypto_shash_descsize(rbd->alg);
-    rbd->encryptor = kmalloc(size, GFP_KERNEL);
-    if (!rbd->encryptor)
-    {
-        pr_info("can't alloc encryptor\n");
-        return PTR_ERR(sdesc);
+    rbd->shash = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(rbd->alg), GFP_NOIO);
+    if (!rbd->shash) {
+        ti->error = "could not allocate shash descriptor";
+        ret = -ENOMEM;
+        goto out;
     }
-    // Setting our algorithm for hash to sha256
-    rbd->encryptor->shash.tfm = rbd->alg;
-    // rbd->encryptor->shash.flags = 0x0;
+    rbd->shash->tfm = rbd->alg;
+
+    bioset_init(&rbd->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
+
     ti->private = rbd;
 
     return 0;
+
+    out:
+    cleanup(rbd);
+    return ret;
 }
+
 
 static void hash_destructor(struct dm_target *ti)
 {
+    struct hash_device *rbd;
     printk(KERN_INFO "hash destructor called\n");
 
-    struct hash_device *rbd = ti->private;
+    rbd = ti->private;
+    if (!rbd)
+        return;
+
     dm_put_device(ti, rbd->dev);
-    crypto_free_shash(rbd->alg);
-    kfree(rbd->encryptor);
-    kfree(rbd);
+    cleanup(rbd);
+}
+
+static void hash_bio(struct bio *bio, struct hash_device *rbd) {
+    int ret;
+    unsigned char digest[SHA256_LENGTH];
+    struct bio_vec bv;
+
+    // printk(KERN_INFO "Hashing bio");
+
+    while (bio->bi_iter.bi_size) {
+        bv = bio_iter_iovec(bio, bio->bi_iter);
+
+        ret = crypto_shash_digest(rbd->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, digest);
+        if (ret) {
+            printk(KERN_INFO "hash failed");
+            // TODO: Don't fail silently
+            return;
+        }
+
+        bio_advance_iter(bio, &bio->bi_iter, SECTOR_SIZE);
+    }
+}
+
+static void hash_at_end_io(struct bio *clone) {
+    struct hash_device *rbd = clone->bi_private;
+    struct bio *read_bio = rbd->read_bio;
+
+    // the cloned bio is no longer useful
+    bio_put(clone);
+
+    // hash 
+    hash_bio(read_bio, rbd);
+
+    // release the read bio
+    bio_endio(read_bio);
 }
 
 static int hash_map(struct dm_target *ti, struct bio *bio)
 {
     // printk(KERN_INFO "hash map called\n");
-
     struct hash_device *rbd = ti->private;
+    struct bio *clone;
 
     bio_set_dev(bio, rbd->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+    
+    if (bio_has_data(bio)) {
+        switch (bio_data_dir(bio)) {
+            case WRITE:
+                sector_t original_sector = bio->bi_iter.bi_sector;
+                unsigned int original_size = bio->bi_iter.bi_size;
+                unsigned int original_idx = bio->bi_iter.bi_idx;
 
-    int ret;
-    unsigned char digest[256];
-    if (bio_has_data(bio))
-    {
-        ret = crypto_shash_digest(&rbd->encryptor->shash, bio_data(bio), SHA256_LENGTH, digest);
-        if (ret) {
-            // TODO: Error Handling
-            pr_err("error ret = %d", ret);
-            return -1
+                // Hash
+                hash_bio(bio, rbd);
+
+                // Reset to the original beginning values of the bio, otherwise nothing will be written
+                bio->bi_iter.bi_sector = original_sector;
+                bio->bi_iter.bi_size = original_size;
+                bio->bi_iter.bi_idx = original_idx;
+                break;
+            case READ:
+                // Create a clone that calls hash_at_end_io when the IO returns with actual read data
+                clone = bio_clone_fast(bio, GFP_NOWAIT, &rbd->bs);
+                if (!clone) {
+                    printk(KERN_INFO "Could not create clone");
+                    return 1;
+                }
+                clone->bi_private = rbd;
+                clone->bi_end_io = hash_at_end_io;
+                bio_set_dev(clone, rbd->dev->bdev);
+                clone->bi_opf = bio->bi_opf;
+                clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+                rbd->read_bio = bio;
+
+                // Submit the clone, triggering end_io, where the read will actually have data and we can hash
+                submit_bio_noacct(clone);
+
+                return DM_MAPIO_SUBMITTED;
         }
-        // if (ret == 0)
-        // {
-        //     int i;
-        //     for (i = 0; i < sizeof(digest); i++)
-        //         printk(KERN_INFO "%02x", digest[i]);
-        // }
     }
 
     return DM_MAPIO_REMAPPED;

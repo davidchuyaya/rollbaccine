@@ -4,7 +4,7 @@
 #include <string.h>
 #include <errno.h>
 
-#define READ_BUFFER_SIZE 256
+#define READ_BUFFER_SIZE 4096
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {

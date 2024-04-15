@@ -216,6 +216,11 @@ echo "0 `sudo blockdev --getsz /dev/ram0` encryption /dev/ram0" | sudo dmsetup c
 ### Integrity
 Our custom integrity checker vs dm-integrity.
 
+Load our encryption device mapper:
+```bash
+echo "0 `sudo blockdev --getsz /dev/ram0` hash /dev/ram0" | sudo dmsetup create hash
+```
+
 ### Fsync
 Replicating fsyncs vs flushing to disk.
 
