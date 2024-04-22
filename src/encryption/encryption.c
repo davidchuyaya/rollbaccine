@@ -61,12 +61,10 @@ struct encryption_io {
     sector_t original_sector;
     unsigned int original_size;
     unsigned int original_idx;
+    struct bio *base_bio;
     // needed for iteration
     struct bio *bio_in;
-	struct bio *bio_out;
-	struct bvec_iter iter_in;
-	struct bvec_iter iter_out;
-    struct bio *base_bio;
+	struct bvec_iter bi_iter;
     // generic implementation struct for waiting for crypto op to complete
     struct crypto_wait wait;
     struct skcipher_request *req;
@@ -225,11 +223,17 @@ int crypt_alloc_req(struct encryption_io *io) {
 // The caller is responsible for resetting the bio's bi_iter to the beginning of the bio after the function executes for writes.
 static void enc_or_dec_bio(struct encryption_io *io, int enc_or_dec) {
     int ret;
-    struct bio_vec bv_in, bv_out;
-    struct scatterlist sg_in, sg_out;
+    struct bio_vec bv;
+    struct scatterlist sg;
+    struct crypto_skcipher *tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
+    char* key = "12345678901234567890123456789012";
+    crypto_skcipher_setkey(tfm, key, 32);
+    io->req = skcipher_request_alloc(tfm, GFP_KERNEL);
+    printk(KERN_INFO "key properly initialized\n");
     char *ivdata = kmalloc(16, GFP_KERNEL);
     memcpy(ivdata, "1234567890123456", 16);
-    while (io->iter_in.bi_size && io->iter_out.bi_size) {
+    printk(KERN_INFO "starting to encrypt/decrypt");
+    while (io->bi_iter.bi_size) {
         ret = crypt_alloc_req(io);
         if (ret) {
             printk(KERN_INFO "encryption/decryption failed");
@@ -237,14 +241,10 @@ static void enc_or_dec_bio(struct encryption_io *io, int enc_or_dec) {
             return;
         }
 
-        bv_in = bio_iter_iovec(io->bio_in, io->iter_in);
-	    bv_out = bio_iter_iovec(io->bio_out, io->iter_out);
+        bv = bio_iter_iovec(io->bio_in, io->bi_iter);
 
-        sg_init_table(&sg_in, 1);
-        sg_set_page(&sg_in, bv_in.bv_page, SECTOR_SIZE, bv_in.bv_offset);
-
-        sg_init_table(&sg_out, 1);
-        sg_set_page(&sg_out, bv_out.bv_page, SECTOR_SIZE, bv_out.bv_offset);
+        sg_init_table(&sg, 1);
+        sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
         
 
         // OLD CODE
@@ -255,16 +255,17 @@ static void enc_or_dec_bio(struct encryption_io *io, int enc_or_dec) {
         // // TODO: Concurrency Issue?
         // skcipher_request_set_crypt(rbd->skcipher_handle->req, &sg, &sg, SECTOR_SIZE, rbd->ivdata);
         // ret = skcipher_encdec(rbd->skcipher_handle, enc_or_dec);
-        skcipher_request_set_crypt(io->req, &sg_in, &sg_out, SECTOR_SIZE, ivdata);
+        skcipher_request_set_crypt(io->req, &sg, &sg, SECTOR_SIZE, ivdata);
         ret = skcipher_encdec(io, enc_or_dec);
         if (ret) {
             printk(KERN_INFO "encryption/decryption failed");
             // TODO: Don't fail silently
             return;
         }
-        bio_advance_iter(io->bio_in, &io->iter_in, SECTOR_SIZE);
-        bio_advance_iter(io->bio_out, &io->iter_out, SECTOR_SIZE);
+        bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
     }
+    kfree(ivdata);
+    skcipher_request_free(io->req);
 }
 
 /**
@@ -286,7 +287,7 @@ static void decrypt_at_end_io(struct bio *clone) {
 
     // decrypt
     enc_or_dec_bio(read_bio, READ);
-
+    printk(KERN_INFO "decryption properly worked");
     // release the read bio
     bio_endio(read_bio->base_bio);
 }
@@ -301,13 +302,9 @@ static void encryption_io_init(struct encryption_io *io, struct bio *bio, sector
     return;
 }
 
-static void crypt_convert_init(struct encryption_io *io, struct bio *bio_out, struct bio *bio_in, sector_t sector) {
+static void crypt_convert_init(struct encryption_io *io, struct bio *bio_in, sector_t sector) {
 	io->bio_in = bio_in;
-	io->bio_out = bio_out;
-	if (bio_in)
-		io->iter_in = bio_in->bi_iter;
-	if (bio_out)
-		io->iter_out = bio_out->bi_iter;
+	io->bi_iter = bio_in->bi_iter;
 }
 
 
@@ -324,11 +321,11 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     io = dm_per_bio_data(bio, ti->per_io_data_size);
     // initialize fields for bio data that will be useful for encryption
 	encryption_io_init(io, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
+    crypt_convert_init(io, bio, io->sector);
     printk(KERN_INFO "io properly initialized\n");
     if (bio_has_data(bio)) {
         switch (bio_data_dir(bio)) {
             case WRITE:
-                crypt_convert_init(io, NULL, io->base_bio, io->sector);
                 sector_t original_sector = io->sector;
                 unsigned int original_size = bio->bi_iter.bi_size;
                 unsigned int original_idx = bio->bi_iter.bi_idx;
@@ -345,7 +342,6 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 
                 return DM_MAPIO_REMAPPED;
             case READ:
-                crypt_convert_init(io, io->base_bio, io->base_bio, io->sector);
                 // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
                 clone = bio_clone_fast(bio, GFP_NOWAIT, &rbd->bs);
                 if (!clone) {
