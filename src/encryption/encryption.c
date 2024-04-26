@@ -35,6 +35,8 @@ struct encryption_device
     char *ivdata;
     // not sure what this is, but it's needed to create a clone of the bio
     struct bio_set bs;
+    // pool for crypto requests
+    mempool_t req_pool;
 };
 
 // per bio private data
@@ -44,13 +46,14 @@ struct encryption_io {
     // needed for iteration
     struct bio *bio_in;
 	struct bvec_iter bi_iter;
-    // generic implementation struct for waiting for crypto op to complete
+    // crypto stuff
+    sector_t sector;
     struct crypto_wait wait;
     struct skcipher_request *req;
     struct encryption_device *rbd;
 
     blk_status_t error;
-	sector_t sector;
+	
 } typedef convert_context;
 
 void cleanup(struct encryption_device* rbd)
@@ -61,7 +64,7 @@ void cleanup(struct encryption_device* rbd)
         kfree(rbd->ivdata);
     if (rbd->tfm)
         crypto_free_skcipher(rbd->tfm);
-
+    mempool_exit(&rbd->req_pool);
     bioset_exit(&rbd->bs);
     kfree(rbd);
 }
@@ -128,6 +131,13 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // TODO: Look into putting hashes inside of here too and some rounding?
     ti->per_io_data_size = sizeof(struct encryption_io);
 
+    // TODO: This might be sus lol
+    ret = mempool_init_kmalloc_pool(&rbd->req_pool, MIN_IOS, sizeof(struct skcipher_request));
+	if (ret) {
+		ti->error = "Cannot allocate crypt request mempool";
+		goto out;
+	}
+
 
     return 0;
 
@@ -153,29 +163,31 @@ static unsigned int skcipher_encdec(struct encryption_io *io, int enc) {
     return rc;
 }
 
-int crypt_alloc_req(struct encryption_io *io) {
+static int crypt_alloc_req(struct encryption_io *io) {
+    // allocate from mempool since we are not in thread-safe context
+    if (!io->req) {
+		io->req = mempool_alloc(&io->rbd->req_pool, in_interrupt() ? GFP_ATOMIC : GFP_NOIO);
+		if (!io->req)
+			return -ENOMEM;
+	}
+    skcipher_request_set_tfm(io->req, io->rbd->tfm);
+    // TODO: figure out best place to put this line
     crypto_init_wait(&io->wait);
-    skcipher_request_set_callback(io->req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &io->wait);
+    skcipher_request_set_callback(io->req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &io->wait);
     return 0;
 }
 
-static void enc_or_dec_bio(struct encryption_io *io, int enc_or_dec) {
+
+
+static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec) {
     int ret;
     struct bio_vec bv;
     struct scatterlist sg;
-    struct crypto_skcipher *tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
-    char* key = "12345678901234567890123456789012";
-    crypto_skcipher_setkey(tfm, key, 32);
-    // TODO: ALlocate from mem-pool instead of request_allco
-    io->req = skcipher_request_alloc(tfm, GFP_ATOMIC);
-    // 
-    printk(KERN_INFO "key properly initialized\n");
     while (io->bi_iter.bi_size) {
         ret = crypt_alloc_req(io);
         if (ret) {
-            printk(KERN_INFO "encryption/decryption failed");
-            // TODO: Don't fail silently
-            return;
+            printk(KERN_INFO "skcipher request allocation failed");
+            return ret;
         }
 
         bv = bio_iter_iovec(io->bio_in, io->bi_iter);
@@ -188,11 +200,15 @@ static void enc_or_dec_bio(struct encryption_io *io, int enc_or_dec) {
         if (ret) {
             printk(KERN_INFO "encryption/decryption failed");
             // TODO: Don't fail silently
-            return;
+            return ret;
         }
+        
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
     }
-    skcipher_request_free(io->req);
+    // TODO: idk if this is right
+    mempool_free(io->req, &io->rbd->req_pool);
+    //skcipher_request_free(io->req);
+    return 0;
 }
 
 /**
@@ -216,18 +232,15 @@ static void decrypt_at_end_io(struct bio *clone) {
     bio_endio(read_bio->base_bio);
 }
 
-static void encryption_io_init(struct encryption_io *io, struct bio *bio, sector_t sector) {
+static void encryption_io_init(struct encryption_io *io, struct encryption_device *rbd, struct bio *bio, sector_t sector) {
 	io->sector = sector;
     io->base_bio = bio;
+    io->bio_in = bio;
+	io->bi_iter = bio->bi_iter;
+    io->rbd = rbd;
 	io->error = 0;
     return;
 }
-
-static void crypt_convert_init(struct encryption_io *io, struct bio *bio_in, sector_t sector) {
-	io->bio_in = bio_in;
-	io->bi_iter = bio_in->bi_iter;
-}
-
 
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
@@ -240,9 +253,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     // fetch data specific to bio
     io = dm_per_bio_data(bio, ti->per_io_data_size);
     // initialize fields for bio data that will be useful for encryption
-	encryption_io_init(io, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
-    crypt_convert_init(io, bio, io->sector);
-    io->rbd = rbd;
+	encryption_io_init(io, rbd, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
     printk(KERN_INFO "io properly initialized\n");
     if (bio_has_data(bio)) {
         switch (bio_data_dir(bio)) {
