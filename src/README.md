@@ -184,6 +184,11 @@ sudo apt install -y fio
 sudo fio --filename=/dev/ram0 --readwrite=readwrite --bs=4k --direct=1 --loops=20 --name=plain
 ```
 
+To remove the ramdisk, run:
+```bash
+sudo modprobe -r brd
+```
+
 
 ### Passthrough
 Load the passthrough device driver and measure its throughput.
@@ -210,6 +215,22 @@ Measure the throughput of our custom encrypting device mapper.
 Load our encryption device mapper:
 ```bash
 echo "0 `sudo blockdev --getsz /dev/ram0` encryption /dev/ram0" | sudo dmsetup create encryption
+```
+
+
+### Networking
+Measure the throughput overhead of networking.
+Replace `<listen port>`, `<server port 1>`, and `<server port 2>` with the desired ports. You can have as many server ports as you want (or no server ports).
+```bash
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
+```
+
+For example, set up networking locally between 2 ramdisks with 2GBs each, `/dev/ram0` and `/dev/ram1` respectively:
+```bash
+sudo modprobe brd rd_nr=2 rd_size=2097152
+sudo insmod server.ko
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 12345" | sudo dmsetup create server1
+echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 12346 12345" | sudo dmsetup create server2
 ```
 
 
