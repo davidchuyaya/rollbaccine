@@ -166,17 +166,14 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
 {
     int ret;
     struct bio_vec bv;
-    struct aead_request *req;
     while (io->bi_iter.bi_size)
     {
         
-        // printk(KERN_INFO "iv properly initialized\n");
-        printk(KERN_INFO "Starting Encryption/Decryption");
+        struct aead_request *req;
         struct scatterlist sg[4];
-        bv = bio_iter_iovec(io->bio_in, io->bi_iter);
         uint64_t curr_sector = io->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
-        // printk(KERN_INFO "start sector %llu", curr_sector);
+        bv = bio_iter_iovec(io->bio_in, io->bi_iter);
         struct encryption_metadata *entry = get_entry(&io->rbd->encryption_metadata_list, curr_sector);
         switch (enc_or_dec)
         {
@@ -196,10 +193,10 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             }
             break;
         case READ:
+            // if we ever read from a sector we never encrypted, we just return?
             if (entry == NULL)
             {
                 return 0;
-                // printk(KERN_INFO "sector not found");
             }
             else
             {
@@ -213,24 +210,10 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         if (!iv)
         {
             printk(KERN_INFO "could not allocate ivdata");
-            return -ENOMEM;
+            ret = -ENOMEM;
+            goto exit;
         }
         memcpy(iv, "123456789012", AES_GCM_IV_SIZE);
-        // static mac
-        // char* mac = kmalloc(16, GFP_KERNEL);
-        // if (!mac)
-        // {
-        //     printk(KERN_INFO "could not allocate mac");
-        //     return -ENOMEM;
-        // }
-        // static sector
-        // uint64_t *sector = kmalloc(sizeof(uint64_t), GFP_KERNEL);
-        // if (!sector)
-        // {
-        //     printk(KERN_INFO "could not allocate mac");
-        //     return -ENOMEM;
-        // }
-        // *sector = 1;
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
         sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
@@ -248,14 +231,13 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         {
             printk(KERN_INFO "aead request allocation failed");
             aead_request_free(req);
-            return ret;
+            kfree(iv);
+            ret = -ENOMEM;
+            goto exit;
         }         
         aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
         // sector + iv size
         aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
-        // aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv);
-        // ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
-
         switch (enc_or_dec)
         {
         case WRITE:
@@ -267,19 +249,24 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
             break;
         }
+        
         if (ret)
         {
-            printk(KERN_INFO "encryption/decryption failed");
+            if (ret == -EBADMSG) {
+            printk(KERN_INFO "invalid integrity check");
+            } else {
+                printk(KERN_INFO "encryption/decryption failed");
+            }
             aead_request_free(req);
-            // TODO: Don't fail silently
-            return ret;
+            kfree(iv);
+            goto exit;
         }
-        // TODO: check for integrtiy with ret == -EBADMSG
-        
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
         kfree(iv);
     }
     return 0;
+exit:
+    return ret;
 }
 
 /**
