@@ -22,6 +22,9 @@
 #define DM_MSG_PREFIX "encryption"
 
 #define SHA256_LENGTH 256
+#define AES_GCM_IV_SIZE 12
+#define AES_GCM_AUTH_SIZE 16
+#define KEY_SIZE 16
 
 #define MIN_IOS 64
 
@@ -48,25 +51,26 @@ typedef struct encryption_io
     // needed for iteration
     struct bio *bio_in;
     struct bvec_iter bi_iter;
-    // crypto stuff
-    sector_t sector;
+    uint64_t sector;
+    struct crypto_wait wait;
     struct encryption_device *rbd;
 
     blk_status_t error;
+
 } convert_context;
 
-struct encryption_metadata {
+// node to maintain encrypted sector and corresponding mac
+struct encryption_metadata
+{
     struct list_head list;
-    sector_t sector;
-    char mac[16];
+    uint64_t sector;
+    char mac[AES_GCM_AUTH_SIZE];
 };
 
 void cleanup(struct encryption_device *rbd)
 {
     if (rbd == NULL)
         return;
-    // if (rbd->ivdata)
-    //     kfree(rbd->ivdata);
     if (rbd->tfm)
         crypto_free_aead(rbd->tfm);
     bioset_exit(&rbd->bs);
@@ -116,10 +120,10 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     printk(KERN_INFO "transform properly initialized\n");
 
     // tag size
-    crypto_aead_setauthsize(rbd->tfm, 16);
+    crypto_aead_setauthsize(rbd->tfm, AES_GCM_AUTH_SIZE);
 
     rbd->key = "1234567890123456";
-    if (crypto_aead_setkey(rbd->tfm, rbd->key, 16))
+    if (crypto_aead_setkey(rbd->tfm, rbd->key, KEY_SIZE))
     {
         ti->error = "Key could not be set";
         ret = -EAGAIN;
@@ -143,12 +147,15 @@ out:
     return ret;
 }
 
-static struct encryption_metadata *get_entry(struct list_head *head, sector_t sector) {
+static struct encryption_metadata *get_entry(struct list_head *head, uint64_t sector)
+{
     struct encryption_metadata *curr_entry;
     struct list_head *ptr;
-    for (ptr = head->next; ptr != head; ptr = ptr->next) {
+    for (ptr = head->next; ptr != head; ptr = ptr->next)
+    {
         curr_entry = list_entry(ptr, struct encryption_metadata, list);
-        if (sector == curr_entry->sector) {
+        if (sector == curr_entry->sector)
+        {
             return curr_entry;
         }
     }
@@ -160,92 +167,117 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
     int ret;
     struct bio_vec bv;
     struct aead_request *req;
-    struct scatterlist sg[4];
-    // char* iv =  kmalloc(12, GFP_KERNEL);
-    //  if (!iv)
-    // {
-    //     printk(KERN_INFO "could not allocate ivdata");
-    //     return -ENOMEM;
-        
-    // }
-    // memcpy(iv, "123456789012", 12);
-    // printk(KERN_INFO "iv properly initialized\n");
-    printk(KERN_INFO "Starting Encryption/Decryption");
     while (io->bi_iter.bi_size)
     {
-        // req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
-        // if (!req)
-        // {
-        //     printk(KERN_INFO "aead request allocation failed");
-        //     return ret;
-        // }
-        // crypto_init_wait(&io->wait);
-        // aead_request_set_tfm(req, io->rbd->tfm);
-        // aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &io->wait);
         
-
-        // // sector + iv size
-	    // aead_request_set_ad(req, sizeof(uint64_t) + 12);
-
-        /* AEAD request:
-         *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
-         *  | (authenticated) | (auth+encryption) |              |
-         *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
-         */
-        // aead_request_set_crypt(req, sg_in, sg_out, len + this->auth_size, riv);
-
+        // printk(KERN_INFO "iv properly initialized\n");
+        printk(KERN_INFO "Starting Encryption/Decryption");
+        struct scatterlist sg[4];
         bv = bio_iter_iovec(io->bio_in, io->bi_iter);
-        sector_t curr_sector = io->bi_iter.bi_sector;
-        //printk(KERN_INFO "start sector %llu", curr_sector);
+        uint64_t curr_sector = io->bi_iter.bi_sector;
+        DECLARE_CRYPTO_WAIT(wait);
+        // printk(KERN_INFO "start sector %llu", curr_sector);
         struct encryption_metadata *entry = get_entry(&io->rbd->encryption_metadata_list, curr_sector);
         switch (enc_or_dec)
         {
         case WRITE:
             // sector has never been written to
-            if (entry == NULL) {
-                printk(KERN_INFO "Writing sector id %llu", curr_sector);
-                struct encryption_metadata *new = kmalloc(sizeof(struct encryption_metadata), GFP_KERNEL);
-                new->sector = curr_sector;
-                list_add(&new->list, &io->rbd->encryption_metadata_list);
-            } else {
+            if (entry == NULL)
+            {
+                printk(KERN_INFO "NEW WRITE: sector id %llu", curr_sector);
+                entry = kmalloc(sizeof(struct encryption_metadata), GFP_KERNEL);
+                entry->sector = curr_sector;
+                list_add(&entry->list, &io->rbd->encryption_metadata_list);
+                printk(KERN_INFO "Added item to list");
+            }
+            else
+            {
                 printk(KERN_INFO "WRITE: sector id %llu", entry->sector);
             }
             break;
         case READ:
-            if (entry == NULL) {
-                //printk(KERN_INFO "sector not found");
-            } else {
+            if (entry == NULL)
+            {
+                return 0;
+                // printk(KERN_INFO "sector not found");
+            }
+            else
+            {
                 printk(KERN_INFO "READ: sector id %llu", entry->sector);
             }
             break;
         }
-        // sg_init_table(sg, 4);
-        // // TODO: check if right
-        // sg_set_buf(&sg[0], sector, sizeof(uint64_t));
-        // sg_set_buf(&sg[1], &org_iv, 12);
-        // sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
-        // sg_set_buf(&sg[3], &tag, 16);
+        // Testing fields
+        // static IV
+        char *iv = kmalloc(AES_GCM_IV_SIZE, GFP_KERNEL);
+        if (!iv)
+        {
+            printk(KERN_INFO "could not allocate ivdata");
+            return -ENOMEM;
+        }
+        memcpy(iv, "123456789012", AES_GCM_IV_SIZE);
+        // static mac
+        // char* mac = kmalloc(16, GFP_KERNEL);
+        // if (!mac)
+        // {
+        //     printk(KERN_INFO "could not allocate mac");
+        //     return -ENOMEM;
+        // }
+        // static sector
+        // uint64_t *sector = kmalloc(sizeof(uint64_t), GFP_KERNEL);
+        // if (!sector)
+        // {
+        //     printk(KERN_INFO "could not allocate mac");
+        //     return -ENOMEM;
+        // }
+        // *sector = 1;
+        sg_init_table(sg, 4);
+        sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
+        sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
+        sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
+        sg_set_buf(&sg[3], &entry->mac, AES_GCM_AUTH_SIZE);
 
-        // switch (enc_or_dec)
-        // {
-        // case WRITE:
-        //     aead_request_set_crypt(&req, &sg, &sg, SECTOR_SIZE, &iv);
-        //     ret = crypto_wait_req(crypto_aead_encrypt(req), &io->wait);
-        //     break;
-        // case READ:
-        //     aead_request_set_crypt(&req, &sg, &sg, SECTOR_SIZE + 16, &iv);
-        //     ret = crypto_wait_req(crypto_aead_decrypt(&req), &io->wait);
-        //     break;
-        // }
-        // if (ret)
-        // {
-        //     printk(KERN_INFO "encryption/decryption failed");
-        //     // TODO: Don't fail silently
-        //     return ret;
-        // }
+        // /* AEAD request:
+        //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
+        //  *  | (authenticated) | (auth+encryption) |              |
+        //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
+        //  */
+        printk(KERN_INFO "allocating aead request");
+        req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
+        if (!req)
+        {
+            printk(KERN_INFO "aead request allocation failed");
+            aead_request_free(req);
+            return ret;
+        }         
+        aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+        // sector + iv size
+        aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
+        // aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv);
+        // ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+
+        switch (enc_or_dec)
+        {
+        case WRITE:
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv);
+            ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+            break;
+        case READ:
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv);
+            ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+            break;
+        }
+        if (ret)
+        {
+            printk(KERN_INFO "encryption/decryption failed");
+            aead_request_free(req);
+            // TODO: Don't fail silently
+            return ret;
+        }
         // TODO: check for integrtiy with ret == -EBADMSG
-
+        
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
+        kfree(iv);
     }
     return 0;
 }
@@ -272,7 +304,7 @@ static void decrypt_at_end_io(struct bio *clone)
     bio_endio(read_bio->base_bio);
 }
 
-static void encryption_io_init(struct encryption_io *io, struct encryption_device *rbd, struct bio *bio, sector_t sector)
+static void encryption_io_init(struct encryption_io *io, struct encryption_device *rbd, struct bio *bio, uint64_t sector)
 {
     // TODO: maybe look into adding an iv_offset if neccesarry
     io->sector = sector;
@@ -302,7 +334,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
         switch (bio_data_dir(bio))
         {
         case WRITE:
-            sector_t original_sector = io->sector;
+            uint64_t original_sector = io->sector;
             unsigned int original_size = bio->bi_iter.bi_size;
             unsigned int original_idx = bio->bi_iter.bi_idx;
 
