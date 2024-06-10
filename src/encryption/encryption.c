@@ -38,9 +38,10 @@ struct encryption_device
     char *key;
     // not sure what this is, but it's needed to create a clone of the bio
     struct bio_set bs;
-    // head of linked list containing mappings from sector to mac
-    // TOOO: synchronize access
+    // list containing mappings from sector to mac
     struct list_head encryption_metadata_list;
+    // lock for list
+    struct mutex lock;
 };
 
 // per bio private data
@@ -136,6 +137,9 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // initialize list
     INIT_LIST_HEAD(&rbd->encryption_metadata_list);
 
+    // initialize lock
+    mutex_init(&rbd->lock);
+
     // TODO: Look into putting hashes inside of here too and some rounding?
     ti->per_io_data_size = sizeof(struct encryption_io);
     ti->private = rbd;
@@ -168,13 +172,17 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
     struct bio_vec bv;
     while (io->bi_iter.bi_size)
     {
-        
+
         struct aead_request *req;
         struct scatterlist sg[4];
         uint64_t curr_sector = io->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(io->bio_in, io->bi_iter);
+        ret = mutex_lock_interruptible(&io->rbd->lock);
+        if (ret)
+            goto exit;
         struct encryption_metadata *entry = get_entry(&io->rbd->encryption_metadata_list, curr_sector);
+        mutex_unlock(&io->rbd->lock);
         switch (enc_or_dec)
         {
         case WRITE:
@@ -184,7 +192,11 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
                 printk(KERN_INFO "NEW WRITE: sector id %llu", curr_sector);
                 entry = kmalloc(sizeof(struct encryption_metadata), GFP_KERNEL);
                 entry->sector = curr_sector;
+                ret = mutex_lock_interruptible(&io->rbd->lock);
+                if (ret)
+                    goto exit;
                 list_add(&entry->list, &io->rbd->encryption_metadata_list);
+                mutex_unlock(&io->rbd->lock);
                 printk(KERN_INFO "Added item to list");
             }
             else
@@ -234,7 +246,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             kfree(iv);
             ret = -ENOMEM;
             goto exit;
-        }         
+        }
         aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
         // sector + iv size
         aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
@@ -249,12 +261,15 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
             break;
         }
-        
+
         if (ret)
         {
-            if (ret == -EBADMSG) {
-            printk(KERN_INFO "invalid integrity check");
-            } else {
+            if (ret == -EBADMSG)
+            {
+                printk(KERN_INFO "invalid integrity check");
+            }
+            else
+            {
                 printk(KERN_INFO "encryption/decryption failed");
             }
             aead_request_free(req);
