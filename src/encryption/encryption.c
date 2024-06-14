@@ -26,7 +26,14 @@
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
 
+#define RAM_SIZE_GB 4
+#define TOTAL_RAM_BYTES (RAM_SIZE_GB * 1024UL * 1024 * 1024)
+#define TOTAL_SECTORS (TOTAL_RAM_BYTES / SECTOR_SIZE)
+#define TOTAL_HASH_MEMORY (TOTAL_SECTORS * AES_GCM_AUTH_SIZE)
+#define BITMAP_SIZE ((TOTAL_SECTORS + 7) / 8) // Number of bytes needed for bitmap
+
 #define MIN_IOS 64
+
 
 // Data attached to each bio
 struct encryption_device
@@ -42,6 +49,10 @@ struct encryption_device
     struct list_head encryption_metadata_list;
     // lock for list
     struct mutex lock;
+    // array of hashes of each sector
+    char checksums[TOTAL_HASH_MEMORY];
+    // bitmap for accessed sectors
+    char bitmap[BITMAP_SIZE]
 };
 
 // per bio private data
@@ -94,6 +105,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     struct encryption_device *rbd;
     printk(KERN_INFO "encryption constructor called\n");
 
+    // TODO: look into vzalloc
     rbd = kmalloc(sizeof(struct encryption_device), GFP_KERNEL);
     if (rbd == NULL)
     {
@@ -135,10 +147,13 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     bioset_init(&rbd->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
 
     // initialize list
-    INIT_LIST_HEAD(&rbd->encryption_metadata_list);
+    // INIT_LIST_HEAD(&rbd->encryption_metadata_list);
 
     // initialize lock
-    mutex_init(&rbd->lock);
+    // mutex_init(&rbd->lock);
+
+    // zero out bitmap
+    memset(rbd->bitmap, 0, BITMAP_SIZE);
 
     // TODO: Look into putting hashes inside of here too and some rounding?
     ti->per_io_data_size = sizeof(struct encryption_io);
@@ -166,6 +181,24 @@ static struct encryption_metadata *get_entry(struct list_head *head, uint64_t se
     return NULL;
 }
 
+// bitmap calculations
+// 1. first find out what byte in our bitmap we should be
+// 2. check the actual bit in the byte
+
+static inline void set_bitmap(unsigned char *bitmap, sector_t index) {
+    
+    bitmap[index / 8] |= (1 << (index % 8));
+}
+
+static inline int test_bitmap(const unsigned char *bitmap, sector_t index) {
+    return bitmap[index / 8] & (1 << (index % 8));
+}
+
+static inline unsigned char checksum_index(sector_t index) {
+    return index * AES_GCM_AUTH_SIZE;
+}
+
+
 static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
 {
     int ret;
@@ -178,41 +211,43 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         uint64_t curr_sector = io->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(io->bio_in, io->bi_iter);
-        ret = mutex_lock_interruptible(&io->rbd->lock);
-        if (ret)
-            goto exit;
-        struct encryption_metadata *entry = get_entry(&io->rbd->encryption_metadata_list, curr_sector);
-        mutex_unlock(&io->rbd->lock);
+        // ret = mutex_lock_interruptible(&io->rbd->lock);
+        // if (ret)
+        //     goto exit;
+        // struct encryption_metadata *entry = get_entry(&io->rbd->encryption_metadata_list, curr_sector);
+        // mutex_unlock(&io->rbd->lock);
         switch (enc_or_dec)
         {
         case WRITE:
             // sector has never been written to
-            if (entry == NULL)
+            if (!test_bitmap(io->rbd->bitmap, curr_sector))
             {
                 printk(KERN_INFO "NEW WRITE: sector id %llu", curr_sector);
-                entry = kmalloc(sizeof(struct encryption_metadata), GFP_KERNEL);
-                entry->sector = curr_sector;
-                ret = mutex_lock_interruptible(&io->rbd->lock);
-                if (ret)
-                    goto exit;
-                list_add(&entry->list, &io->rbd->encryption_metadata_list);
-                mutex_unlock(&io->rbd->lock);
-                printk(KERN_INFO "Added item to list");
+                set_bitmap(io->rbd->bitmap, curr_sector);
+
+                // entry = kmalloc(sizeof(struct encryption_metadata), GFP_KERNEL);
+                // entry->sector = curr_sector;
+                // ret = mutex_lock_interruptible(&io->rbd->lock);
+                // if (ret)
+                //     goto exit;
+                // list_add(&entry->list, &io->rbd->encryption_metadata_list);
+                // mutex_unlock(&io->rbd->lock);
+                //printk(KERN_INFO "Added item to list");
             }
             else
             {
-                printk(KERN_INFO "WRITE: sector id %llu", entry->sector);
+                printk(KERN_INFO "WRITE: sector id %llu", curr_sector);
             }
             break;
         case READ:
             // if we ever read from a sector we never encrypted, we just return?
-            if (entry == NULL)
+            if (!test_bitmap(io->rbd->bitmap, curr_sector))
             {
                 return 0;
             }
             else
             {
-                printk(KERN_INFO "READ: sector id %llu", entry->sector);
+                printk(KERN_INFO "READ: sector id %llu", curr_sector);
             }
             break;
         }
@@ -230,7 +265,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
         sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
         sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
-        sg_set_buf(&sg[3], &entry->mac, AES_GCM_AUTH_SIZE);
+        sg_set_buf(&sg[3], &io->rbd->checksums[checksum_index(curr_sector)], AES_GCM_AUTH_SIZE);
 
         // /* AEAD request:
         //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
