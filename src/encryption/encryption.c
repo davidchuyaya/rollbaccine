@@ -26,11 +26,10 @@
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
 
-#define RAM_SIZE_GB 4
-#define TOTAL_RAM_BYTES (RAM_SIZE_GB * 1024UL * 1024 * 1024)
+#define RAM_SIZE_GB 1
+#define TOTAL_RAM_BYTES 10240
 #define TOTAL_SECTORS (TOTAL_RAM_BYTES / SECTOR_SIZE)
 #define TOTAL_HASH_MEMORY (TOTAL_SECTORS * AES_GCM_AUTH_SIZE)
-#define BITMAP_SIZE ((TOTAL_SECTORS + 7) / 8) // Number of bytes needed for bitmap
 
 #define MIN_IOS 64
 
@@ -51,8 +50,7 @@ struct encryption_device
     struct mutex lock;
     // array of hashes of each sector
     char checksums[TOTAL_HASH_MEMORY];
-    // bitmap for accessed sectors
-    char bitmap[BITMAP_SIZE]
+
 };
 
 // per bio private data
@@ -114,6 +112,10 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         goto out;
     }
 
+    // Check the allocation of the large checksums array
+    printk(KERN_INFO "Allocated memory for encryption_device: %zu bytes\n", sizeof(struct encryption_device));
+
+
     // Get the device from argv[0] and store it in rbd->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &rbd->dev))
     {
@@ -152,8 +154,9 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     // initialize lock
     // mutex_init(&rbd->lock);
 
-    // zero out bitmap
-    memset(rbd->bitmap, 0, BITMAP_SIZE);
+    // zero out checksums
+    //memset(rbd->checksums, 0, TOTAL_HASH_MEMORY);
+
 
     // TODO: Look into putting hashes inside of here too and some rounding?
     ti->per_io_data_size = sizeof(struct encryption_io);
@@ -181,21 +184,8 @@ static struct encryption_metadata *get_entry(struct list_head *head, uint64_t se
     return NULL;
 }
 
-// bitmap calculations
-// 1. first find out what byte in our bitmap we should be
-// 2. check the actual bit in the byte
-
-static inline void set_bitmap(unsigned char *bitmap, sector_t index) {
-    
-    bitmap[index / 8] |= (1 << (index % 8));
-}
-
-static inline int test_bitmap(const unsigned char *bitmap, sector_t index) {
-    return bitmap[index / 8] & (1 << (index % 8));
-}
-
-static inline unsigned char checksum_index(sector_t index) {
-    return index * AES_GCM_AUTH_SIZE;
+static inline unsigned char *checksum_index(struct encryption_io *io, sector_t index) {
+    return &io->rbd->checksums[index * AES_GCM_AUTH_SIZE];
 }
 
 
@@ -220,10 +210,9 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         {
         case WRITE:
             // sector has never been written to
-            if (!test_bitmap(io->rbd->bitmap, curr_sector))
+            if (*checksum_index(io, curr_sector) == 0)
             {
                 printk(KERN_INFO "NEW WRITE: sector id %llu", curr_sector);
-                set_bitmap(io->rbd->bitmap, curr_sector);
 
                 // entry = kmalloc(sizeof(struct encryption_metadata), GFP_KERNEL);
                 // entry->sector = curr_sector;
@@ -241,7 +230,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             break;
         case READ:
             // if we ever read from a sector we never encrypted, we just return?
-            if (!test_bitmap(io->rbd->bitmap, curr_sector))
+            if (*checksum_index(io, curr_sector) == 0)
             {
                 return 0;
             }
@@ -265,7 +254,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
         sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
         sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
-        sg_set_buf(&sg[3], &io->rbd->checksums[checksum_index(curr_sector)], AES_GCM_AUTH_SIZE);
+        sg_set_buf(&sg[3], checksum_index(io, curr_sector), AES_GCM_AUTH_SIZE);
 
         // /* AEAD request:
         //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
