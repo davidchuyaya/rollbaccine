@@ -83,10 +83,12 @@ void cleanup(struct encryption_device *rbd)
 {
     if (rbd == NULL)
         return;
+    if (rbd->checksums == NULL)
+        kvfree(rbd->checksums);
     if (rbd->tfm)
         crypto_free_aead(rbd->tfm);
     bioset_exit(&rbd->bs);
-    vfree(rbd);
+    kfree(rbd);
 }
 
 static void encryption_destructor(struct dm_target *ti)
