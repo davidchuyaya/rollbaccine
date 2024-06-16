@@ -7,6 +7,7 @@
 #include <linux/bio.h>
 #include <linux/scatterlist.h>
 #include <linux/list.h>
+#include <linux/vmalloc.h>
 #include <linux/string.h>
 #include <linux/gfp.h>
 #include <linux/err.h>
@@ -27,8 +28,9 @@
 #define KEY_SIZE 16
 
 #define RAM_SIZE_GB 1
-#define TOTAL_RAM_BYTES 10240
-#define TOTAL_SECTORS (TOTAL_RAM_BYTES / SECTOR_SIZE)
+#define TOTAL_RAM_BYTES RAM_SIZE_GB * 1024 * 1024 * 1024
+#define TOTAL_TEST_SECTORS 8388608
+#define TOTAL_SECTORS TOTAL_RAM_BYTES / SECTOR_SIZE
 #define TOTAL_HASH_MEMORY (TOTAL_SECTORS * AES_GCM_AUTH_SIZE)
 
 #define MIN_IOS 64
@@ -49,7 +51,7 @@ struct encryption_device
     // lock for list
     struct mutex lock;
     // array of hashes of each sector
-    char checksums[TOTAL_HASH_MEMORY];
+    char* checksums;
 
 };
 
@@ -84,7 +86,7 @@ void cleanup(struct encryption_device *rbd)
     if (rbd->tfm)
         crypto_free_aead(rbd->tfm);
     bioset_exit(&rbd->bs);
-    kfree(rbd);
+    vfree(rbd);
 }
 
 static void encryption_destructor(struct dm_target *ti)
@@ -156,6 +158,12 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
     // zero out checksums
     //memset(rbd->checksums, 0, TOTAL_HASH_MEMORY);
+    rbd->checksums = kvmalloc_array(TOTAL_TEST_SECTORS, AES_GCM_AUTH_SIZE, GFP_KERNEL | __GFP_ZERO);
+    if (!rbd->checksums) {
+        ti->error = "Cannot allocate checksums";
+        ret = -ENOMEM;
+        goto out;
+    }
 
 
     // TODO: Look into putting hashes inside of here too and some rounding?
