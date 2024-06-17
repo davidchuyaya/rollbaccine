@@ -123,7 +123,20 @@ Host localvm
 ```
 </details>
 
- To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
+
+### VSCode setup
+
+To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
+
+In order for VSCode to understand Linux kernel headers, we will follow instructions from the [vscode-linux-kernel](https://github.com/amezin/vscode-linux-kernel) repo:
+```bash
+cd rollbaccine
+rm -rf .vscode
+git clone https://github.com/amezin/vscode-linux-kernel .vscode
+python3 .vscode/generate_compdb.py -O /lib/modules/5.15.0-107-generic/build $PWD
+```
+
+Replace `5.15.0-107-generic` with the output of `uname -r` on the VM.
 
 
 ### Setting up the VM
