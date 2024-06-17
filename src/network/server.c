@@ -117,7 +117,6 @@ static void kill_thread(struct socket *sock) {
     // Shut down the socket, causing the thread to unblock (if it was blocked on a socket)
     if (sock != NULL) {
         kernel_sock_shutdown(sock, SHUT_RDWR);
-        sock_release(sock);
     }
 }
 
@@ -160,6 +159,9 @@ void blocking_read(struct server_device *device, struct socket *sock, enum Conne
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
     kfree(buffer);
+    kernel_sock_shutdown(sock, SHUT_RDWR);
+    // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut it down.
+//     sock_release(sock);
 }
 
 int connect_to_server(void *args) {
@@ -322,9 +324,9 @@ int listen_for_connections(void* args) {
         new_connected_socket_list->sock = new_sock;
         spin_lock(&device->connected_sockets_lock);
         if (thread_params->conn_type == METADATA) {
-            list_add(&new_server_socket_list->list, &device->connected_metadata_sockets);
+            list_add(&new_connected_socket_list->list, &device->connected_metadata_sockets);
         } else {
-            list_add(&new_server_socket_list->list, &device->connected_bio_sockets);
+            list_add(&new_connected_socket_list->list, &device->connected_bio_sockets);
         }
         spin_unlock(&device->connected_sockets_lock);
 
@@ -349,6 +351,10 @@ int listen_for_connections(void* args) {
         }
     }
 
+    kernel_sock_shutdown(thread_params->sock, SHUT_RDWR);
+    // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut
+    // it down.
+    //     sock_release(thread_params->sock);
     kfree(thread_params);
     return 0;
 }
