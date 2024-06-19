@@ -1,5 +1,5 @@
 /**
- * This file is heavily inspired by https://github.com/sysprog21/kecho/tree/master.
+ * This file is heavily inspired by https://github.com/sysprog21/kecho/tree/master and https://github.com/LINBIT/drbd.
  * Given a server port, this module will create 2 servers, 1 for the metadata and 1 for the actual bio blocks, at port and port+1 respectively.
  * Note: In order to kill threads on shutdown, we create a list of all open sockets that threads could be blocked on, and close them on shutdown.
  *       We also set shutting_down = true so a thread who returns from a blocking operation sees it and exits.
@@ -39,6 +39,12 @@ struct msg {
     sector_t sector;
     // TODO: Figure out how to send variable number of hashes
     // char hash[ROLLBACCINE_HASH_SIZE];
+};
+
+// For storing lists of messages, bios, etc
+struct generic_list {
+	void *data;
+	struct list_head list;
 };
 
 // Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
@@ -97,13 +103,76 @@ struct listen_thread_params {
     enum ConnectionType conn_type;
 };
 
-void broadcast(struct server_device *device, unsigned char* buffer, enum ConnectionType conn_type) {
-	int sent;
+void broadcast_bio(struct server_device *device, struct bio *bio) {
+    // TODO Instead of sending synchronously, we should:
+	// 1. Copy the bio
+    // 2. Return
+    // 3. Asynchronously send over the network
+
+    int sent;
+    struct msghdr msg_header;
+    struct socket_list *curr, *next;
+    struct bio_vec bvec, chunked_bvec;
+    struct bvec_iter iter;
+    struct list_head *sockets = &device->connected_bio_sockets;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;  // TODO: May need MSG_SPLICE_PAGES, as seen in DRBD. Requires newer kernel version? Otherwise may need to map userspace page to kernel space?
+
+	spin_lock(&device->connected_sockets_lock);
+	list_for_each_entry_safe(curr, next, sockets, list) {
+		bio_for_each_segment(bvec, bio, iter) {
+			// TODO: DRBD adds a MSG_MORE flag to the end. We probably want to do this for variable size writes.
+			// TODO: We also should supply the size of the bio
+			// TODO: We need to hash the bio and check it against the metadata as well
+
+			// Note: Replaced with bvec_set_page() in newer kernel versions
+			chunked_bvec.bv_page = bvec.bv_page;
+			chunked_bvec.bv_offset = bvec.bv_offset;
+			// TODO: Sends by page increments for now. Could send more? Check out DRBD does it
+			chunked_bvec.bv_len = bvec.bv_len;
+
+			// Keep retrying send until the whole message is sent
+			while (chunked_bvec.bv_len > 0) {
+				// Note: Replaced WRITE with ITER_SOURCE in newer kernel versions
+				iov_iter_bvec(&msg_header.msg_iter, WRITE, &chunked_bvec, 1, chunked_bvec.bv_len);
+
+				sent = sock_sendmsg(curr->sock, &msg_header);
+				if (sent <= 0) {
+					printk(KERN_ERR "Error sending message, aborting send");
+					// TODO: Should remove the socket from the list and shut down the connection?
+					goto finish_sending_to_socket;
+				} else {
+					chunked_bvec.bv_offset += sent;
+					chunked_bvec.bv_len -= sent;
+				}
+			}
+		}
+		// Label to jump to if socket cannot be written to, so we can iterate the next socket
+		finish_sending_to_socket:
+	}
+	printk(KERN_INFO "Sent bio");
+	spin_unlock(&device->connected_sockets_lock);
+}
+
+void broadcast_bio_metadata(struct server_device *device, struct bio *bio) {
+    int sent;
     struct msghdr msg_header;
     struct kvec vec;
     struct socket_list *curr, *next;
-	struct list_head *sockets = conn_type == METADATA ? &device->connected_metadata_sockets : &device->connected_bio_sockets;
-	size_t buffer_size = conn_type == METADATA ? sizeof(struct msg) : ROLLBACCINE_ENCRYPT_GRANULARITY;
+    struct msg message;
+    struct list_head *sockets = &device->connected_metadata_sockets;
+    size_t buffer_size = sizeof(struct msg);
+
+	// The message to send
+    message.type = ROLLBACCINE_WRITE;
+    message.bal = device->bal;
+    message.write_index = atomic_inc_return(&device->write_index);
+    message.num_pages = (bio->bi_iter.bi_size / PAGE_SIZE) + 1;
+    message.sector = bio->bi_iter.bi_sector;
 
     msg_header.msg_name = NULL;
     msg_header.msg_namelen = 0;
@@ -113,7 +182,7 @@ void broadcast(struct server_device *device, unsigned char* buffer, enum Connect
 
     spin_lock(&device->connected_sockets_lock);
     list_for_each_entry_safe(curr, next, sockets, list) {
-        vec.iov_base = buffer;
+        vec.iov_base = &message;
         vec.iov_len = buffer_size;
 
         // Keep retrying send until the whole message is sent
@@ -127,37 +196,10 @@ void broadcast(struct server_device *device, unsigned char* buffer, enum Connect
                 vec.iov_base += sent;
                 vec.iov_len -= sent;
             }
-		}
-	}
-    printk(KERN_INFO "Sent %s message", conn_type == METADATA ? "metadata" : "bio");
+        }
+    }
+    printk(KERN_INFO "Sent metadata message, sector: %llu, num pages: %u", message.sector, message.num_pages);
     spin_unlock(&device->connected_sockets_lock);
-}
-
-void broadcast_bio(struct server_device *device, struct bio *bio) {
-    // TODO 1. Copy the bio
-    // 2. Return
-    // 3. Asynchronously send over the network
-
-    // Temporary hack: Just send the message synchronously
-    // unsigned char *buffer;
-
-    // buffer = kzalloc(ROLLBACCINE_ENCRYPT_GRANULARITY, GFP_KERNEL);
-    // if (buffer == NULL) {
-    //     printk(KERN_ERR "Error allocating buffer");
-    //     return;
-    // }
-}
-
-void broadcast_bio_metadata(struct server_device *device, struct bio *bio) {
-	struct msg message;
-	message.type = ROLLBACCINE_WRITE;
-	message.bal = device->bal;
-	message.write_index = atomic_inc_return(&device->write_index);
-	message.num_pages = (bio->bi_iter.bi_size / PAGE_SIZE) + 1;
-	message.sector = bio->bi_iter.bi_sector;
-
-	broadcast(device, (unsigned char *)&message, METADATA);
-	// TODO: Prepare listener for receiving metadata
 }
 
 static int server_map(struct dm_target *ti, struct bio *bio) {
@@ -229,10 +271,13 @@ void blocking_read(struct server_device *device, struct socket *sock, enum Conne
 		// A full message has been received
 		if (conn_type == METADATA) {
 			message = (struct msg *)buffer;
-			printk(KERN_INFO "Message sector: %llu", message->sector);
+			printk(KERN_INFO "Received message sector: %llu, num pages: %u", message->sector, message->num_pages);
+
+			spin_lock(&device->received_metadata_lock);
+
 		}
 		else {
-			printk(KERN_INFO "Received data block");
+			printk(KERN_INFO "Received data block: %s", buffer);
 		}
     }
 
@@ -514,6 +559,8 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
 
     device->shutting_down = false;
     spin_lock_init(&device->connected_sockets_lock);
+	spin_lock_init(&device->received_metadata_lock);
+	spin_lock_init(&device->received_bios_lock);
 
     // Get the device from argv[0] and store it in device->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &device->dev)) {
