@@ -68,6 +68,12 @@ struct server_device {
     spinlock_t connected_sockets_lock;
     struct list_head connected_metadata_sockets;
     struct list_head connected_bio_sockets;
+
+	// Received metadata and bios
+	spinlock_t received_metadata_lock;
+	struct list_head received_metadata;
+	spinlock_t received_bios_lock;
+	struct list_head received_bios;
 };
 
 // Thread params: Parameters passed into threads. Should be freed by the thread when it exits.
@@ -91,24 +97,81 @@ struct listen_thread_params {
     enum ConnectionType conn_type;
 };
 
+void broadcast(struct server_device *device, unsigned char* buffer, enum ConnectionType conn_type) {
+	int sent;
+    struct msghdr msg_header;
+    struct kvec vec;
+    struct socket_list *curr, *next;
+	struct list_head *sockets = conn_type == METADATA ? &device->connected_metadata_sockets : &device->connected_bio_sockets;
+	size_t buffer_size = conn_type == METADATA ? sizeof(struct msg) : ROLLBACCINE_ENCRYPT_GRANULARITY;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    spin_lock(&device->connected_sockets_lock);
+    list_for_each_entry_safe(curr, next, sockets, list) {
+        vec.iov_base = buffer;
+        vec.iov_len = buffer_size;
+
+        // Keep retrying send until the whole message is sent
+        while (vec.iov_len > 0) {
+            sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
+            if (sent <= 0) {
+                printk(KERN_ERR "Error sending message, aborting send");
+                // TODO: Should remove the socket from the list and shut down the connection?
+                break;
+            } else {
+                vec.iov_base += sent;
+                vec.iov_len -= sent;
+            }
+		}
+	}
+    printk(KERN_INFO "Sent %s message", conn_type == METADATA ? "metadata" : "bio");
+    spin_unlock(&device->connected_sockets_lock);
+}
+
 void broadcast_bio(struct server_device *device, struct bio *bio) {
     // TODO 1. Copy the bio
     // 2. Return
     // 3. Asynchronously send over the network
 
     // Temporary hack: Just send the message synchronously
+    // unsigned char *buffer;
+
+    // buffer = kzalloc(ROLLBACCINE_ENCRYPT_GRANULARITY, GFP_KERNEL);
+    // if (buffer == NULL) {
+    //     printk(KERN_ERR "Error allocating buffer");
+    //     return;
+    // }
+}
+
+void broadcast_bio_metadata(struct server_device *device, struct bio *bio) {
+	struct msg message;
+	message.type = ROLLBACCINE_WRITE;
+	message.bal = device->bal;
+	message.write_index = atomic_inc_return(&device->write_index);
+	message.num_pages = (bio->bi_iter.bi_size / PAGE_SIZE) + 1;
+	message.sector = bio->bi_iter.bi_sector;
+
+	broadcast(device, (unsigned char *)&message, METADATA);
+	// TODO: Prepare listener for receiving metadata
 }
 
 static int server_map(struct dm_target *ti, struct bio *bio) {
     struct server_device *device = ti->private;
-    bio_set_dev(bio, device->dev->bdev);
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Copy bio if it's a write
     if (bio_has_data(bio) && bio_data_dir(bio) == WRITE) {
+		broadcast_bio_metadata(device, bio);
         broadcast_bio(device, bio);
     }
     // TODO: Detect fsyncs
+
+    bio_set_dev(bio, device->dev->bdev);
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     return DM_MAPIO_REMAPPED;
 }
@@ -123,9 +186,11 @@ static void kill_thread(struct socket *sock) {
 // Function used by all listening sockets to block and listen to messages
 void blocking_read(struct server_device *device, struct socket *sock, enum ConnectionType conn_type) {
     unsigned char* buffer;
+	struct msg* message;
     struct msghdr msg_header;
     struct kvec vec;
     size_t buffer_size;
+	int received;
 
     if (conn_type == METADATA) {
         buffer_size = sizeof(struct msg);
@@ -139,8 +204,6 @@ void blocking_read(struct server_device *device, struct socket *sock, enum Conne
         return;
     }
 
-    vec.iov_base = buffer;
-    vec.iov_len = buffer_size;
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
     msg_header.msg_control = NULL;
@@ -148,15 +211,32 @@ void blocking_read(struct server_device *device, struct socket *sock, enum Conne
     msg_header.msg_flags = 0;
 
     while (!device->shutting_down) {
-        int len = kernel_recvmsg(sock, &msg_header, &vec, buffer_size, buffer_size, msg_header.msg_flags);
-        if (len <= 0) {
-            printk(KERN_ERR "Error reading from socket");
-            break;
-        }
+        vec.iov_base = buffer;
+        vec.iov_len = buffer_size;
 
-        printk(KERN_INFO "Received message: %s", buffer);
+        // Keep reading until we've received a full message
+        while (!device->shutting_down && vec.iov_len > 0) {
+            received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+            if (received <= 0) {
+                printk(KERN_ERR "Error reading from socket");
+                goto cleanup;
+            }
+
+            vec.iov_base += received;
+            vec.iov_len -= received;
+		}
+
+		// A full message has been received
+		if (conn_type == METADATA) {
+			message = (struct msg *)buffer;
+			printk(KERN_INFO "Message sector: %llu", message->sector);
+		}
+		else {
+			printk(KERN_INFO "Received data block");
+		}
     }
 
+	cleanup:
     printk(KERN_INFO "Shutting down, exiting blocking read");
     kfree(buffer);
     kernel_sock_shutdown(sock, SHUT_RDWR);
@@ -200,27 +280,6 @@ int connect_to_server(void *args) {
     spin_unlock(&thread_params->device->connected_sockets_lock);
 
     blocking_read(thread_params->device, thread_params->sock, thread_params->conn_type);
-
-    // // Test sending a message
-    // buffer = kzalloc(BUFFER_SIZE, GFP_KERNEL);
-    // if (buffer == NULL) {
-    //     printk(KERN_ERR "Error allocating buffer");
-    //     return -1;
-    // }
-    // memcpy(buffer, "Hello, world!", 14);
-
-    // vec.iov_base = buffer;
-    // vec.iov_len = BUFFER_SIZE;
-    
-    // msg.msg_name = NULL;
-    // msg.msg_namelen = 0;
-    // msg.msg_control = NULL;
-    // msg.msg_controllen = 0;
-    // msg.msg_flags = 0;
-
-    // printk(KERN_INFO "Sending message");
-    // kernel_sendmsg(thread_params->sock, &msg, &vec, 1, BUFFER_SIZE);
-    // printk(KERN_INFO "Sent message");
 
     cleanup:
     kfree(thread_params);
