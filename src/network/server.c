@@ -19,6 +19,7 @@
 #define ROLLBACCINE_RETRY_TIMEOUT 5000 // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_HASH_SIZE 256
+#define MIN_IOS 64
 #define MODULE_NAME "server"
 
 enum ConnectionType { METADATA, BIO };
@@ -36,6 +37,7 @@ struct msg {
     unsigned int num_pages;
 
     // Metadata about the bio
+    unsigned int bi_opf;
     sector_t sector;
     // TODO: Figure out how to send variable number of hashes
     // char hash[ROLLBACCINE_HASH_SIZE];
@@ -55,6 +57,8 @@ struct socket_list {
 
 struct server_device {
     struct dm_dev *dev;
+    struct bio_set bs;
+    bool is_leader;
     bool shutting_down; // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
 
     struct ballot bal;
@@ -206,7 +210,10 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     struct server_device *device = ti->private;
 
     // Copy bio if it's a write
-    if (bio_has_data(bio) && bio_data_dir(bio) == WRITE) {
+    // TODO: At this point, the buffer is still in userspace. But networking already works? If we only want to send the encrypted block, we should do it in end_io?
+    if (device->is_leader && bio_has_data(bio) && bio_data_dir(bio) == WRITE) {
+        printk(KERN_INFO "bi_opf: %u", bio->bi_opf);
+        printk(KERN_INFO "Write bi_opf: %u", REQ_OP_WRITE);
 		broadcast_bio_metadata(device, bio);
         broadcast_bio(device, bio);
     }
@@ -229,6 +236,8 @@ static void kill_thread(struct socket *sock) {
 void blocking_read(struct server_device *device, struct socket *sock, enum ConnectionType conn_type) {
     unsigned char* buffer;
 	struct msg* message;
+    struct bio* bio_to_submit;
+    struct page* page;
     struct msghdr msg_header;
     struct kvec vec;
     size_t buffer_size;
@@ -266,22 +275,39 @@ void blocking_read(struct server_device *device, struct socket *sock, enum Conne
 
             vec.iov_base += received;
             vec.iov_len -= received;
-		}
+        }
 
-		// A full message has been received
-		if (conn_type == METADATA) {
-			message = (struct msg *)buffer;
-			printk(KERN_INFO "Received message sector: %llu, num pages: %u", message->sector, message->num_pages);
+        // A full message has been received
+        if (conn_type == METADATA) {
+            message = (struct msg *)buffer;
+            printk(KERN_INFO "Received message sector: %llu, num pages: %u", message->sector, message->num_pages);
 
-			spin_lock(&device->received_metadata_lock);
+            spin_lock(&device->received_metadata_lock);
 
-		}
-		else {
-			printk(KERN_INFO "Received data block: %s", buffer);
-		}
+        }
+        else {
+            printk(KERN_INFO "Received data block: %s", buffer);
+
+            bio_to_submit = bio_alloc_bioset(GFP_NOIO, 1, &device->bs);
+            bio_to_submit->bi_private = device;
+            bio_set_dev(bio_to_submit, device->dev->bdev);
+            bio_to_submit->bi_opf = REQ_OP_WRITE; // TODO: Copy from metadata
+            bio_to_submit->bi_iter.bi_sector = 0; // TODO: Copy from metadata
+
+            // Copy data from buffer to bio
+            page = alloc_page(GFP_KERNEL);
+            if (page == NULL) {
+                printk(KERN_ERR "Error allocating page");
+                goto cleanup;
+            }
+            memcpy(page_address(page), buffer, buffer_size);
+            bio_add_page(bio_to_submit, page, buffer_size, 0);
+
+            submit_bio_noacct(bio_to_submit);
+        }
     }
 
-	cleanup:
+    cleanup:
     printk(KERN_INFO "Shutting down, exiting blocking read");
     kfree(buffer);
     kernel_sock_shutdown(sock, SHUT_RDWR);
@@ -544,7 +570,7 @@ static int start_server(struct server_device *device, ushort port, enum Connecti
     return 0;
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = listen port. 2+ = server ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = is_leader. 2 = listen port. 3+ = server ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
     ushort port;
@@ -557,6 +583,8 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
+    bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
+
     device->shutting_down = false;
     spin_lock_init(&device->connected_sockets_lock);
 	spin_lock_init(&device->received_metadata_lock);
@@ -568,8 +596,10 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
+    device->is_leader = strcmp(argv[1], "true") == 0;
+
     // Start server
-    error = kstrtou16(argv[1], 10, &port);
+    error = kstrtou16(argv[2], 10, &port);
     if (error < 0) {
         printk(KERN_ERR "Error parsing port");
         return error;
@@ -594,9 +624,9 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return error;
     }
 
-    // Connect to other servers. argv[2], argv[3], etc are all server ports to connect to.
+    // Connect to other servers. argv[3], argv[4], etc are all server ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
-    for (i = 2; i < argc; i++) {
+    for (i = 3; i < argc; i++) {
         error = kstrtou16(argv[i], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
@@ -652,6 +682,7 @@ static void server_destructor(struct dm_target *ti) {
     }
 
     dm_put_device(ti, device->dev);
+    bioset_exit(&device->bs);
     kfree(device);
 
     printk(KERN_INFO "Server destructed");

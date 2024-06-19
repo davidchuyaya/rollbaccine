@@ -233,17 +233,19 @@ echo "0 `sudo blockdev --getsz /dev/ram0` encryption /dev/ram0" | sudo dmsetup c
 
 ### Networking
 Measure the throughput overhead of networking.
+Replace `<is_leader>` with true if this node's writes should be replicated.
+TODO: Remove this feature once leader election is implemented.
 Replace `<listen port>`, `<server port 1>`, and `<server port 2>` with the desired ports. You can have as many server ports as you want (or no server ports).
 ```bash
-echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <is_leader> <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
 ```
 
 For example, set up networking locally between 2 ramdisks with 2GBs each, `/dev/ram0` and `/dev/ram1` respectively:
 ```bash
 sudo modprobe brd rd_nr=2 rd_size=2097152
 sudo insmod server.ko
-echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 12340" | sudo dmsetup create server1
-echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 12350 12340" | sudo dmsetup create server2
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 true 12340" | sudo dmsetup create server1
+echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 false 12350 12340" | sudo dmsetup create server2
 ```
 
 
