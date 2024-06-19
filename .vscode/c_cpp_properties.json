@@ -1,67 +1,11 @@
 {
-    "env": {
-        "myIncludePath": [
-            "${workspaceFolder}/src",
-            "/usr/lib/modules/5.15.0-101-generic/build/include",
-            "/usr/lib/modules/5.15.0-101-generic/build/include/uapi",
-            "/usr/lib/modules/5.15.0-101-generic/build/include/generated/uapi",
-            "/usr/lib/modules/5.15.0-101-generic/build/arch/x86/include",
-            "/usr/lib/modules/5.15.0-101-generic/build/arch/x86/include/uapi",
-            "/usr/lib/modules/5.15.0-101-generic/build/arch/x86/include/generated",
-            "/usr/lib/modules/5.15.0-101-generic/build/arch/x86/include/generated/uapi",
-            "/usr/lib/gcc/x86_64-linux-gnu/11/include",
-            "/usr/include/c++/11",
-            "/usr/include/x86_64-linux-gnu/c++/11",
-            "/usr/include/c++/11/backward",
-            "/usr/local/include",
-            "/usr/include/x86_64-linux-gnu"
-        ],
-        "myDefines": [
-            "KBUILD_MODNAME=\"module\"",
-            "DEBUG",
-            "MY_FEATURE=1",
-            "__GNUC__",
-            "__KERNEL__"
-        ]
-    },
     "configurations": [
         {
             "name": "Linux",
-            "compilerPath": "/usr/bin/gcc",
-            "compilerArgs": [
-                "-m32"
-            ],
-            "intelliSenseMode": "linux-gcc-x64",
-            "includePath": [
-                "${myIncludePath}",
-                "/usr/include"
-            ],
-            "defines": [
-                "${myDefines}"
-            ],
-            "cStandard": "gnu11",
-            "cppStandard": "gnu++14",
-            "configurationProvider": "ms-vscode.cmake-tools",
-            "forcedInclude": [
-                "${workspaceFolder}/common.h"
-            ],
-            "compileCommands": "${workspaceFolder}/build/compile_commands.json",
-            "dotconfig": "${workspaceFolder}/.config",
-            "mergeConfigurations": true,
-            "customConfigurationVariables": {
-                "myVar": "myvalue"
-            },
-            "browse": {
-                "path": [
-                    "${myIncludePath}",
-                    "/usr/include",
-                    "${workspaceFolder}"
-                ],
-                "limitSymbolsToIncludedHeaders": true,
-                "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db"
-            }
+            "cStandard": "c11",
+            "intelliSenseMode": "gcc-x64",
+            "compileCommands": "${workspaceFolder}/compile_commands.json"
         }
     ],
-    "version": 4,
-    "enableConfigurationSquiggles": true
+    "version": 4
 }

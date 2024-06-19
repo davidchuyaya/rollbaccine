@@ -1,5 +1,5 @@
 /**
- * This file is heavily inspired by https://github.com/sysprog21/kecho/tree/master.
+ * This file is heavily inspired by https://github.com/sysprog21/kecho/tree/master and https://github.com/LINBIT/drbd.
  * Given a server port, this module will create 2 servers, 1 for the metadata and 1 for the actual bio blocks, at port and port+1 respectively.
  * Note: In order to kill threads on shutdown, we create a list of all open sockets that threads could be blocked on, and close them on shutdown.
  *       We also set shutting_down = true so a thread who returns from a blocking operation sees it and exits.
@@ -19,6 +19,7 @@
 #define ROLLBACCINE_RETRY_TIMEOUT 5000 // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_HASH_SIZE 256
+#define MIN_IOS 64
 #define MODULE_NAME "server"
 
 enum ConnectionType { METADATA, BIO };
@@ -36,9 +37,16 @@ struct msg {
     unsigned int num_pages;
 
     // Metadata about the bio
+    unsigned int bi_opf;
     sector_t sector;
     // TODO: Figure out how to send variable number of hashes
     // char hash[ROLLBACCINE_HASH_SIZE];
+};
+
+// For storing lists of messages, bios, etc
+struct generic_list {
+	void *data;
+	struct list_head list;
 };
 
 // Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
@@ -49,6 +57,8 @@ struct socket_list {
 
 struct server_device {
     struct dm_dev *dev;
+    struct bio_set bs;
+    bool is_leader;
     bool shutting_down; // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
 
     struct ballot bal;
@@ -68,6 +78,12 @@ struct server_device {
     spinlock_t connected_sockets_lock;
     struct list_head connected_metadata_sockets;
     struct list_head connected_bio_sockets;
+
+	// Received metadata and bios
+	spinlock_t received_metadata_lock;
+	struct list_head received_metadata;
+	spinlock_t received_bios_lock;
+	struct list_head received_bios;
 };
 
 // Thread params: Parameters passed into threads. Should be freed by the thread when it exits.
@@ -92,23 +108,119 @@ struct listen_thread_params {
 };
 
 void broadcast_bio(struct server_device *device, struct bio *bio) {
-    // TODO 1. Copy the bio
+    // TODO Instead of sending synchronously, we should:
+	// 1. Copy the bio
     // 2. Return
     // 3. Asynchronously send over the network
 
-    // Temporary hack: Just send the message synchronously
+    int sent;
+    struct msghdr msg_header;
+    struct socket_list *curr, *next;
+    struct bio_vec bvec, chunked_bvec;
+    struct bvec_iter iter;
+    struct list_head *sockets = &device->connected_bio_sockets;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;  // TODO: May need MSG_SPLICE_PAGES, as seen in DRBD. Requires newer kernel version? Otherwise may need to map userspace page to kernel space?
+
+	spin_lock(&device->connected_sockets_lock);
+	list_for_each_entry_safe(curr, next, sockets, list) {
+		bio_for_each_segment(bvec, bio, iter) {
+			// TODO: DRBD adds a MSG_MORE flag to the end. We probably want to do this for variable size writes.
+			// TODO: We also should supply the size of the bio
+			// TODO: We need to hash the bio and check it against the metadata as well
+
+			// Note: Replaced with bvec_set_page() in newer kernel versions
+			chunked_bvec.bv_page = bvec.bv_page;
+			chunked_bvec.bv_offset = bvec.bv_offset;
+			// TODO: Sends by page increments for now. Could send more? Check out DRBD does it
+			chunked_bvec.bv_len = bvec.bv_len;
+
+			// Keep retrying send until the whole message is sent
+			while (chunked_bvec.bv_len > 0) {
+				// Note: Replaced WRITE with ITER_SOURCE in newer kernel versions
+				iov_iter_bvec(&msg_header.msg_iter, WRITE, &chunked_bvec, 1, chunked_bvec.bv_len);
+
+				sent = sock_sendmsg(curr->sock, &msg_header);
+				if (sent <= 0) {
+					printk(KERN_ERR "Error sending message, aborting send");
+					// TODO: Should remove the socket from the list and shut down the connection?
+					goto finish_sending_to_socket;
+				} else {
+					chunked_bvec.bv_offset += sent;
+					chunked_bvec.bv_len -= sent;
+				}
+			}
+		}
+		// Label to jump to if socket cannot be written to, so we can iterate the next socket
+		finish_sending_to_socket:
+	}
+	printk(KERN_INFO "Sent bio");
+	spin_unlock(&device->connected_sockets_lock);
+}
+
+void broadcast_bio_metadata(struct server_device *device, struct bio *bio) {
+    int sent;
+    struct msghdr msg_header;
+    struct kvec vec;
+    struct socket_list *curr, *next;
+    struct msg message;
+    struct list_head *sockets = &device->connected_metadata_sockets;
+    size_t buffer_size = sizeof(struct msg);
+
+	// The message to send
+    message.type = ROLLBACCINE_WRITE;
+    message.bal = device->bal;
+    message.write_index = atomic_inc_return(&device->write_index);
+    message.num_pages = (bio->bi_iter.bi_size / PAGE_SIZE) + 1;
+    message.sector = bio->bi_iter.bi_sector;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    spin_lock(&device->connected_sockets_lock);
+    list_for_each_entry_safe(curr, next, sockets, list) {
+        vec.iov_base = &message;
+        vec.iov_len = buffer_size;
+
+        // Keep retrying send until the whole message is sent
+        while (vec.iov_len > 0) {
+            sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
+            if (sent <= 0) {
+                printk(KERN_ERR "Error sending message, aborting send");
+                // TODO: Should remove the socket from the list and shut down the connection?
+                break;
+            } else {
+                vec.iov_base += sent;
+                vec.iov_len -= sent;
+            }
+        }
+    }
+    printk(KERN_INFO "Sent metadata message, sector: %llu, num pages: %u", message.sector, message.num_pages);
+    spin_unlock(&device->connected_sockets_lock);
 }
 
 static int server_map(struct dm_target *ti, struct bio *bio) {
     struct server_device *device = ti->private;
-    bio_set_dev(bio, device->dev->bdev);
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Copy bio if it's a write
-    if (bio_has_data(bio) && bio_data_dir(bio) == WRITE) {
+    // TODO: At this point, the buffer is still in userspace. But networking already works? If we only want to send the encrypted block, we should do it in end_io?
+    if (device->is_leader && bio_has_data(bio) && bio_data_dir(bio) == WRITE) {
+        printk(KERN_INFO "bi_opf: %u", bio->bi_opf);
+        printk(KERN_INFO "Write bi_opf: %u", REQ_OP_WRITE);
+		broadcast_bio_metadata(device, bio);
         broadcast_bio(device, bio);
     }
     // TODO: Detect fsyncs
+
+    bio_set_dev(bio, device->dev->bdev);
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     return DM_MAPIO_REMAPPED;
 }
@@ -117,16 +229,19 @@ static void kill_thread(struct socket *sock) {
     // Shut down the socket, causing the thread to unblock (if it was blocked on a socket)
     if (sock != NULL) {
         kernel_sock_shutdown(sock, SHUT_RDWR);
-        sock_release(sock);
     }
 }
 
 // Function used by all listening sockets to block and listen to messages
 void blocking_read(struct server_device *device, struct socket *sock, enum ConnectionType conn_type) {
     unsigned char* buffer;
+	struct msg* message;
+    struct bio* bio_to_submit;
+    struct page* page;
     struct msghdr msg_header;
     struct kvec vec;
     size_t buffer_size;
+	int received;
 
     if (conn_type == METADATA) {
         buffer_size = sizeof(struct msg);
@@ -140,8 +255,6 @@ void blocking_read(struct server_device *device, struct socket *sock, enum Conne
         return;
     }
 
-    vec.iov_base = buffer;
-    vec.iov_len = buffer_size;
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
     msg_header.msg_control = NULL;
@@ -149,17 +262,57 @@ void blocking_read(struct server_device *device, struct socket *sock, enum Conne
     msg_header.msg_flags = 0;
 
     while (!device->shutting_down) {
-        int len = kernel_recvmsg(sock, &msg_header, &vec, buffer_size, buffer_size, msg_header.msg_flags);
-        if (len <= 0) {
-            printk(KERN_ERR "Error reading from socket");
-            break;
+        vec.iov_base = buffer;
+        vec.iov_len = buffer_size;
+
+        // Keep reading until we've received a full message
+        while (!device->shutting_down && vec.iov_len > 0) {
+            received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+            if (received <= 0) {
+                printk(KERN_ERR "Error reading from socket");
+                goto cleanup;
+            }
+
+            vec.iov_base += received;
+            vec.iov_len -= received;
         }
 
-        printk(KERN_INFO "Received message: %s", buffer);
+        // A full message has been received
+        if (conn_type == METADATA) {
+            message = (struct msg *)buffer;
+            printk(KERN_INFO "Received message sector: %llu, num pages: %u", message->sector, message->num_pages);
+
+            spin_lock(&device->received_metadata_lock);
+
+        }
+        else {
+            printk(KERN_INFO "Received data block: %s", buffer);
+
+            bio_to_submit = bio_alloc_bioset(GFP_NOIO, 1, &device->bs);
+            bio_to_submit->bi_private = device;
+            bio_set_dev(bio_to_submit, device->dev->bdev);
+            bio_to_submit->bi_opf = REQ_OP_WRITE; // TODO: Copy from metadata
+            bio_to_submit->bi_iter.bi_sector = 0; // TODO: Copy from metadata
+
+            // Copy data from buffer to bio
+            page = alloc_page(GFP_KERNEL);
+            if (page == NULL) {
+                printk(KERN_ERR "Error allocating page");
+                goto cleanup;
+            }
+            memcpy(page_address(page), buffer, buffer_size);
+            bio_add_page(bio_to_submit, page, buffer_size, 0);
+
+            submit_bio_noacct(bio_to_submit);
+        }
     }
 
+    cleanup:
     printk(KERN_INFO "Shutting down, exiting blocking read");
     kfree(buffer);
+    kernel_sock_shutdown(sock, SHUT_RDWR);
+    // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut it down.
+//     sock_release(sock);
 }
 
 int connect_to_server(void *args) {
@@ -198,27 +351,6 @@ int connect_to_server(void *args) {
     spin_unlock(&thread_params->device->connected_sockets_lock);
 
     blocking_read(thread_params->device, thread_params->sock, thread_params->conn_type);
-
-    // // Test sending a message
-    // buffer = kzalloc(BUFFER_SIZE, GFP_KERNEL);
-    // if (buffer == NULL) {
-    //     printk(KERN_ERR "Error allocating buffer");
-    //     return -1;
-    // }
-    // memcpy(buffer, "Hello, world!", 14);
-
-    // vec.iov_base = buffer;
-    // vec.iov_len = BUFFER_SIZE;
-    
-    // msg.msg_name = NULL;
-    // msg.msg_namelen = 0;
-    // msg.msg_control = NULL;
-    // msg.msg_controllen = 0;
-    // msg.msg_flags = 0;
-
-    // printk(KERN_INFO "Sending message");
-    // kernel_sendmsg(thread_params->sock, &msg, &vec, 1, BUFFER_SIZE);
-    // printk(KERN_INFO "Sent message");
 
     cleanup:
     kfree(thread_params);
@@ -322,9 +454,9 @@ int listen_for_connections(void* args) {
         new_connected_socket_list->sock = new_sock;
         spin_lock(&device->connected_sockets_lock);
         if (thread_params->conn_type == METADATA) {
-            list_add(&new_server_socket_list->list, &device->connected_metadata_sockets);
+            list_add(&new_connected_socket_list->list, &device->connected_metadata_sockets);
         } else {
-            list_add(&new_server_socket_list->list, &device->connected_bio_sockets);
+            list_add(&new_connected_socket_list->list, &device->connected_bio_sockets);
         }
         spin_unlock(&device->connected_sockets_lock);
 
@@ -349,6 +481,10 @@ int listen_for_connections(void* args) {
         }
     }
 
+    kernel_sock_shutdown(thread_params->sock, SHUT_RDWR);
+    // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut
+    // it down.
+    //     sock_release(thread_params->sock);
     kfree(thread_params);
     return 0;
 }
@@ -434,7 +570,7 @@ static int start_server(struct server_device *device, ushort port, enum Connecti
     return 0;
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = listen port. 2+ = server ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = is_leader. 2 = listen port. 3+ = server ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
     ushort port;
@@ -447,8 +583,12 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
+    bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
+
     device->shutting_down = false;
     spin_lock_init(&device->connected_sockets_lock);
+	spin_lock_init(&device->received_metadata_lock);
+	spin_lock_init(&device->received_bios_lock);
 
     // Get the device from argv[0] and store it in device->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &device->dev)) {
@@ -456,8 +596,10 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
+    device->is_leader = strcmp(argv[1], "true") == 0;
+
     // Start server
-    error = kstrtou16(argv[1], 10, &port);
+    error = kstrtou16(argv[2], 10, &port);
     if (error < 0) {
         printk(KERN_ERR "Error parsing port");
         return error;
@@ -482,9 +624,9 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return error;
     }
 
-    // Connect to other servers. argv[2], argv[3], etc are all server ports to connect to.
+    // Connect to other servers. argv[3], argv[4], etc are all server ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
-    for (i = 2; i < argc; i++) {
+    for (i = 3; i < argc; i++) {
         error = kstrtou16(argv[i], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
@@ -540,6 +682,7 @@ static void server_destructor(struct dm_target *ti) {
     }
 
     dm_put_device(ti, device->dev);
+    bioset_exit(&device->bs);
     kfree(device);
 
     printk(KERN_INFO "Server destructed");
