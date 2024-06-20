@@ -182,10 +182,21 @@ static void kill_thread(struct socket *sock) {
     }
 }
 
+// Because we alloc pages when we receive the bios, we haev to free them when it's done writing
+static void free_pages_end_io(struct bio *received_bio) {
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+
+    bio_for_each_segment(bvec, received_bio, iter) {
+        __free_page(bvec.bv_page);
+    }
+    bio_put(received_bio);
+}
+
 // Function used by all listening sockets to block and listen to messages
 void blocking_read(struct server_device *device, struct socket *sock) {
     struct metadata_msg metadata;
-    struct bio* bio_to_submit;
+    struct bio* received_bio;
     struct page* page;
     struct msghdr msg_header;
     struct kvec vec;
@@ -209,11 +220,12 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         }
         printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
 
-        bio_to_submit = bio_alloc_bioset(GFP_NOIO, metadata.num_pages, &device->bs);
-        bio_to_submit->bi_private = device;
-        bio_set_dev(bio_to_submit, device->dev->bdev);
-        bio_to_submit->bi_opf = metadata.bi_opf;
-        bio_to_submit->bi_iter.bi_sector = metadata.sector;
+        received_bio = bio_alloc_bioset(GFP_NOIO, metadata.num_pages, &device->bs);
+        received_bio->bi_private = device;
+        bio_set_dev(received_bio, device->dev->bdev);
+        received_bio->bi_opf = metadata.bi_opf;
+        received_bio->bi_iter.bi_sector = metadata.sector;
+        received_bio->bi_end_io = free_pages_end_io;
 
         // 2. Expect hash next
         // 3. Receive pages of bio
@@ -233,12 +245,12 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                 break;
             }
             printk(KERN_INFO "Received bio page: %i", i);
-            bio_add_page(bio_to_submit, page, PAGE_SIZE, 0);
+            bio_add_page(received_bio, page, PAGE_SIZE, 0);
         }
 
             // 4. Verify against hash
         // 5. Submit bio
-        submit_bio_noacct(bio_to_submit);
+        submit_bio_noacct(received_bio);
         printk(KERN_INFO "Submitted bio");
     }
 
