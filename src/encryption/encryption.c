@@ -104,9 +104,6 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         goto out;
     }
 
-    
-
-
     // Get the device from argv[0] and store it in rbd->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &rbd->dev))
     {
@@ -139,7 +136,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
     bioset_init(&rbd->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
 
-    rbd->checksums = kvmalloc_array(TOTAL_TEST_SECTORS, AES_GCM_AUTH_SIZE, GFP_KERNEL | __GFP_ZERO);
+    rbd->checksums = kvmalloc_array(TOTAL_TEST_SECTORS, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
     if (!rbd->checksums) {
         ti->error = "Cannot allocate checksums";
         ret = -ENOMEM;
@@ -160,7 +157,11 @@ out:
 }
 
 static inline unsigned char *checksum_index(struct encryption_io *io, sector_t index) {
-    return &io->rbd->checksums[index * AES_GCM_AUTH_SIZE];
+    return &io->rbd->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+}
+
+static inline unsigned char *iv_index(struct encryption_io *io, sector_t index) {
+    return &io->rbd->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
 }
 
 
@@ -203,17 +204,17 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         }
         // Testing fields
         // static IV
-        char *iv = kmalloc(AES_GCM_IV_SIZE, GFP_KERNEL);
-        if (!iv)
-        {
-            printk(KERN_INFO "could not allocate ivdata");
-            ret = -ENOMEM;
-            goto exit;
-        }
-        memcpy(iv, "123456789012", AES_GCM_IV_SIZE);
+        // char *iv = kmalloc(AES_GCM_IV_SIZE, GFP_KERNEL);
+        // if (!iv)
+        // {
+        //     printk(KERN_INFO "could not allocate ivdata");
+        //     ret = -ENOMEM;
+        //     goto exit;
+        // }
+        memcpy(iv_index(io, curr_sector), "123456789012", AES_GCM_IV_SIZE);
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
-        sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
+        sg_set_buf(&sg[1], iv_index(io, curr_sector), AES_GCM_IV_SIZE);
         sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
         sg_set_buf(&sg[3], checksum_index(io, curr_sector), AES_GCM_AUTH_SIZE);
 
@@ -228,7 +229,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         {
             printk(KERN_INFO "aead request allocation failed");
             aead_request_free(req);
-            kfree(iv);
+            //kfree(iv);
             ret = -ENOMEM;
             goto exit;
         }
@@ -238,11 +239,11 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         switch (enc_or_dec)
         {
         case WRITE:
-            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv);
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv_index(io, curr_sector));
             ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
             break;
         case READ:
-            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv);
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv_index(io, curr_sector));
             ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
             break;
         }
@@ -258,11 +259,11 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
                 printk(KERN_INFO "encryption/decryption failed");
             }
             aead_request_free(req);
-            kfree(iv);
+            //kfree(iv);
             goto exit;
         }
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
-        kfree(iv);
+        //kfree(iv);
     }
     return 0;
 exit:
