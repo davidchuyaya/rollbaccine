@@ -11,6 +11,7 @@
 #include <linux/tcp.h>
 #include <linux/kthread.h>
 #include <linux/inet.h> // For in4_pton to translate IP addresses from strings
+#include <linux/kfifo.h>
 #include <net/sock.h>
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
@@ -18,6 +19,8 @@
 #define ROLLBACCINE_RETRY_TIMEOUT 5000 // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_HASH_SIZE 256
+#define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE 1024 // Number of bios that can be outstanding between main threads and network broadcast thread. Must be power of 2, according to kfifo specs
+#define ROLLBACCINE_BROADCAST_RETRY_TIMEOUT 1000 // Number of milliseconds before broadcast thread checks kfifo (busy waiting). Could check performance difference between this and waiting on a semaphore?
 #define MIN_IOS 64
 #define MODULE_NAME "server"
 
@@ -54,6 +57,11 @@ struct server_device {
 
     struct ballot bal;
     atomic_t write_index;
+    
+    // Communication between main threads and the networking thread
+    wait_queue_head_t bio_fifo_wait_queue;
+    spinlock_t bio_fifo_lock;
+    struct kfifo bio_fifo;
 
     // Sockets, tracked so we can kill them on exit.
     struct list_head server_sockets;
@@ -61,7 +69,6 @@ struct server_device {
 
     // Connected sockets. Should be a subset of the sockets above. Handy for broadcasting
     // TODO: Need to figure out network handshake so we know who we're talking to.
-    // TODO: Create a circular buffer of pending messages, batch send on a separate thread?
     spinlock_t connected_sockets_lock;
     struct list_head connected_sockets;
 };
@@ -83,6 +90,15 @@ struct listen_thread_params {
     struct socket *sock;
     struct server_device *device;
 };
+
+// Because we alloc pages when we receive the bios, we haev to free them when it's done writing
+static void free_pages_end_io(struct bio *received_bio) {
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+
+    bio_for_each_segment(bvec, received_bio, iter) { __free_page(bvec.bv_page); }
+    bio_put(received_bio);
+}
 
 void broadcast_bio(struct server_device *device, struct bio *bio) {
     int sent;
@@ -155,17 +171,77 @@ void broadcast_bio(struct server_device *device, struct bio *bio) {
         // Label to jump to if socket cannot be written to, so we can iterate the next socket
     finish_sending_to_socket:
     }
-    printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
+//     printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
     spin_unlock(&device->connected_sockets_lock);
+}
+
+// Thread that runs in the background and broadcasts bios
+int broadcaster(void *args) {
+    struct server_device *device = (struct server_device *)args;
+    struct bio *clone;
+    int num_bios_gotten;
+
+    while (!device->shutting_down) {
+        num_bios_gotten = kfifo_out(&device->bio_fifo, &clone, sizeof(struct bio*));
+	// printk(KERN_INFO "Checked bios, got %d", num_bios_gotten);
+        if (num_bios_gotten == 0) {
+            // Wait for new bios
+            wait_event_interruptible(device->bio_fifo_wait_queue, !kfifo_is_empty(&device->bio_fifo));
+            continue;
+        }
+
+        broadcast_bio(device, clone);
+        // TODO Free the bio
+        free_pages_end_io(clone);
+    }
+
+    return 0;
+}
+
+struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
+    struct bio *clone;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+    struct page *page;
+
+    // Note: If bi_size is not a multiple of PAGE_SIZE, we have a BIG problem :(
+    clone = bio_alloc_bioset(GFP_NOIO, bio_src->bi_iter.bi_size / PAGE_SIZE, &device->bs);
+    if (!clone) {
+        return NULL;
+    }
+    clone->bi_opf = bio_src->bi_opf;
+    clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
+
+    bio_for_each_segment(bvec, bio_src, iter) {
+        page = alloc_page(GFP_KERNEL);
+        if (!page) {
+            bio_put(clone);
+            return NULL;
+        }
+        memcpy(kmap(page), kmap(bvec.bv_page) + bvec.bv_offset, bvec.bv_len);
+	kunmap(page);
+        kunmap(bvec.bv_page);
+
+        bio_add_page(clone, page, bvec.bv_len, 0);
+    }
+    return clone;
 }
 
 static int server_map(struct dm_target *ti, struct bio *bio) {
     struct server_device *device = ti->private;
+    struct bio *clone;
 
     // Copy bio if it's a write
     // TODO: At this point, the buffer is still in userspace. But networking already works? If we only want to send the encrypted block, we should do it in end_io?
     if (device->is_leader && bio_has_data(bio) && bio_data_dir(bio) == WRITE) {
-        broadcast_bio(device, bio);
+        clone = deep_bio_clone(device, bio);
+        if (!clone) {
+            printk(KERN_ERR "Could not create clone");
+            return DM_MAPIO_REMAPPED;
+        }
+	// Add to networking queue. There may be multiple writers, so lock
+        kfifo_in_spinlocked(&device->bio_fifo, &clone, sizeof(struct bio*), &device->bio_fifo_lock);
+	wake_up(&device->bio_fifo_wait_queue);
     }
     // TODO: Detect fsyncs
 
@@ -180,17 +256,6 @@ static void kill_thread(struct socket *sock) {
     if (sock != NULL) {
         kernel_sock_shutdown(sock, SHUT_RDWR);
     }
-}
-
-// Because we alloc pages when we receive the bios, we haev to free them when it's done writing
-static void free_pages_end_io(struct bio *received_bio) {
-    struct bio_vec bvec;
-    struct bvec_iter iter;
-
-    bio_for_each_segment(bvec, received_bio, iter) {
-        __free_page(bvec.bv_page);
-    }
-    bio_put(received_bio);
 }
 
 // Function used by all listening sockets to block and listen to messages
@@ -218,7 +283,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
             printk(KERN_ERR "Error reading from socket");
             break;
         }
-        printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
+        // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
 
         received_bio = bio_alloc_bioset(GFP_NOIO, metadata.num_pages, &device->bs);
         received_bio->bi_private = device;
@@ -244,14 +309,14 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                 printk(KERN_ERR "Error reading from socket");
                 break;
             }
-            printk(KERN_INFO "Received bio page: %i", i);
+            // printk(KERN_INFO "Received bio page: %i", i);
             bio_add_page(received_bio, page, PAGE_SIZE, 0);
         }
 
             // 4. Verify against hash
         // 5. Submit bio
         submit_bio_noacct(received_bio);
-        printk(KERN_INFO "Submitted bio");
+        // printk(KERN_INFO "Submitted bio");
     }
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
@@ -500,6 +565,7 @@ static int start_server(struct server_device *device, ushort port) {
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = is_leader. 2 = listen port. 3+ = server ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
+    struct task_struct *broadcast_thread;
     ushort port;
     int error;
     int i;
@@ -514,6 +580,14 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
 
     device->shutting_down = false;
     spin_lock_init(&device->connected_sockets_lock);
+
+    init_waitqueue_head(&device->bio_fifo_wait_queue);
+    spin_lock_init(&device->bio_fifo_lock);
+    error = kfifo_alloc(&device->bio_fifo, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE, GFP_KERNEL);
+    if (error < 0) {
+        printk(KERN_ERR "Error creating kfifo");
+        return error;
+    }
 
     // Get the device from argv[0] and store it in device->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &device->dev)) {
@@ -549,6 +623,15 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         }
         printk(KERN_INFO "Starting thread to connect to server at port: %u", port);
         start_client_to_server(device, port);
+    }
+
+    // Start broadcast thread
+    if (device->is_leader) {
+        broadcast_thread = kthread_run(broadcaster, device, "broadcast thread");
+        if (IS_ERR(broadcast_thread)) {
+            printk(KERN_ERR "Error creating broadcast thread");
+            return -1;
+        }
     }
 
     device->bal.id = 0; // TODO: Generate securely
@@ -587,6 +670,7 @@ static void server_destructor(struct dm_target *ti) {
         kfree(curr);
     }
 
+    kfifo_free(&device->bio_fifo);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     kfree(device);

@@ -246,6 +246,7 @@ sudo modprobe brd rd_nr=2 rd_size=2097152
 sudo insmod server.ko
 echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 true 12340" | sudo dmsetup create server1
 echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 false 12350 12340" | sudo dmsetup create server2
+sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1 --loops=10 --name=servers
 ```
 
 
