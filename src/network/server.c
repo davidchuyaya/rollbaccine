@@ -191,7 +191,7 @@ int broadcaster(void *args) {
         }
 
         broadcast_bio(device, clone);
-        // TODO Free the bio
+        // Free the bio
         free_pages_end_io(clone);
     }
 
