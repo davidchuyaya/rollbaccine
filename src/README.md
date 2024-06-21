@@ -240,9 +240,9 @@ Replace `<listen port>`, `<server port 1>`, and `<server port 2>` with the desir
 echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <is_leader> <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
 ```
 
-For example, set up networking locally between 2 ramdisks with 2GBs each, `/dev/ram0` and `/dev/ram1` respectively:
+For example, set up networking locally between 2 ramdisks with 1GBs each, `/dev/ram0` and `/dev/ram1` respectively:
 ```bash
-sudo modprobe brd rd_nr=2 rd_size=2097152
+sudo modprobe brd rd_nr=2 rd_size=1048576
 sudo insmod server.ko
 echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 true 12340" | sudo dmsetup create server1
 echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 false 12350 12340" | sudo dmsetup create server2

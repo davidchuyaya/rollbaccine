@@ -20,7 +20,7 @@
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_HASH_SIZE 256
 #define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE 1024 // Number of bios that can be outstanding between main threads and network broadcast thread. Must be power of 2, according to kfifo specs
-#define ROLLBACCINE_BROADCAST_RETRY_TIMEOUT 1000 // Number of milliseconds before broadcast thread checks kfifo (busy waiting). Could check performance difference between this and waiting on a semaphore?
+#define ROLLBACCINE_PAGE_POOL_SIZE 1024 // Number of pages to be allocated for the page pool
 #define MIN_IOS 64
 #define MODULE_NAME "server"
 
@@ -52,6 +52,7 @@ struct socket_list {
 struct server_device {
     struct dm_dev *dev;
     struct bio_set bs;
+    mempool_t *mempool;
     bool is_leader;
     bool shutting_down; // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
 
@@ -93,10 +94,14 @@ struct listen_thread_params {
 
 // Because we alloc pages when we receive the bios, we haev to free them when it's done writing
 static void free_pages_end_io(struct bio *received_bio) {
+    struct server_device *device = (struct server_device*) received_bio->bi_private;
     struct bio_vec bvec;
     struct bvec_iter iter;
 
-    bio_for_each_segment(bvec, received_bio, iter) { __free_page(bvec.bv_page); }
+    bio_for_each_segment(bvec, received_bio, iter) {
+        mempool_free(bvec.bv_page, device->mempool);
+        // __free_page(bvec.bv_page); 
+    }
     bio_put(received_bio);
 }
 
@@ -209,17 +214,19 @@ struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
     if (!clone) {
         return NULL;
     }
+    clone->bi_private = device;
     clone->bi_opf = bio_src->bi_opf;
     clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
 
     bio_for_each_segment(bvec, bio_src, iter) {
-        page = alloc_page(GFP_KERNEL);
+	    page = mempool_alloc(device->mempool, GFP_KERNEL);
+        // page = alloc_page(GFP_KERNEL);
         if (!page) {
             bio_put(clone);
             return NULL;
         }
         memcpy(kmap(page), kmap(bvec.bv_page) + bvec.bv_offset, bvec.bv_len);
-	kunmap(page);
+	    kunmap(page);
         kunmap(bvec.bv_page);
 
         bio_add_page(clone, page, bvec.bv_len, 0);
@@ -241,7 +248,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         }
 	// Add to networking queue. There may be multiple writers, so lock
         kfifo_in_spinlocked(&device->bio_fifo, &clone, sizeof(struct bio*), &device->bio_fifo_lock);
-	wake_up(&device->bio_fifo_wait_queue);
+	    wake_up(&device->bio_fifo_wait_queue);
     }
     // TODO: Detect fsyncs
 
@@ -296,7 +303,8 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         // 3. Receive pages of bio
         i = 0;
         for (i = 0; i < metadata.num_pages; i++) {
-            page = alloc_page(GFP_KERNEL);
+            page = mempool_alloc(device->mempool, GFP_KERNEL);
+        //     page = alloc_page(GFP_KERNEL);
             if (page == NULL) {
                 printk(KERN_ERR "Error allocating page");
                 break;
@@ -577,6 +585,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     }
 
     bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
+    device->mempool = mempool_create_page_pool(ROLLBACCINE_PAGE_POOL_SIZE, 0);
 
     device->shutting_down = false;
     spin_lock_init(&device->connected_sockets_lock);
@@ -673,6 +682,7 @@ static void server_destructor(struct dm_target *ti) {
     kfifo_free(&device->bio_fifo);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
+    mempool_destroy(device->mempool);
     kfree(device);
 
     printk(KERN_INFO "Server destructed");
