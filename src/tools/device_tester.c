@@ -50,7 +50,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        char* write_buffer = "Hello, world!";
+    	char* write_buffer = "This is a larger chunk of text that will be written to the file. It can span multiple lines and contain any characters you want, including numbers (1234567890) and special symbols (!@#$%^&*()).";
         int len = write(file_pointer, write_buffer, strlen(write_buffer));
         if (len == -1) {
             printf("Error writing to file\n");
