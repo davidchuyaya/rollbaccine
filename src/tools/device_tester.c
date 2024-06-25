@@ -8,7 +8,7 @@
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        printf("Usage: ./device_tester <filename> <read, write, or clear>\n");
+        printf("Usage: ./device_tester <filename> <read or write>\n");
         return 1;
     }
 
@@ -57,8 +57,13 @@ int main(int argc, char* argv[]) {
             ret = 1;
             goto cleanup;
         }
-
         printf("Wrote to file: %s\n", write_buffer);
+
+        ret = fsync(file_pointer);
+        if (ret == -1) {
+            printf("Fsync error: %s\n", strerror(errno));
+        }
+        printf("Fsynced\n");
     }
     else {
         printf("Expected 'read' or 'write' as 2nd parameter\n");

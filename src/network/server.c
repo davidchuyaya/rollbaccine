@@ -24,7 +24,8 @@
 #define MIN_IOS 64
 #define MODULE_NAME "server"
 
-enum MsgType { ROLLBACCINE_FSYNC, ROLLBACCINE_WRITE };
+// TODO: Expand with protocol message types
+enum MsgType { ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, FOLLOWER_ACK };
 
 // Note: These message types are sent over network, so they need to be packed & int sizes need to be specific
 struct ballot {
@@ -49,15 +50,29 @@ struct socket_list {
     struct list_head list;
 };
 
+struct fsync_list {
+    struct bio *bio;
+    int waiting_for_write_index; // The write index that this fsync bio is waiting for
+    struct list_head list;
+};
+
 struct server_device {
     struct dm_dev *dev;
     struct bio_set bs;
     mempool_t *mempool;
     bool is_leader;
     bool shutting_down; // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
+    int f;
+    int n;
 
     struct ballot bal;
-    atomic_t write_index;
+    int write_index; // Doesn't need to be atomic because only the broadcast thread will modify this
+    int latest_data_write_index; // Last index where data was written (instead of an empty bio for fsync, for example)
+    // Max write indices of each replica
+    spinlock_t write_index_lock;
+    int* write_indices; // Len = n
+    int max_quorum_write_index;
+    struct list_head pending_fsyncs;
     
     // Communication between main threads and the networking thread
     wait_queue_head_t bio_fifo_wait_queue;
@@ -72,6 +87,11 @@ struct server_device {
     // TODO: Need to figure out network handshake so we know who we're talking to.
     spinlock_t connected_sockets_lock;
     struct list_head connected_sockets;
+};
+
+struct bio_data {
+    enum MsgType type; // Fsync or write
+    struct bio *base_bio;
 };
 
 // Thread params: Parameters passed into threads. Should be freed by the thread when it exits.
@@ -92,6 +112,76 @@ struct listen_thread_params {
     struct server_device *device;
 };
 
+// Returns the max int that a quorum agrees to. Note that since the leader itself must have write index >= followers' write index, the quorum size is f (not f+1).
+void process_follower_write_index(struct server_device *device, int follower_id, int follower_write_index) {
+    int i, j, num_geq_write_indices = 0;
+    bool max_index_changed = false;
+    struct fsync_list *curr, *next;
+
+    spin_lock(&device->write_index_lock);
+    // Special case for f = 1, n = 2, since there's only 1 follower, so we don't need to iterate.
+    // Also, we don't need to compare maxes (the latest message should always have a larger write index).
+    if (device->f == 1 && device->n == 2) {
+        device->max_quorum_write_index = follower_write_index;
+        max_index_changed = true;
+    }
+    // Special case for f = 1, n = 3.
+    // What the quorum agrees on = max of what any 1 follower has (plus the leader's write index, which must be higher).
+    else if (device->f == 1 && device->n == 3) {
+        if (device->max_quorum_write_index < follower_write_index) {
+            device->max_quorum_write_index = follower_write_index;
+            max_index_changed = true;
+        }
+    }
+    // Otherwise, find the largest write index that a quorum agrees to
+    else {
+        device->write_indices[follower_id] = follower_write_index;
+        for (i = 0; i < device->n; i++) {
+            if (device->max_quorum_write_index >= device->write_indices[i]) {
+                continue;
+            }
+
+            // Count the number of followers with an index >= this index
+            num_geq_write_indices = 0;
+            for (j = 0; j < device->n; j++) {
+                if (device->write_indices[j] >= device->write_indices[i]) {
+                    num_geq_write_indices++;
+                }
+            }
+            // If a quorum (including the leader) is reached on this index, store it
+            if (num_geq_write_indices >= device->f) {
+                device->max_quorum_write_index = device->write_indices[i];
+                max_index_changed = true;
+            }
+        }
+    }
+
+    // Loop through all bios waiting on fsync if the max index has changed
+    if (max_index_changed) {
+        // printk(KERN_INFO "New max quorum write index: %d", device->max_quorum_write_index);
+        list_for_each_entry_safe(curr, next, &device->pending_fsyncs, list) {
+            if (curr->waiting_for_write_index <= device->max_quorum_write_index) {
+                // printk(KERN_INFO "Fsync waiting on write index %d satisfied", curr->waiting_for_write_index);
+                submit_bio_noacct(curr->bio);
+                list_del(&curr->list);
+                kfree(curr);
+            }
+            else {
+                break;
+            }
+        }
+    }
+    spin_unlock(&device->write_index_lock);
+}
+
+bool requires_fsync(struct bio *bio) {
+    return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA);
+}
+
+unsigned int remove_fsync_flags(unsigned int bio_opf) {
+    return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA;
+}
+
 // Because we alloc pages when we receive the bios, we haev to free them when it's done writing
 static void free_pages_end_io(struct bio *received_bio) {
     struct server_device *device = (struct server_device*) received_bio->bi_private;
@@ -107,6 +197,8 @@ static void free_pages_end_io(struct bio *received_bio) {
 
 void broadcast_bio(struct server_device *device, struct bio *bio) {
     int sent;
+    struct fsync_list *fsync_list_elem;
+    struct bio_data *bio_data = dm_per_bio_data(bio, sizeof(struct bio_data));
     struct msghdr msg_header;
     struct kvec vec;
     struct socket_list *curr, *next;
@@ -114,12 +206,48 @@ void broadcast_bio(struct server_device *device, struct bio *bio) {
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
 
-    metadata.type = ROLLBACCINE_WRITE;
+    metadata.type = bio_data->type;
     metadata.bal = device->bal;
-    metadata.write_index = atomic_inc_return(&device->write_index);
-    metadata.num_pages = bio->bi_iter.bi_size / PAGE_SIZE; // Note: If bi_size is not a multiple of PAGE_SIZE, we have a BIG problem :(
+    metadata.write_index = ++device->write_index;
+    metadata.num_pages = bio->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = bio->bi_opf;
     metadata.sector = bio->bi_iter.bi_sector;
+
+    // If thsi write has contents, update the latest data write index
+    if (metadata.num_pages > 0) {
+        device->latest_data_write_index = metadata.write_index;
+    }
+
+    // Add the fsync bio to the queue of pending_fsyncs, or just submit it now if there are already enough acks.
+    if (metadata.type == ROLLBACCINE_FSYNC) {
+        fsync_list_elem = kmalloc(sizeof(struct fsync_list), GFP_KERNEL);
+        if (fsync_list_elem == NULL) {
+            printk(KERN_ERR "Error creating fsync_list_elem");
+            return;
+        }
+
+        spin_lock(&device->write_index_lock);
+        // If the write this fsync depends on is already ACK'd, then let it through. Possible if there are multiple fsyncs in a row.
+        if (device->latest_data_write_index <= device->max_quorum_write_index) {
+            // printk(KERN_INFO "Fsync %llu ALREADY satisfied for latest data write index: %d", metadata.write_index, device->latest_data_write_index);
+            kfree(fsync_list_elem);
+            submit_bio_noacct(bio_data->base_bio);
+            // Immediately return since there's nothing to send; this fsync must've been empty, otherwise latest_data_write_index would be higher
+            spin_unlock(&device->write_index_lock);
+            return;
+        }
+        else {
+            // printk(KERN_INFO "Fsync %llu will begin waiting for latest data write index: %d", metadata.write_index, device->latest_data_write_index);
+            // Otherwise add it to the list of waiting fsyncs
+            fsync_list_elem->bio = bio_data->base_bio;
+            fsync_list_elem->waiting_for_write_index = device->latest_data_write_index;
+            list_add_tail(&fsync_list_elem->list, &device->pending_fsyncs);
+        }
+        spin_unlock(&device->write_index_lock);
+    }
+
+    // Note: If bi_size is not a multiple of PAGE_SIZE, we have to send by sector chunks
+    WARN_ON(metadata.num_pages * PAGE_SIZE != bio->bi_iter.bi_size);
 
     msg_header.msg_name = NULL;
     msg_header.msg_namelen = 0;
@@ -176,7 +304,7 @@ void broadcast_bio(struct server_device *device, struct bio *bio) {
         // Label to jump to if socket cannot be written to, so we can iterate the next socket
     finish_sending_to_socket:
     }
-//     printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
+    // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
     spin_unlock(&device->connected_sockets_lock);
 }
 
@@ -188,7 +316,7 @@ int broadcaster(void *args) {
 
     while (!device->shutting_down) {
         num_bios_gotten = kfifo_out(&device->bio_fifo, &clone, sizeof(struct bio*));
-	// printk(KERN_INFO "Checked bios, got %d", num_bios_gotten);
+        // printk(KERN_INFO "Checked bios, got %d", num_bios_gotten);
         if (num_bios_gotten == 0) {
             // Wait for new bios
             wait_event_interruptible(device->bio_fifo_wait_queue, !kfifo_is_empty(&device->bio_fifo));
@@ -196,7 +324,7 @@ int broadcaster(void *args) {
         }
 
         broadcast_bio(device, clone);
-        // Free the bio
+
         free_pages_end_io(clone);
     }
 
@@ -205,6 +333,7 @@ int broadcaster(void *args) {
 
 struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
     struct bio *clone;
+    struct bio_data *src_bio_data, *clone_bio_data;
     struct bio_vec bvec;
     struct bvec_iter iter;
     struct page *page;
@@ -214,48 +343,71 @@ struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
     if (!clone) {
         return NULL;
     }
+
     clone->bi_private = device;
     clone->bi_opf = bio_src->bi_opf;
     clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
 
     bio_for_each_segment(bvec, bio_src, iter) {
-	    page = mempool_alloc(device->mempool, GFP_KERNEL);
+        page = mempool_alloc(device->mempool, GFP_KERNEL);
         // page = alloc_page(GFP_KERNEL);
         if (!page) {
             bio_put(clone);
             return NULL;
         }
         memcpy(kmap(page), kmap(bvec.bv_page) + bvec.bv_offset, bvec.bv_len);
-	    kunmap(page);
+        kunmap(page);
         kunmap(bvec.bv_page);
 
         bio_add_page(clone, page, bvec.bv_len, 0);
     }
+
+    // Deep copy the bio data as well
+    src_bio_data = dm_per_bio_data(bio_src, sizeof(struct bio_data));
+    clone_bio_data = dm_per_bio_data(clone, sizeof(struct bio_data));
+    clone_bio_data->type = src_bio_data->type;
+    // Point to the original bio, in case this is an fsync and we need to wake it?
+    clone_bio_data->base_bio = bio_src;
+
     return clone;
 }
 
 static int server_map(struct dm_target *ti, struct bio *bio) {
+    bool is_fsync = false;
     struct server_device *device = ti->private;
     struct bio *clone;
+    struct bio_data *bio_data;
 
     // Copy bio if it's a write
-    // TODO: At this point, the buffer is still in userspace. But networking already works? If we only want to send the encrypted block, we should do it in end_io?
-    if (device->is_leader && bio_has_data(bio) && bio_data_dir(bio) == WRITE) {
+    if (device->is_leader && bio_data_dir(bio) == WRITE) {
+        bio_data = dm_per_bio_data(bio, sizeof(struct bio_data));
+        if (requires_fsync(bio)) {
+            // printk(KERN_INFO "Fsync detected");
+            bio_data->type = ROLLBACCINE_FSYNC;
+            bio->bi_opf = remove_fsync_flags(bio->bi_opf); // Don't need actual fsync if we have replication
+            is_fsync = true;
+        }
+        else {
+            bio_data->type = ROLLBACCINE_WRITE;
+        }
+
+        // Create the clone
         clone = deep_bio_clone(device, bio);
         if (!clone) {
             printk(KERN_ERR "Could not create clone");
             return DM_MAPIO_REMAPPED;
         }
-	// Add to networking queue. There may be multiple writers, so lock
+
+        // Add clone to networking queue. There may be multiple writers, so lock
         kfifo_in_spinlocked(&device->bio_fifo, &clone, sizeof(struct bio*), &device->bio_fifo_lock);
-	    wake_up(&device->bio_fifo_wait_queue);
+        wake_up_interruptible(&device->bio_fifo_wait_queue);
     }
-    // TODO: Detect fsyncs
 
     bio_set_dev(bio, device->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
-    return DM_MAPIO_REMAPPED;
+    // If this is an fsync, then say we submitted it so it doesn't propagate further (and effectively blocks)
+    return is_fsync ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
 }
 
 static void kill_thread(struct socket *sock) {
@@ -272,10 +424,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
     struct page* page;
     struct msghdr msg_header;
     struct kvec vec;
-    int received, i;
-
-    vec.iov_base = &metadata;
-    vec.iov_len = sizeof(struct metadata_msg);
+    int sent, received, i;
 
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
@@ -285,12 +434,22 @@ void blocking_read(struct server_device *device, struct socket *sock) {
 
     while (!device->shutting_down) {
         // 1. Receive metadata message
+        vec.iov_base = &metadata;
+        vec.iov_len = sizeof(struct metadata_msg);
+
         received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
         if (received <= 0) {
             printk(KERN_ERR "Error reading from socket");
             break;
         }
         // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
+
+        // Received ack for fsync
+        if (metadata.type == FOLLOWER_ACK && device->is_leader) {
+            // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
+            process_follower_write_index(device, metadata.bal.id, metadata.write_index);
+            continue;
+        }
 
         received_bio = bio_alloc_bioset(GFP_NOIO, metadata.num_pages, &device->bs);
         received_bio->bi_private = device;
@@ -301,7 +460,6 @@ void blocking_read(struct server_device *device, struct socket *sock) {
 
         // 2. Expect hash next
         // 3. Receive pages of bio
-        i = 0;
         for (i = 0; i < metadata.num_pages; i++) {
             page = mempool_alloc(device->mempool, GFP_KERNEL);
         //     page = alloc_page(GFP_KERNEL);
@@ -321,10 +479,32 @@ void blocking_read(struct server_device *device, struct socket *sock) {
             bio_add_page(received_bio, page, PAGE_SIZE, 0);
         }
 
-            // 4. Verify against hash
+        // 4. Verify against hash
         // 5. Submit bio
         submit_bio_noacct(received_bio);
         // printk(KERN_INFO "Submitted bio");
+
+        // 6. If the message is an fsync, reply.
+        if (metadata.type == ROLLBACCINE_FSYNC) {
+            metadata.type = FOLLOWER_ACK;
+            metadata.bal.id = device->bal.id;
+
+            vec.iov_base = &metadata;
+            vec.iov_len = sizeof(struct metadata_msg);
+
+            // Keep retrying send until the whole message is sent
+            while (vec.iov_len > 0) {
+                sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
+                if (sent <= 0) {
+                    printk(KERN_ERR "Error sending message, aborting send");
+                    break;
+                } else {
+                    vec.iov_base += sent;
+                    vec.iov_len -= sent;
+                }
+            }
+            // printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
+        }
     }
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
@@ -570,7 +750,7 @@ static int start_server(struct server_device *device, ushort port) {
     return 0;
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = is_leader. 2 = listen port. 3+ = server ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
     struct task_struct *broadcast_thread;
@@ -604,10 +784,38 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
-    device->is_leader = strcmp(argv[1], "true") == 0;
+    error = kstrtoint(argv[1], 10, &device->f);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing f");
+        return error;
+    }
+    printk(KERN_INFO "f: %i", device->f);
+
+    error = kstrtoint(argv[2], 10, &device->n);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing n");
+        return error;
+    }
+    printk(KERN_INFO "n: %i", device->n);
+
+    error = kstrtou64(argv[3], 10, &device->bal.id);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing id");
+        return error;
+    }
+    printk(KERN_INFO "id: %llu", device->bal.id);
+    device->bal.num = 0;
+    device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
+    device->latest_data_write_index = ROLLBACCINE_INIT_WRITE_INDEX;
+    device->max_quorum_write_index = ROLLBACCINE_INIT_WRITE_INDEX;
+    spin_lock_init(&device->write_index_lock);
+    device->write_indices = kzalloc(sizeof(int) * device->n, GFP_KERNEL);
+    INIT_LIST_HEAD(&device->pending_fsyncs);
+
+    device->is_leader = strcmp(argv[4], "true") == 0;
 
     // Start server
-    error = kstrtou16(argv[2], 10, &port);
+    error = kstrtou16(argv[5], 10, &port);
     if (error < 0) {
         printk(KERN_ERR "Error parsing port");
         return error;
@@ -622,9 +830,9 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return error;
     }
 
-    // Connect to other servers. argv[3], argv[4], etc are all server ports to connect to.
+    // Connect to other servers. argv[6], argv[7], etc are all server ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
-    for (i = 3; i < argc; i++) {
+    for (i = 6; i < argc; i++) {
         error = kstrtou16(argv[i], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
@@ -643,10 +851,11 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         }
     }
 
-    device->bal.id = 0; // TODO: Generate securely
-    device->bal.num = 0;
-    atomic_set(&device->write_index, ROLLBACCINE_INIT_WRITE_INDEX);
+    // Enable FUA and PREFLUSH flags
+    ti->num_flush_bios = 1;
+    ti->flush_supported = 1;
 
+    ti->per_io_data_size = sizeof(struct bio_data);
     ti->private = device;
 
     printk(KERN_INFO "Server constructed");
@@ -666,16 +875,19 @@ static void server_destructor(struct dm_target *ti) {
     printk(KERN_INFO "Killing server sockets");
     list_for_each_entry_safe(curr, next, &device->server_sockets, list) {
         kill_thread(curr->sock);
+        list_del(&curr->list);
         kfree(curr);
     }
     printk(KERN_INFO "Killing client sockets");
     list_for_each_entry_safe(curr, next, &device->client_sockets, list) {
         kill_thread(curr->sock);
+        list_del(&curr->list);
         kfree(curr);
     }
 
     // Free socket list (sockets should already be freed)
     list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
+        list_del(&curr->list);
         kfree(curr);
     }
 

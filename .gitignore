@@ -62,3 +62,6 @@ settings.json
 
 # device_tester
 device_tester
+
+# C library stuff
+compile_commands.json
