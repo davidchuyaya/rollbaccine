@@ -55,11 +55,13 @@ dkms.conf
 *.db
 *.db-shm
 *.db-wal
-settings.json
-compile_commands.json
+# settings.json
 
 # Mac stuff
 .DS_Store
 
 # device_tester
 device_tester
+
+# C library stuff
+compile_commands.json

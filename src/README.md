@@ -235,17 +235,21 @@ echo "0 `sudo blockdev --getsz /dev/ram0` encryption /dev/ram0" | sudo dmsetup c
 Measure the throughput overhead of networking.
 Replace `<is_leader>` with true if this node's writes should be replicated.
 TODO: Remove this feature once leader election is implemented.
+Replace `<f>` with a number, minimum 1.
+Replace `<n>` with the number of nodes in the system, minimum 2.
+Replace `<id>` with the id of the node, starting from 0.
 Replace `<listen port>`, `<server port 1>`, and `<server port 2>` with the desired ports. You can have as many server ports as you want (or no server ports).
 ```bash
-echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <is_leader> <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <f> <n> <id> <is_leader> <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
 ```
 
-For example, set up networking locally between 2 ramdisks with 2GBs each, `/dev/ram0` and `/dev/ram1` respectively:
+For example, set up networking locally between 2 ramdisks with 1GBs each, `/dev/ram0` and `/dev/ram1` respectively:
 ```bash
-sudo modprobe brd rd_nr=2 rd_size=2097152
+sudo modprobe brd rd_nr=2 rd_size=1048576
 sudo insmod server.ko
-echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 true 12340" | sudo dmsetup create server1
-echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 false 12350 12340" | sudo dmsetup create server2
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 0 true 12340" | sudo dmsetup create server1
+echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 1 2 1 false 12350 12340" | sudo dmsetup create server2
+sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1 --loops=10 --name=servers
 ```
 
 
