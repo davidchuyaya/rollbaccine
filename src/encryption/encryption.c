@@ -262,6 +262,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             //kfree(iv);
             goto exit;
         }
+	aead_request_free(req);
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
         //kfree(iv);
     }
