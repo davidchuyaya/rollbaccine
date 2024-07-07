@@ -29,7 +29,7 @@
 
 #define RAM_SIZE_GB 1
 #define TOTAL_RAM_BYTES RAM_SIZE_GB * 1024 * 1024 * 1024
-#define TOTAL_TEST_SECTORS 8388608
+#define TOTAL_TEST_SECTORS 4194304
 #define TOTAL_SECTORS TOTAL_RAM_BYTES / SECTOR_SIZE
 #define TOTAL_HASH_MEMORY (TOTAL_SECTORS * AES_GCM_AUTH_SIZE)
 
@@ -177,40 +177,10 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         uint64_t curr_sector = io->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(io->bio_in, io->bi_iter);
-        switch (enc_or_dec)
-        {
-        case WRITE:
-            // sector has never been written to
-            if (*checksum_index(io, curr_sector) == 0)
-            {
-                //printk(KERN_INFO "NEW WRITE: sector id %llu", curr_sector);
-            }
-            else
-            {
-                //printk(KERN_INFO "WRITE: sector id %llu", curr_sector);
-            }
-            break;
-        case READ:
-            // if we ever read from a sector we never encrypted, we just return?
-            if (*checksum_index(io, curr_sector) == 0)
-            {
-                return 0;
-            }
-            else
-            {
-                //printk(KERN_INFO "READ: sector id %llu", curr_sector);
-            }
-            break;
+        // We will never read from a sector that we haven't written to yet
+        if (*checksum_index(io, curr_sector) == 0 && enc_or_dec == READ) {
+            return 0;
         }
-        // Testing fields
-        // static IV
-        // char *iv = kmalloc(AES_GCM_IV_SIZE, GFP_KERNEL);
-        // if (!iv)
-        // {
-        //     printk(KERN_INFO "could not allocate ivdata");
-        //     ret = -ENOMEM;
-        //     goto exit;
-        // }
         memcpy(iv_index(io, curr_sector), "123456789012", AES_GCM_IV_SIZE);
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
@@ -223,13 +193,11 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         //  *  | (authenticated) | (auth+encryption) |              |
         //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
         //  */
-        //printk(KERN_INFO "allocating aead request");
         req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
         if (!req)
         {
             printk(KERN_INFO "aead request allocation failed");
             aead_request_free(req);
-            //kfree(iv);
             ret = -ENOMEM;
             goto exit;
         }
@@ -259,12 +227,10 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
                 printk(KERN_INFO "encryption/decryption failed");
             }
             aead_request_free(req);
-            //kfree(iv);
             goto exit;
         }
-	aead_request_free(req);
+	    aead_request_free(req);
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
-        //kfree(iv);
     }
     return 0;
 exit:
@@ -289,7 +255,6 @@ static void decrypt_at_end_io(struct bio *clone)
 
     // decrypt
     enc_or_dec_bio(read_bio, READ);
-    //printk(KERN_INFO "decryption properly worked");
     // release the read bio
     bio_endio(read_bio->base_bio);
 }
