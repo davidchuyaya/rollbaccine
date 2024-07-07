@@ -7,6 +7,7 @@
 #include <linux/bio.h>
 #include <linux/scatterlist.h>
 #include <linux/list.h>
+#include <linux/vmalloc.h>
 #include <linux/string.h>
 #include <linux/gfp.h>
 #include <linux/err.h>
@@ -26,7 +27,14 @@
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
 
+#define RAM_SIZE_GB 1
+#define TOTAL_RAM_BYTES RAM_SIZE_GB * 1024 * 1024 * 1024
+#define TOTAL_TEST_SECTORS 4194304
+#define TOTAL_SECTORS TOTAL_RAM_BYTES / SECTOR_SIZE
+#define TOTAL_HASH_MEMORY (TOTAL_SECTORS * AES_GCM_AUTH_SIZE)
+
 #define MIN_IOS 64
+
 
 // Data attached to each bio
 struct encryption_device
@@ -38,10 +46,9 @@ struct encryption_device
     char *key;
     // not sure what this is, but it's needed to create a clone of the bio
     struct bio_set bs;
-    // list containing mappings from sector to mac
-    struct list_head encryption_metadata_list;
-    // lock for list
-    struct mutex lock;
+    // array of hashes of each sector
+    char* checksums;
+
 };
 
 // per bio private data
@@ -60,18 +67,12 @@ typedef struct encryption_io
 
 } convert_context;
 
-// node to maintain encrypted sector and corresponding mac
-struct encryption_metadata
-{
-    struct list_head list;
-    uint64_t sector;
-    char mac[AES_GCM_AUTH_SIZE];
-};
-
 void cleanup(struct encryption_device *rbd)
 {
     if (rbd == NULL)
         return;
+    if (rbd->checksums == NULL)
+        kvfree(rbd->checksums);
     if (rbd->tfm)
         crypto_free_aead(rbd->tfm);
     bioset_exit(&rbd->bs);
@@ -94,6 +95,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     struct encryption_device *rbd;
     printk(KERN_INFO "encryption constructor called\n");
 
+    // TODO: look into vzalloc
     rbd = kmalloc(sizeof(struct encryption_device), GFP_KERNEL);
     if (rbd == NULL)
     {
@@ -134,11 +136,14 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
     bioset_init(&rbd->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
 
-    // initialize list
-    INIT_LIST_HEAD(&rbd->encryption_metadata_list);
-
-    // initialize lock
-    mutex_init(&rbd->lock);
+    rbd->checksums = kvmalloc_array(TOTAL_TEST_SECTORS, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    if (!rbd->checksums) {
+        ti->error = "Cannot allocate checksums";
+        ret = -ENOMEM;
+        goto out;
+    }
+    // Check the allocation of the large checksums array
+    printk(KERN_INFO "Allocated memory for encryption_device: %zu bytes\n", sizeof(rbd->checksums));
 
     // TODO: Look into putting hashes inside of here too and some rounding?
     ti->per_io_data_size = sizeof(struct encryption_io);
@@ -151,20 +156,14 @@ out:
     return ret;
 }
 
-static struct encryption_metadata *get_entry(struct list_head *head, uint64_t sector)
-{
-    struct encryption_metadata *curr_entry;
-    struct list_head *ptr;
-    for (ptr = head->next; ptr != head; ptr = ptr->next)
-    {
-        curr_entry = list_entry(ptr, struct encryption_metadata, list);
-        if (sector == curr_entry->sector)
-        {
-            return curr_entry;
-        }
-    }
-    return NULL;
+static inline unsigned char *checksum_index(struct encryption_io *io, sector_t index) {
+    return &io->rbd->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
 }
+
+static inline unsigned char *iv_index(struct encryption_io *io, sector_t index) {
+    return &io->rbd->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
+}
+
 
 static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
 {
@@ -178,72 +177,27 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         uint64_t curr_sector = io->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(io->bio_in, io->bi_iter);
-        ret = mutex_lock_interruptible(&io->rbd->lock);
-        if (ret)
-            goto exit;
-        struct encryption_metadata *entry = get_entry(&io->rbd->encryption_metadata_list, curr_sector);
-        mutex_unlock(&io->rbd->lock);
-        switch (enc_or_dec)
-        {
-        case WRITE:
-            // sector has never been written to
-            if (entry == NULL)
-            {
-                printk(KERN_INFO "NEW WRITE: sector id %llu", curr_sector);
-                entry = kmalloc(sizeof(struct encryption_metadata), GFP_KERNEL);
-                entry->sector = curr_sector;
-                ret = mutex_lock_interruptible(&io->rbd->lock);
-                if (ret)
-                    goto exit;
-                list_add(&entry->list, &io->rbd->encryption_metadata_list);
-                mutex_unlock(&io->rbd->lock);
-                printk(KERN_INFO "Added item to list");
-            }
-            else
-            {
-                printk(KERN_INFO "WRITE: sector id %llu", entry->sector);
-            }
-            break;
-        case READ:
-            // if we ever read from a sector we never encrypted, we just return?
-            if (entry == NULL)
-            {
-                return 0;
-            }
-            else
-            {
-                printk(KERN_INFO "READ: sector id %llu", entry->sector);
-            }
-            break;
+        // We will never read from a sector that we haven't written to yet
+        if (*checksum_index(io, curr_sector) == 0 && enc_or_dec == READ) {
+            return 0;
         }
-        // Testing fields
-        // static IV
-        char *iv = kmalloc(AES_GCM_IV_SIZE, GFP_KERNEL);
-        if (!iv)
-        {
-            printk(KERN_INFO "could not allocate ivdata");
-            ret = -ENOMEM;
-            goto exit;
-        }
-        memcpy(iv, "123456789012", AES_GCM_IV_SIZE);
+        memcpy(iv_index(io, curr_sector), "123456789012", AES_GCM_IV_SIZE);
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
-        sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
+        sg_set_buf(&sg[1], iv_index(io, curr_sector), AES_GCM_IV_SIZE);
         sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
-        sg_set_buf(&sg[3], &entry->mac, AES_GCM_AUTH_SIZE);
+        sg_set_buf(&sg[3], checksum_index(io, curr_sector), AES_GCM_AUTH_SIZE);
 
         // /* AEAD request:
         //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
         //  *  | (authenticated) | (auth+encryption) |              |
         //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
         //  */
-        printk(KERN_INFO "allocating aead request");
         req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
         if (!req)
         {
             printk(KERN_INFO "aead request allocation failed");
             aead_request_free(req);
-            kfree(iv);
             ret = -ENOMEM;
             goto exit;
         }
@@ -253,11 +207,11 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         switch (enc_or_dec)
         {
         case WRITE:
-            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv);
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv_index(io, curr_sector));
             ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
             break;
         case READ:
-            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv);
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv_index(io, curr_sector));
             ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
             break;
         }
@@ -273,14 +227,14 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
                 printk(KERN_INFO "encryption/decryption failed");
             }
             aead_request_free(req);
-            kfree(iv);
             goto exit;
         }
+	    aead_request_free(req);
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
-        kfree(iv);
     }
     return 0;
 exit:
+    cleanup(io->rbd);
     return ret;
 }
 
@@ -301,7 +255,6 @@ static void decrypt_at_end_io(struct bio *clone)
 
     // decrypt
     enc_or_dec_bio(read_bio, READ);
-    printk(KERN_INFO "decryption properly worked");
     // release the read bio
     bio_endio(read_bio->base_bio);
 }
@@ -320,7 +273,7 @@ static void encryption_io_init(struct encryption_io *io, struct encryption_devic
 
 static int encryption_map(struct dm_target *ti, struct bio *bio)
 {
-    printk(KERN_INFO "encryption map called\n");
+    //printk(KERN_INFO "encryption map called\n");
     struct encryption_device *rbd = ti->private;
     struct bio *clone;
     struct encryption_io *io;
@@ -330,19 +283,20 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     io = dm_per_bio_data(bio, ti->per_io_data_size);
     // initialize fields for bio data that will be useful for encryption
     encryption_io_init(io, rbd, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
-    printk(KERN_INFO "io properly initialized\n");
+    //printk(KERN_INFO "io properly initialized\n");
     if (bio_has_data(bio))
     {
+	uint64_t original_sector;
         switch (bio_data_dir(bio))
         {
         case WRITE:
-            uint64_t original_sector = io->sector;
+            original_sector = io->sector;
             unsigned int original_size = bio->bi_iter.bi_size;
             unsigned int original_idx = bio->bi_iter.bi_idx;
 
             // Encrypt
             enc_or_dec_bio(io, WRITE);
-            printk(KERN_INFO "encryption done properly\n");
+            //printk(KERN_INFO "encryption done properly\n");
 
             // Reset to the original beginning values of the bio, otherwise nothing will be written
             bio->bi_iter.bi_sector = original_sector;
@@ -366,7 +320,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
 
             // Submit the clone, triggering end_io, where the read will actually have data and we can decrypt
             submit_bio_noacct(clone);
-            printk(KERN_INFO "read properly initialized\n");
+            //printk(KERN_INFO "read properly initialized\n");
 
             return DM_MAPIO_SUBMITTED;
         }
