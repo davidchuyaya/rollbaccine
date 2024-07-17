@@ -73,7 +73,7 @@ struct server_device {
     // Logic for writes that block on previous fsyncs going to disk
     int disk_unacked_ops; // Number of operations yet to be acked by disk
     struct kfifo queued_ops; // List of all blocked ops. Ordered by write index.
-    spinlock_t submit_queue_out_lock;
+    wait_queue_head_t submit_queue_wait_queue;
     struct kfifo submit_queue; // Operations about to be submitted to disk, queued in here to avoid deadlock when bio_end_io is called on the same thread. Lock writes with index_lock, reads with submit_queue_out_lock.
     
     // Communication between main threads and the networking thread
@@ -197,13 +197,6 @@ unsigned int remove_fsync_flags(unsigned int bio_opf) {
     return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA;
 }
 
-void submit_bios_in_submit_queue(struct server_device *device) {
-    struct bio *bio;
-    while (kfifo_out_spinlocked(&device->submit_queue, &bio, sizeof(struct bio *), &device->submit_queue_out_lock) > 0) {
-        submit_bio_noacct(bio);
-    }
-}
-
 // Because we alloc pages when we receive the bios, we haev to free them when it's done writing
 static void free_pages_end_io(struct bio *received_bio) {
     struct server_device *device = (struct server_device*) received_bio->bi_private;
@@ -234,7 +227,7 @@ static void try_free_clones(struct bio *deep_clone, struct bio *shallow_clone) {
 
 static void disk_end_io(struct bio *bio) {
     struct server_device *device = (struct server_device*) bio->bi_private;
-    struct bio_data *bio_data = dm_per_bio_data(bio, sizeof(struct bio_data));
+    // struct bio_data *bio_data = dm_per_bio_data(bio, sizeof(struct bio_data));
     struct bio *next_bio;
     struct bio_data *next_bio_data;
 
@@ -250,7 +243,6 @@ static void disk_end_io(struct bio *bio) {
             // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
             kfifo_in(&device->submit_queue, &next_bio, sizeof(struct bio *));
             device->disk_unacked_ops++;
-            
 
             if (requires_fsync(next_bio)) {
                 break;
@@ -259,7 +251,7 @@ static void disk_end_io(struct bio *bio) {
     }
     spin_unlock(&device->index_lock);
 
-    submit_bios_in_submit_queue(device);
+    wake_up_interruptible(&device->submit_queue_wait_queue);
 }
 
 static void leader_disk_end_io(struct bio *shallow_clone) {
@@ -385,6 +377,27 @@ int broadcaster(void *args) {
     return 0;
 }
 
+// Thread that runs in the background and submits bios to disk
+int submitter(void *args) {
+    struct server_device *device = (struct server_device *)args;
+    struct bio *clone;
+    int num_bios_gotten;
+
+    while (!device->shutting_down) {
+        num_bios_gotten = kfifo_out(&device->submit_queue, &clone, sizeof(struct bio *));
+        // printk(KERN_INFO "Checked bios, got %d", num_bios_gotten);
+        if (num_bios_gotten == 0) {
+            // Wait for new bios
+            wait_event_interruptible(device->submit_queue_wait_queue, !kfifo_is_empty(&device->submit_queue));
+            continue;
+        }
+
+        submit_bio_noacct(clone);
+    }
+
+    return 0;
+}
+
 struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src) {
     struct bio *clone;
     clone = bio_clone_fast(bio_src, GFP_NOWAIT, &device->bs);
@@ -490,7 +503,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         }
         spin_unlock(&device->index_lock);
 
-        submit_bios_in_submit_queue(device);
+        wake_up_interruptible(&device->submit_queue_wait_queue);
 
         // Add original bio to fsyncs blocked on replication. Remove any fsync flags from the original so it won't trigger a disk IO.
         if (is_fsync) {
@@ -619,7 +632,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         }
         spin_unlock(&device->index_lock);
 
-        submit_bios_in_submit_queue(device);
+        wake_up_interruptible(&device->submit_queue_wait_queue);
     }
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
@@ -868,7 +881,7 @@ static int start_server(struct server_device *device, ushort port) {
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
-    struct task_struct *broadcast_thread;
+    struct task_struct *broadcast_thread, *submit_thread;
     ushort port;
     int error;
     int i;
@@ -938,7 +951,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         printk(KERN_ERR "Error creating queued_ops");
         return error;
     }
-    spin_lock_init(&device->submit_queue_out_lock);
+    init_waitqueue_head(&device->submit_queue_wait_queue);
     error = kfifo_alloc(&device->submit_queue, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE, GFP_KERNEL);
     if (error < 0) {
         printk(KERN_ERR "Error creating submit_queue");
@@ -984,6 +997,13 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         }
     }
 
+    // Start submit thread
+    submit_thread = kthread_run(submitter, device, "submit thread");
+    if (IS_ERR(submit_thread)) {
+        printk(KERN_ERR "Error creating submit thread");
+        return -1;
+    }
+
     // Enable FUA and PREFLUSH flags
     ti->num_flush_bios = 1;
     ti->flush_supported = 1;
@@ -1024,7 +1044,12 @@ static void server_destructor(struct dm_target *ti) {
         kfree(curr);
     }
 
+
     kfifo_free(&device->broadcast_queue);
+    // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
+    kfifo_free(&device->fsyncs_pending_replication);
+    kfifo_free(&device->queued_ops);
+    kfifo_free(&device->submit_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     mempool_destroy(device->mempool);
