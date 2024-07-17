@@ -256,6 +256,7 @@ sudo insmod server.ko
 echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 0 true 12340" | sudo dmsetup create server1
 echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 1 2 1 false 12350 12340" | sudo dmsetup create server2
 sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1 --loops=10 --name=servers
+sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --loops=10 --name=servers
 ```
 
 
