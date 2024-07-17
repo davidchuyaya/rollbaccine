@@ -147,6 +147,12 @@ sudo apt install -y build-essential
 ```
 [Install the GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt) so you can push changes after developing in the VM.
 
+To avoid having to type your password on sudo, execute the following:
+```bash
+sudo passwd -d davidchu
+```
+Replace `davidchu` with your username.
+
 
 ## Everyday development
 After modifying the kernel module, compile it with and install it with:
@@ -157,7 +163,7 @@ sudo insmod rollbaccine.ko
 ```
 
 > [!TIP]  
-> To view the outputs of your module, execute `sudo dmesg | tail -10`. To see all loaded kernel modules, run `sudo lsmod`.
+> To view the outputs of your module, execute `sudo dmesg | tail -10`. To see the outputs continuously, execute `sudo dmesg -wH`. To see all loaded kernel modules, run `sudo lsmod`.
 
 
 Now that the module is loaded, we have to create the device with `dmsetup`.
@@ -264,6 +270,11 @@ echo "0 `sudo blockdev --getsz /dev/ram0` hash /dev/ram0" | sudo dmsetup create 
 ### Fsync
 Replicating fsyncs vs flushing to disk.
 
+Mount ext4. Replace `/dev/mapper/passthrough` with the device mapper's directory.
+```bash
+sudo mkfs.ext4 /dev/mapper/passthrough
+sudo mount /dev/mapper/passthrough /mnt
+```
 
 
 ## Testing writes/reads to block device
