@@ -4,16 +4,17 @@
 - [Everyday development](#everyday-development)
 - [Benchmarking](#benchmarking)
 
+Create a Ubuntu 24.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). The 24.04 version is required for in-kernel TLS.
+
+Download a [Ubuntu 24.04 LTS image](https://ubuntu.com/download/server). I downloaded the server install image since I don't need the GUI.
+
 ## Mac Setup
 <details Mac>
 <summary>Mac Setup</summary>
 <br>
-Create a Ubuntu 22.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I installed [UTM](https://mac.getutm.app/).
 
 ### Creating the VM with UTM
-Download a [Ubuntu 22.04 LTS image](https://releases.ubuntu.com/jammy/). I downloaded the server install image since I don't need the GUI.
-
-Configure the VM:
+Install [UTM](https://mac.getutm.app/), and configure the VM:
 - Open UTM, then click "+"
 - Virtualize
 - Linux
@@ -27,15 +28,10 @@ Install Ubuntu:
 - Start the VM
 - Install Ubuntu Server
 - Enter your preferred username and password
+- Check Install OpenSSH Server
 - Wait until the install finishes, then select "Reboot now"
 - In UTM, select CD/DVD and clear (this simulates ejecting disk)
 - Enter your username and password
-
-Start the SSH server on the VM:
-```bash
-sudo apt install -y openssh-server
-sudo service ssh restart
-```
 
 Write down the IPv4 address of the VM. It should be under the "Welcome to Ubuntu" message in the VM.
 Then execute `ssh user@ip` on your machine, where `user` is the username you chose and `ip` is the IP address of the VM. You're in!
@@ -71,11 +67,7 @@ ssh-copy-id localvm
 <summary>Windows Setup</summary>
 <br>
 
-Create a Ubuntu 22.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). I downloaded [oracle virtual box](https://www.virtualbox.org/wiki/Downloads).
-
-Download a [Ubuntu 22.04 LTS image](https://releases.ubuntu.com/jammy/). I downloaded the server install image since I don't need the GUI.
-
-Configure the VM:
+Install [Oracle virtual box](https://www.virtualbox.org/wiki/Downloads) and configure the VM:
 
 1. Create new machine and browse to find the ISO image you downloaded earlier
 2. Create username and password
@@ -133,25 +125,25 @@ In order for VSCode to understand Linux kernel headers, we will follow instructi
 cd rollbaccine
 rm -rf .vscode
 git clone https://github.com/amezin/vscode-linux-kernel .vscode
-python3 .vscode/generate_compdb.py -O /lib/modules/5.15.0-107-generic/build $PWD
+python3 .vscode/generate_compdb.py -O /lib/modules/6.8.0-38-generic/build $PWD
 ```
 
-Replace `5.15.0-107-generic` with the output of `uname -r` on the VM.
+Replace `6.8.0-38-generic` with the output of `uname -r` on the VM.
 
 
 ### Setting up the VM
+To avoid having to type your password on sudo, execute the following:
+```bash
+sudo passwd -d davidchu
+```
+Replace `davidchu` with your username.
+
 Install the necessary packages:
 ```bash
 sudo apt update
 sudo apt install -y build-essential
 ```
 [Install the GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt) so you can push changes after developing in the VM.
-
-To avoid having to type your password on sudo, execute the following:
-```bash
-sudo passwd -d davidchu
-```
-Replace `davidchu` with your username.
 
 
 ## Everyday development
@@ -186,7 +178,7 @@ sudo rmmod rollbaccine
 
 
 ## Benchmarking
-Create an Azure VM with a Ubuntu 22.04 image and at least 8 cores.
+Create an Azure VM with a Ubuntu 24.04 image and at least 8 cores.
 Turn off Secure Boot so we can load kernel modules.
 
 We will benchmark everything using `fio` against direct writes to RAM.
@@ -238,13 +230,13 @@ echo "0 `sudo blockdev --getsz /dev/ram0` encryption /dev/ram0" | sudo dmsetup c
 
 
 ### Networking
-Measure the throughput overhead of networking.
-Replace `<is_leader>` with true if this node's writes should be replicated.
-TODO: Remove this feature once leader election is implemented.
-Replace `<f>` with a number, minimum 1.
-Replace `<n>` with the number of nodes in the system, minimum 2.
-Replace `<id>` with the id of the node, starting from 0.
-Replace `<listen port>`, `<server port 1>`, and `<server port 2>` with the desired ports. You can have as many server ports as you want (or no server ports).
+Measure the throughput overhead of networking.  
+Replace `<is_leader>` with true if this node's writes should be replicated.  
+TODO: Remove this feature once leader election is implemented.  
+Replace `<f>` with a number, minimum 1.  
+Replace `<n>` with the number of nodes in the system, minimum 2.  
+Replace `<id>` with the id of the node, starting from 0.  
+Replace `<listen port>`, `<server port 1>`, and `<server port 2>` with the desired ports, where you can supply a varying number of server ports, depending on how many servers this node should connect to.
 ```bash
 echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <f> <n> <id> <is_leader> <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
 ```
@@ -259,6 +251,31 @@ sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1
 sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --loops=10 --name=servers
 ```
 
+Create the certificates for TLS, if the files don't already exist in the [network](network) directory. Replace `127.0.0.1` with the address of the node:
+```bash
+openssl genrsa | openssl pkcs8 -topk8 -nocrypt -outform DER -out 0_privkey.der
+openssl req -x509 -key 0_privkey.der -out 0_cert.pem -days 365 -keyform DER -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=127.0.0.1"
+openssl genrsa | openssl pkcs8 -topk8 -nocrypt -outform DER -out 1_privkey.der
+openssl req -x509 -key 1_privkey.der -out 1_cert.pem -days 365 -keyform DER -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=127.0.0.1"
+```
+
+Install `keyutils` if you haven't already:
+```bash
+sudo apt install -y keyutils
+```
+
+Create the keyring and load them. Record the output ids of each command. You will need to rerun these commands after each restart:
+```bash
+keyctl newring tls_keyring @s > keyring_id.txt
+keyring_id=$(cat keyring_id.txt)
+openssl x509 -in 0_cert.pem -outform DER | keyctl padd asymmetric 0_cert $keyring_id > 0_cert_id.txt
+openssl x509 -in 1_cert.pem -outform DER | keyctl padd asymmetric 1_cert $keyring_id > 1_cert_id.txt
+sudo modprobe pkcs8_key_parser
+keyctl padd asymmetric 0_privkey @s <0_privkey.der > 0_privkey_id.txt
+keyctl padd asymmetric 1_privkey @s <1_privkey.der > 1_privkey_id.txt
+```
+
+If you run `keyctl show`, you should see a cert and privkey for each node, where the certificates are in the tls_keyring.
 
 ### Integrity
 Our custom integrity checker vs dm-integrity.
