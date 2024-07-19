@@ -13,7 +13,7 @@
 #include <linux/module.h>
 #include <linux/tcp.h>
 #include <net/sock.h>
-#include <net/handshake.h>
+#include <net/handshake.h> // For TLS
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
 #define ROLLBACCINE_ENCRYPT_GRANULARITY 4096 // Number of bytes to encrypt, hash, or send at a time
@@ -23,8 +23,11 @@
 #define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE 1024 // Number of bios that can be outstanding between main threads and network broadcast thread. Must be power of 2, according to kfifo specs
 #define ROLLBACCINE_PAGE_POOL_SIZE 1024 // Number of pages to be allocated for the page pool. Should be larger than the set of pages used by bios in-flight.
 #define ROLLBACCINE_BIO_DATA_POOL_SIZE 1024 // Number of bio_data structs to be allocated. Should be larger than the set of bios in-flight at any time.
+#define ROLLBACCINE_TLS_TIMEOUT 5000 // Number of milliseconds to wait for TLS handshake to complete
 #define MIN_IOS 64
 #define MODULE_NAME "server"
+
+// #define TLS_ON
 
 // TODO: Expand with protocol message types
 enum MsgType { ROLLBACCINE_WRITE, FOLLOWER_ACK };
@@ -139,6 +142,9 @@ struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src)
 struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src);
 void kill_thread(struct socket *sock);
 void blocking_read(struct server_device *device, struct socket *sock);
+#ifdef TLS_ON
+void on_tls_handshake_done(void *data, int status, key_serial_t peerid);
+#endif
 int connect_to_server(void *args);
 int start_client_to_server(struct server_device *device, ushort port);
 int listen_to_accepted_socket(void *args);
@@ -684,11 +690,28 @@ void blocking_read(struct server_device *device, struct socket *sock) {
 //     sock_release(sock);
 }
 
+#ifdef TLS_ON
+void on_tls_handshake_done(void *data, int status, key_serial_t peerid) {
+    struct completion *tls_handshake_completed = data;
+
+    if (status != 0) {
+        printk(KERN_ERR "TLS handshake failed with status %d", status);    
+    }
+
+    complete(tls_handshake_completed);
+}
+#endif
+
 int connect_to_server(void *args) {
     struct client_thread_params *thread_params = (struct client_thread_params *)args;
     struct socket_list *sock_list;
-    struct tls_handshake_args tls_args;
     int error = -1;
+#ifdef TLS_ON
+    struct tls_handshake_args tls_args;
+    struct completion tls_handshake_completed;
+    struct file* sock_file;
+    unsigned long timeout_remainder;
+#endif
 
     // Retry connecting to server until it succeeds
     printk(KERN_INFO "Attempting to connect for the first time");
@@ -715,6 +738,39 @@ int connect_to_server(void *args) {
     spin_lock(&thread_params->device->connected_sockets_lock);
     list_add(&sock_list->list, &thread_params->device->connected_sockets);
     spin_unlock(&thread_params->device->connected_sockets_lock);
+
+#ifdef TLS_ON
+    // TLS setup
+    printk(KERN_INFO "Client starting TLS handshake");
+    sock_file = sock_alloc_file(thread_params->sock, O_NONBLOCK, NULL);
+    if (IS_ERR(sock_file)) {
+        printk(KERN_ERR "Error creating file from socket");
+    }
+    // TODO: Free the sock_file. Has the same problem with freeing as sock_release()
+    init_completion(&tls_handshake_completed);
+    tls_args.ta_sock = thread_params->sock;
+    tls_args.ta_done = on_tls_handshake_done;
+    tls_args.ta_data = &tls_handshake_completed;
+    tls_args.ta_peername = "127.0.0.1"; // TODO: Replace with dynamic address
+    tls_args.ta_keyring = 812650863;    // TODO: Replace with read from file
+    tls_args.ta_my_cert = 311286881;
+    tls_args.ta_my_privkey = 58895732;
+    error = tls_client_hello_x509(&tls_args, GFP_KERNEL);
+    if (error < 0) {
+        printk(KERN_ERR "Client error starting TLS handshake: %d", error);
+    }
+    else {
+        // Wait until TLS handshake is done
+        printk(KERN_INFO "Client waiting for TLS handshake to complete");
+        timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
+        if (!timeout_remainder) {
+            printk(KERN_ERR "Client TLS handshake timed out");
+        }
+        else {
+            printk(KERN_INFO "Client TLS handshake completed");
+        }
+    }
+#endif
 
     blocking_read(thread_params->device, thread_params->sock);
 
@@ -773,6 +829,42 @@ int start_client_to_server(struct server_device *device, ushort port) {
 
 int listen_to_accepted_socket(void *args) {
     struct accepted_thread_params *thread_params = (struct accepted_thread_params *)args;
+#ifdef TLS_ON
+    struct tls_handshake_args tls_args;
+    struct completion tls_handshake_completed;
+    struct file *sock_file;
+    unsigned long timeout_remainder;
+    int error;
+
+    // TLS setup
+    printk(KERN_INFO "Server starting TLS handshake");
+    sock_file = sock_alloc_file(thread_params->sock, O_NONBLOCK, NULL);
+    if (IS_ERR(sock_file)) {
+        printk(KERN_ERR "Error creating file from socket");
+    }
+    // TODO: Free the sock_file. Has the same problem with freeing as sock_release()
+    init_completion(&tls_handshake_completed);
+    tls_args.ta_sock = thread_params->sock;
+    tls_args.ta_done = on_tls_handshake_done;
+    tls_args.ta_data = &tls_handshake_completed;
+    tls_args.ta_peername = "127.0.0.1";  // TODO: Replace with dynamic address
+    tls_args.ta_keyring = 812650863;     // TODO: Replace with read from file
+    tls_args.ta_my_cert = 1033674527;
+    tls_args.ta_my_privkey = 327987726;
+    error = tls_server_hello_x509(&tls_args, GFP_KERNEL);
+    if (error < 0) {
+        printk(KERN_ERR "Server error starting TLS handshake: %d", error);
+    }
+    else {
+        // Wait until TLS handshake is done
+        timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
+        if (!timeout_remainder) {
+            printk(KERN_ERR "Server TLS handshake timed out");
+        } else {
+            printk(KERN_INFO "Server TLS handshake completed");
+        }
+    }
+#endif
 
     blocking_read(thread_params->device, thread_params->sock);
 

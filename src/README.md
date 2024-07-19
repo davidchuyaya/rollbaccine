@@ -251,6 +251,9 @@ sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1
 sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --loops=10 --name=servers
 ```
 
+#### TLS
+Run the following instructions *before* setting up networking.
+
 Create the certificates for TLS, if the files don't already exist in the [network](network) directory. Replace `127.0.0.1` with the address of the node:
 ```bash
 openssl genrsa | openssl pkcs8 -topk8 -nocrypt -outform DER -out 0_privkey.der
@@ -259,9 +262,9 @@ openssl genrsa | openssl pkcs8 -topk8 -nocrypt -outform DER -out 1_privkey.der
 openssl req -x509 -key 1_privkey.der -out 1_cert.pem -days 365 -keyform DER -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=127.0.0.1"
 ```
 
-Install `keyutils` if you haven't already:
+Install `keyutils` if you haven't already, to enable key management. In addition, install [ktls-utils](https://github.com/oracle/ktls-utils), since kTLS itself can't actually perform the handshake; [it requires an application in userspace to do it](https://docs.kernel.org/networking/tls-handshake.html#user-handshake-agent) for security concerns [[1](https://lwn.net/Articles/892216/)][[2](https://lwn.net/Articles/896746/)].
 ```bash
-sudo apt install -y keyutils
+sudo apt install -y keyutils ktls-utils
 ```
 
 Create the keyring and load them. Record the output ids of each command. You will need to rerun these commands after each restart:
@@ -275,7 +278,11 @@ keyctl padd asymmetric 0_privkey @s <0_privkey.der > 0_privkey_id.txt
 keyctl padd asymmetric 1_privkey @s <1_privkey.der > 1_privkey_id.txt
 ```
 
-If you run `keyctl show`, you should see a cert and privkey for each node, where the certificates are in the tls_keyring.
+If you run `keyctl show`, you should see a cert and privkey for each node, where the certificates are in the tls_keyring.  
+TODO: For now, I manually run `keyctl show` to find the keyring, cert, and privkey ids and copy them to the TLS handshake parameters. We should automate this by having the module read the directory and find the files that store the key IDs.
+
+If ktls-utils stops working, check its logs with `journalctl -b` and filter for "tls".
+
 
 ### Integrity
 Our custom integrity checker vs dm-integrity.
