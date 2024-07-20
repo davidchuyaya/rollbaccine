@@ -14,6 +14,7 @@
 #include <linux/tcp.h>
 #include <net/sock.h>
 #include <net/handshake.h> // For TLS
+#include <net/tls_prot.h>
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
 #define ROLLBACCINE_ENCRYPT_GRANULARITY 4096 // Number of bytes to encrypt, hash, or send at a time
@@ -27,7 +28,7 @@
 #define MIN_IOS 64
 #define MODULE_NAME "server"
 
-// #define TLS_ON
+#define TLS_ON
 
 // TODO: Expand with protocol message types
 enum MsgType { ROLLBACCINE_WRITE, FOLLOWER_ACK };
@@ -358,7 +359,7 @@ void broadcast_bio(struct bio *clone) {
         while (vec.iov_len > 0) {
             sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
             if (sent <= 0) {
-                printk(KERN_ERR "Error sending message, aborting send");
+                printk(KERN_ERR "Error broadcasting message header, aborting");
                 // TODO: Should remove the socket from the list and shut down the connection?
                 goto finish_sending_to_socket;
             } else {
@@ -385,7 +386,7 @@ void broadcast_bio(struct bio *clone) {
 
                 sent = sock_sendmsg(curr->sock, &msg_header);
                 if (sent <= 0) {
-                    printk(KERN_ERR "Error sending message, aborting send");
+                    printk(KERN_ERR "Error broadcasting message pages");
                     // TODO: Should remove the socket from the list and shut down the connection?
                     goto finish_sending_to_socket;
                 } else {
@@ -588,12 +589,23 @@ void blocking_read(struct server_device *device, struct socket *sock) {
     struct msghdr msg_header;
     struct kvec vec;
     int sent, received, i;
+#ifdef TLS_ON
+    union {
+        struct cmsghdr cmsg;
+        u8 buf[CMSG_SPACE(sizeof(u8))];
+    } u;
+#endif
 
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
+    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
+#ifdef TLS_ON
+    msg_header.msg_control = &u;
+    msg_header.msg_controllen = sizeof(u);
+#else
     msg_header.msg_control = NULL;
     msg_header.msg_controllen = 0;
-    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
+#endif
 
     while (!device->shutting_down) {
         // 1. Receive metadata message
@@ -605,11 +617,30 @@ void blocking_read(struct server_device *device, struct socket *sock) {
             printk(KERN_ERR "Error reading from socket");
             break;
         }
-        // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH | REQ_FUA));
+
+#ifdef TLS_ON
+        // Handle the TLS control messages.
+        if (msg_header.msg_controllen != sizeof(u)) {
+            switch (tls_get_record_type(sock->sk, &u.cmsg)) {
+                case 0:
+                    fallthrough;
+                case TLS_RECORD_TYPE_DATA:
+                    printk(KERN_INFO "We got some TLS control msg but it's all good");
+                    break;
+                case TLS_RECORD_TYPE_ALERT:
+                    printk(KERN_ERR "TLS alert received. Uhoh.");
+                    break;
+                default:
+                    break;
+            }
+        }
+#endif
+
+        printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH | REQ_FUA));
 
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
-            // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
+            printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
             process_follower_fsync_index(device, metadata.bal.id, metadata.write_index);
             continue;
         }
@@ -640,7 +671,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                 printk(KERN_ERR "Error reading from socket");
                 break;
             }
-            // printk(KERN_INFO "Received bio page: %i", i);
+            printk(KERN_INFO "Received bio page: %i", i);
             __bio_add_page(received_bio, page, PAGE_SIZE, 0);
         }
 
@@ -654,18 +685,27 @@ void blocking_read(struct server_device *device, struct socket *sock) {
             vec.iov_base = &metadata;
             vec.iov_len = sizeof(struct metadata_msg);
 
+#ifdef TLS_ON
+            // Clear TLS message headers (not populated by us) before responding
+            msg_header.msg_name = 0;
+            msg_header.msg_namelen = 0;
+            msg_header.msg_control = NULL;
+            msg_header.msg_controllen = 0;
+            msg_header.msg_flags = 0;
+#endif
+
             // Keep retrying send until the whole message is sent
             while (vec.iov_len > 0) {
                 sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
                 if (sent <= 0) {
-                    printk(KERN_ERR "Error sending message, aborting send");
+                    printk(KERN_ERR "Error replying to fsync, aborting");
                     break;
                 } else {
                     vec.iov_base += sent;
                     vec.iov_len -= sent;
                 }
             }
-            // printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
+            printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
         }
 
         // 6. Submit bio
@@ -751,13 +791,10 @@ int connect_to_server(void *args) {
     tls_args.ta_sock = thread_params->sock;
     tls_args.ta_done = on_tls_handshake_done;
     tls_args.ta_data = &tls_handshake_completed;
-    tls_args.ta_peername = "127.0.0.1"; // TODO: Replace with dynamic address
-    tls_args.ta_keyring = 812650863;    // TODO: Replace with read from file
-    tls_args.ta_my_cert = 311286881;
-    tls_args.ta_my_privkey = 58895732;
     error = tls_client_hello_x509(&tls_args, GFP_KERNEL);
     if (error < 0) {
         printk(KERN_ERR "Client error starting TLS handshake: %d", error);
+        return 0;
     }
     else {
         // Wait until TLS handshake is done
@@ -765,6 +802,7 @@ int connect_to_server(void *args) {
         timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
         if (!timeout_remainder) {
             printk(KERN_ERR "Client TLS handshake timed out");
+            return 0;
         }
         else {
             printk(KERN_INFO "Client TLS handshake completed");
@@ -847,19 +885,17 @@ int listen_to_accepted_socket(void *args) {
     tls_args.ta_sock = thread_params->sock;
     tls_args.ta_done = on_tls_handshake_done;
     tls_args.ta_data = &tls_handshake_completed;
-    tls_args.ta_peername = "127.0.0.1";  // TODO: Replace with dynamic address
-    tls_args.ta_keyring = 812650863;     // TODO: Replace with read from file
-    tls_args.ta_my_cert = 1033674527;
-    tls_args.ta_my_privkey = 327987726;
     error = tls_server_hello_x509(&tls_args, GFP_KERNEL);
     if (error < 0) {
         printk(KERN_ERR "Server error starting TLS handshake: %d", error);
+        return 0;
     }
     else {
         // Wait until TLS handshake is done
         timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
         if (!timeout_remainder) {
             printk(KERN_ERR "Server TLS handshake timed out");
+            return 0;
         } else {
             printk(KERN_INFO "Server TLS handshake completed");
         }

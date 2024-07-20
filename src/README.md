@@ -252,34 +252,31 @@ sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --loops=10
 ```
 
 #### TLS
+To enable/disable TLS, comment out the `#define TLS` line in [server.c](src/network/server.c).  
 Run the following instructions *before* setting up networking.
 
-Create the certificates for TLS, if the files don't already exist in the [network](network) directory. Replace `127.0.0.1` with the address of the node:
+Create the certificates for TLS, if the files don't already exist in the [network](network) directory. As we create more replicas, we'll have to add all their certificates to the `tls_certs.pem` file by concatenating them. Replace `localhost` with the address of the node:
 ```bash
-openssl genrsa | openssl pkcs8 -topk8 -nocrypt -outform DER -out 0_privkey.der
-openssl req -x509 -key 0_privkey.der -out 0_cert.pem -days 365 -keyform DER -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=127.0.0.1"
-openssl genrsa | openssl pkcs8 -topk8 -nocrypt -outform DER -out 1_privkey.der
-openssl req -x509 -key 1_privkey.der -out 1_cert.pem -days 365 -keyform DER -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=127.0.0.1"
+openssl req -x509 -newkey rsa:4096 -keyout 0_key.pem -out 0_cert.pem -sha256 -days 365 -nodes -nodes -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=localhost"
+openssl req -x509 -newkey rsa:4096 -keyout 1_key.pem -out 1_cert.pem -sha256 -days 365 -nodes -nodes -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=localhost"
+cat 0_cert.pem 1_cert.pem > tls_certs.pem
 ```
 
-Install `keyutils` if you haven't already, to enable key management. In addition, install [ktls-utils](https://github.com/oracle/ktls-utils), since kTLS itself can't actually perform the handshake; [it requires an application in userspace to do it](https://docs.kernel.org/networking/tls-handshake.html#user-handshake-agent) for security concerns [[1](https://lwn.net/Articles/892216/)][[2](https://lwn.net/Articles/896746/)].
+Install [ktls-utils](https://github.com/oracle/ktls-utils), since kTLS itself can't actually perform the handshake; [it requires an application in userspace to do it](https://docs.kernel.org/networking/tls-handshake.html#user-handshake-agent) for security concerns [[1](https://lwn.net/Articles/892216/)][[2](https://lwn.net/Articles/896746/)]:
 ```bash
-sudo apt install -y keyutils ktls-utils
+sudo apt install -y automake pkg-config cmake-data gnutls-bin libgnutls28-dev libkeyutils-dev libglib2.0-dev libnl-3-dev libnl-genl-3-dev
+git clone https://github.com/oracle/ktls-utils
+cd ktls-utils
+sudo ./autogen.sh
+sudo ./configure --with-systemd
+sudo make
+sudo make install
+sudo cp *.pem /etc # Move all the certificates to the right directory
+sudo cp tlshd.conf /etc # Move the config
+sudo systemctl daemon-reload
+sudo systemctl enable --now tlshd
 ```
-
-Create the keyring and load them. Record the output ids of each command. You will need to rerun these commands after each restart:
-```bash
-keyctl newring tls_keyring @s > keyring_id.txt
-keyring_id=$(cat keyring_id.txt)
-openssl x509 -in 0_cert.pem -outform DER | keyctl padd asymmetric 0_cert $keyring_id > 0_cert_id.txt
-openssl x509 -in 1_cert.pem -outform DER | keyctl padd asymmetric 1_cert $keyring_id > 1_cert_id.txt
-sudo modprobe pkcs8_key_parser
-keyctl padd asymmetric 0_privkey @s <0_privkey.der > 0_privkey_id.txt
-keyctl padd asymmetric 1_privkey @s <1_privkey.der > 1_privkey_id.txt
-```
-
-If you run `keyctl show`, you should see a cert and privkey for each node, where the certificates are in the tls_keyring.  
-TODO: For now, I manually run `keyctl show` to find the keyring, cert, and privkey ids and copy them to the TLS handshake parameters. We should automate this by having the module read the directory and find the files that store the key IDs.
+This is known to work for commit e55cefda944595fd83b609eba7ad8f819fa1c9d3. Roll it back with `git checkout`.
 
 If ktls-utils stops working, check its logs with `journalctl -b` and filter for "tls".
 
