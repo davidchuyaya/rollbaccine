@@ -29,6 +29,7 @@
 #define MODULE_NAME "server"
 
 #define TLS_ON
+// #define MULTITHREADED_NETWORK
 
 // TODO: Expand with protocol message types
 enum MsgType { ROLLBACCINE_WRITE, FOLLOWER_ACK };
@@ -154,7 +155,7 @@ int start_server(struct server_device *device, ushort port);
 int __init server_init_module(void);
 void server_exit_module(void);
 
-    struct bio_data *alloc_bio_data(struct server_device *device) {
+struct bio_data *alloc_bio_data(struct server_device *device) {
     struct bio_data *data = mempool_alloc(device->bio_data_mempool, GFP_KERNEL);
     if (!data) {
         printk(KERN_ERR "Could not allocate bio_data");
@@ -349,7 +350,8 @@ void broadcast_bio(struct bio *clone) {
     msg_header.msg_controllen = 0;
     msg_header.msg_flags = 0;
 
-    spin_lock(&device->connected_sockets_lock);
+    // spin_lock(&device->connected_sockets_lock);
+    // TODO: kernel_sendmsg throws a "scheduling while atomic" error if we obtain the locks. Figure out what to do (use read locks?)
     list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
@@ -399,7 +401,7 @@ void broadcast_bio(struct bio *clone) {
     finish_sending_to_socket:
     }
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
-    spin_unlock(&device->connected_sockets_lock);
+    // spin_unlock(&device->connected_sockets_lock);
 }
 
 // Thread that runs in the background and broadcasts bios
@@ -495,6 +497,7 @@ struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
 static int server_map(struct dm_target *ti, struct bio *bio) {
     bool is_fsync = false;
     bool is_cloned = false;
+    bool should_wake_submit_queue = false;
     struct server_device *device = ti->private;
     struct bio *deep_clone, *shallow_clone; // deep clone is for the network, shallow clone is for submission to disk when necessary
     struct bio_data *bio_data;
@@ -544,27 +547,35 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
             // printk(KERN_INFO "Write %d submitted to disk, is fsync: %d", bio_data->write_index, is_fsync);
             // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
             kfifo_in(&device->submit_queue, &shallow_clone, sizeof(struct bio *));
+            should_wake_submit_queue = true;
             // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
             device->disk_unacked_ops++;
         }
-        spin_unlock(&device->index_lock);
-
-        wake_up_interruptible(&device->submit_queue_wait_queue);
-
         // Add original bio to fsyncs blocked on replication. Remove any fsync flags from the original so it won't trigger a disk IO.
         if (is_fsync) {
             bio->bi_opf = remove_fsync_flags(bio->bi_opf);
-            bio->bi_private = bio_data->write_index; // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
+            bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
             kfifo_in_spinlocked(&device->fsyncs_pending_replication, &bio, sizeof(struct bio *), &device->replica_fsync_lock);
         }
-        else {
-            // Immediately ack non-fsync writes to the user. The writes are cloned and either queued or submitted
+        // If we're not multithreading the network, then we can use the single socket to preserve total order across the network, so add to the queue while holding the index lock
+#ifndef MULTITHREADED_NETWORK
+        kfifo_in(&device->broadcast_queue, &deep_clone, sizeof(struct bio *));
+#endif
+        spin_unlock(&device->index_lock);
+
+        // Wake up threads that process items on the queue
+        if (should_wake_submit_queue) {
+            wake_up_interruptible(&device->submit_queue_wait_queue);
+        }
+#ifdef MULTITHREADED_NETWORK
+        kfifo_in_spinlocked(&device->broadcast_queue, &deep_clone, sizeof(struct bio *), &device->broadcast_queue_lock);
+#endif
+        wake_up_interruptible(&device->broadcast_queue_wait_queue);
+
+        // Immediately ack non-fsync writes to the user. The writes are cloned and either queued or submitted
+        if (!is_fsync) {
             ack_bio_to_user_without_executing(bio);
         }
-
-        // Add to networking queue
-        kfifo_in_spinlocked(&device->broadcast_queue, &deep_clone, sizeof(struct bio*), &device->broadcast_queue_lock);
-        wake_up_interruptible(&device->broadcast_queue_wait_queue);
     }
 
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
@@ -625,7 +636,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                 case 0:
                     fallthrough;
                 case TLS_RECORD_TYPE_DATA:
-                    printk(KERN_INFO "We got some TLS control msg but it's all good");
+                    // printk(KERN_INFO "We got some TLS control msg but it's all good");
                     break;
                 case TLS_RECORD_TYPE_ALERT:
                     printk(KERN_ERR "TLS alert received. Uhoh.");
@@ -636,11 +647,11 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         }
 #endif
 
-        printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH | REQ_FUA));
+        // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH | REQ_FUA));
 
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
-            printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
+            // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
             process_follower_fsync_index(device, metadata.bal.id, metadata.write_index);
             continue;
         }
@@ -671,7 +682,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                 printk(KERN_ERR "Error reading from socket");
                 break;
             }
-            printk(KERN_INFO "Received bio page: %i", i);
+            // printk(KERN_INFO "Received bio page: %i", i);
             __bio_add_page(received_bio, page, PAGE_SIZE, 0);
         }
 
@@ -705,7 +716,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                     vec.iov_len -= sent;
                 }
             }
-            printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
+            // printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
         }
 
         // 6. Submit bio
