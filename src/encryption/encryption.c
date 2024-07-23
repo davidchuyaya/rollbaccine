@@ -29,7 +29,7 @@
 
 #define RAM_SIZE_GB 1
 #define TOTAL_RAM_BYTES RAM_SIZE_GB * 1024 * 1024 * 1024
-#define TOTAL_TEST_SECTORS 4194304
+#define TOTAL_TEST_SECTORS 8388608
 #define TOTAL_SECTORS TOTAL_RAM_BYTES / SECTOR_SIZE
 #define TOTAL_HASH_MEMORY (TOTAL_SECTORS * AES_GCM_AUTH_SIZE)
 
@@ -48,7 +48,6 @@ struct encryption_device
     struct bio_set bs;
     // array of hashes of each sector
     char* checksums;
-
 };
 
 // per bio private data
@@ -71,7 +70,7 @@ void cleanup(struct encryption_device *rbd)
 {
     if (rbd == NULL)
         return;
-    if (rbd->checksums == NULL)
+    if (rbd->checksums)
         kvfree(rbd->checksums);
     if (rbd->tfm)
         crypto_free_aead(rbd->tfm);
@@ -171,15 +170,20 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
     struct bio_vec bv;
     while (io->bi_iter.bi_size)
     {
-
         struct aead_request *req;
         struct scatterlist sg[4];
         uint64_t curr_sector = io->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(io->bio_in, io->bi_iter);
-        // We will never read from a sector that we haven't written to yet
-        if (*checksum_index(io, curr_sector) == 0 && enc_or_dec == READ) {
+        switch (enc_or_dec)
+        {
+        case READ:
+            if (*checksum_index(io, curr_sector) == 0) {
             return 0;
+        }
+            break;
+        default:
+            break;
         }
         memcpy(iv_index(io, curr_sector), "123456789012", AES_GCM_IV_SIZE);
         sg_init_table(sg, 4);
@@ -229,7 +233,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             aead_request_free(req);
             goto exit;
         }
-	    aead_request_free(req);
+	aead_request_free(req);
         bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
     }
     return 0;
