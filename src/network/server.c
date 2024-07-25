@@ -25,6 +25,11 @@
 #define ROLLBACCINE_PAGE_POOL_SIZE 1024 // Number of pages to be allocated for the page pool. Should be larger than the set of pages used by bios in-flight.
 #define ROLLBACCINE_BIO_DATA_POOL_SIZE 1024 // Number of bio_data structs to be allocated. Should be larger than the set of bios in-flight at any time.
 #define ROLLBACCINE_TLS_TIMEOUT 5000 // Number of milliseconds to wait for TLS handshake to complete
+#define SHA256_LENGTH 256
+#define AES_GCM_IV_SIZE 12
+#define AES_GCM_AUTH_SIZE 16
+#define KEY_SIZE 16
+#define TOTAL_SECTORS 8388608
 #define MIN_IOS 64
 #define MODULE_NAME "server"
 
@@ -96,6 +101,15 @@ struct server_device {
     // TODO: Need to figure out network handshake so we know who we're talking to.
     spinlock_t connected_sockets_lock;
     struct list_head connected_sockets;
+
+
+    // AEAD Encryption/Decryption Fields
+    // symmetric key algorithm instance
+    struct crypto_aead *tfm;
+    // persist key
+    char *key;
+    // array of hashes of each sector
+    char* checksums;
 };
 
 // Associated data for each bio, shared between clones
@@ -104,6 +118,15 @@ struct bio_data {
     struct bio *deep_clone;
     struct bio *shallow_clone;
     int write_index;
+
+    // AEAD fields
+    struct bio *base_bio;
+    // needed for iteration
+    struct bio *bio_in;
+    struct bvec_iter bi_iter;
+    // current sector
+    uint64_t sector;
+    struct crypto_wait wait;
     atomic_t ref_counter; // The number of clones. Once it hits 0, the bio can be freed. Only exists in the deep clone
 };
 
@@ -1185,6 +1208,32 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -1;
     }
 
+    // Set up AEAD Encryption/Decryption
+    device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+    if (IS_ERR(device->tfm))
+    {
+        printk(KERN_ERR "Cannot allocate transform");
+        error = -ENOMEM;
+        goto out;
+    }
+
+    crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
+
+    device->key = "1234567890123456";
+    if (crypto_aead_setkey(device->tfm, device->key, KEY_SIZE))
+    {
+        printk(KERN_ERR "Key could not be set");
+        error = -EAGAIN;
+        goto out;
+    }
+
+    device->checksums = kvmalloc_array(TOTAL_TEST_SECTORS, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    if (!device->checksums) {
+        printk(KERN_ERR "Cannot allocate checksums");
+        ret = -ENOMEM;
+        goto out;
+    }
+
     // Enable FUA and PREFLUSH flags
     ti->num_flush_bios = 1;
     ti->flush_supported = 1;
@@ -1193,6 +1242,20 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
 
     printk(KERN_INFO "Server constructed");
     return 0;
+
+out:
+    cleanup(device);
+    return error;
+}
+
+void cleanup(struct server_device *device)
+{
+    if (device == NULL)
+        return;
+    if (device->checksums)
+        kvfree(device->checksums);
+    if (device->tfm)
+        crypto_free_aead(device->tfm);
 }
 
 static void server_destructor(struct dm_target *ti) {
@@ -1234,6 +1297,7 @@ static void server_destructor(struct dm_target *ti) {
     bioset_exit(&device->bs);
     mempool_destroy(device->page_mempool);
     mempool_destroy(device->bio_data_mempool);
+    cleanup(device);
     kfree(device);
 
     printk(KERN_INFO "Server destructed");
