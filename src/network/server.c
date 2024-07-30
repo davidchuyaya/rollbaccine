@@ -21,7 +21,8 @@
 #define ROLLBACCINE_RETRY_TIMEOUT 5000 // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_HASH_SIZE 256
-#define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE 1024 // Number of bios that can be outstanding between main threads and network broadcast thread. Must be power of 2, according to kfifo specs
+// TODO: Adjust this so queueing is rare
+#define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE 1024 * 1024 // Number of bios that can be outstanding between main threads and network broadcast thread. Must be power of 2, according to kfifo specs
 #define ROLLBACCINE_PAGE_POOL_SIZE 1024 // Number of pages to be allocated for the page pool. Should be larger than the set of pages used by bios in-flight.
 #define ROLLBACCINE_BIO_DATA_POOL_SIZE 1024 // Number of bio_data structs to be allocated. Should be larger than the set of bios in-flight at any time.
 #define ROLLBACCINE_TLS_TIMEOUT 5000 // Number of milliseconds to wait for TLS handshake to complete
@@ -34,6 +35,8 @@
 #define MODULE_NAME "server"
 
 #define TLS_ON
+// #define MULTITHREADED_NETWORK
+// #define MEMORY_TRACKING // Check the number of mallocs/frees and see if we're leaking memory
 
 // TODO: Expand with protocol message types
 enum MsgType { ROLLBACCINE_WRITE, FOLLOWER_ACK };
@@ -64,8 +67,8 @@ struct socket_list {
 struct server_device {
     struct dm_dev *dev;
     struct bio_set bs;
-    mempool_t *bio_data_mempool;
-    mempool_t *page_mempool;
+    struct kmem_cache *bio_data_mempool;
+    struct kmem_cache *page_mempool;
     bool is_leader;
     bool shutting_down; // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     int f;
@@ -77,20 +80,24 @@ struct server_device {
 
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
+    // IMPORTANT: If multiple semaphores must be obtained, obtain in order of their names (sem1, sem2, etc)
     spinlock_t replica_fsync_lock;
     int* replica_fsync_indices; // Len = n
     int max_replica_fsync_index;
+    struct semaphore sem1_fsyncs_pending_replication;
     struct kfifo fsyncs_pending_replication; // List of all fsyncs waiting for replication. Best-effort ordered by write index.
 
     // Logic for writes that block on previous fsyncs going to disk
-    int disk_unacked_ops; // Number of operations yet to be acked by disk
-    struct kfifo queued_ops; // List of all blocked ops. Ordered by write index.
+    atomic_t disk_unacked_ops; // Number of operations yet to be acked by disk
+    atomic_t disk_unacked_fsync;
     wait_queue_head_t submit_queue_wait_queue;
+    struct semaphore sem2_submit_queue;
     struct kfifo submit_queue; // Operations about to be submitted to disk, queued in here to avoid deadlock when bio_end_io is called on the same thread. Lock writes with index_lock, reads with submit_queue_out_lock.
     
     // Communication between main threads and the networking thread
     wait_queue_head_t broadcast_queue_wait_queue;
     spinlock_t broadcast_queue_lock;
+    struct semaphore sem3_broadcast_queue;
     struct kfifo broadcast_queue;
 
     // Sockets, tracked so we can kill them on exit.
@@ -99,7 +106,7 @@ struct server_device {
 
     // Connected sockets. Should be a subset of the sockets above. Handy for broadcasting
     // TODO: Need to figure out network handshake so we know who we're talking to.
-    spinlock_t connected_sockets_lock;
+    struct mutex connected_sockets_lock;
     struct list_head connected_sockets;
 
 
@@ -110,6 +117,13 @@ struct server_device {
     char *key;
     // array of hashes of each sector
     char* checksums;
+    // Counters for tracking memory usage
+#ifdef MEMORY_TRACKING
+    atomic_t num_bio_pages_not_freed;
+    atomic_t num_bio_data_not_freed;
+    atomic_t num_shallow_clones_not_freed;
+    atomic_t num_deep_clones_not_freed;
+#endif
 };
 
 // Associated data for each bio, shared between clones
@@ -148,6 +162,8 @@ struct listen_thread_params {
     struct server_device *device;
 };
 
+void wait_event_interruptible_with_retry(wait_queue_head_t *queue, int condition);
+void down_interruptible_with_retry(struct semaphore *sem);
 struct bio_data *alloc_bio_data(struct server_device *device);
 void ack_bio_to_user_without_executing(struct bio *bio);
 void process_follower_fsync_index(struct server_device *device, int follower_id, int follower_fsync_index);
@@ -177,12 +193,40 @@ int start_server(struct server_device *device, ushort port);
 int __init server_init_module(void);
 void server_exit_module(void);
 
-    struct bio_data *alloc_bio_data(struct server_device *device) {
-    struct bio_data *data = mempool_alloc(device->bio_data_mempool, GFP_KERNEL);
+// Waits may return before the condition is true because of a signal. Retry.
+void wait_event_interruptible_with_retry(wait_queue_head_t *queue, int condition) {
+    int ret;
+    do {
+        ret = wait_event_interruptible(*queue, condition);
+        if (ret == -ERESTARTSYS) {
+            printk(KERN_ERR "wait_event_interruptible_with_retry(queue) interrupted by signal, retrying");
+        }
+    }
+    while (ret != 0);
+}
+
+// Semaphore down may return before it actually locks on the semaphore because of a signal. Retry.
+void down_interruptible_with_retry(struct semaphore *sem) {
+    int ret;
+    do {
+        ret = down_interruptible(sem);
+        if (ret == -ERESTARTSYS) {
+            printk(KERN_ERR "down_interruptible_with_retry(sem) interrupted by signal, retrying");
+        }
+    }
+    while (ret != 0);
+}
+
+struct bio_data *alloc_bio_data(struct server_device *device) {
+    // struct bio_data *data = mempool_alloc(device->bio_data_mempool, GFP_KERNEL);
+    struct bio_data *data = kmalloc(sizeof(struct bio_data), GFP_KERNEL);
     if (!data) {
         printk(KERN_ERR "Could not allocate bio_data");
         return NULL;
     }
+#ifdef MEMORY_TRACKING
+    printk(KERN_INFO "Server %llu allocated bio_data, remaining: %d", device->bal.id, atomic_inc_return(&device->num_bio_data_not_freed));
+#endif
     return data;
 }
 
@@ -239,6 +283,7 @@ void process_follower_fsync_index(struct server_device *device, int follower_id,
         }
     }
 
+    // TODO: Locking here is overly strict. We just need to lock to change max index and lock when interacting with the kfifo
     // Loop through all blocked fsyncs if the max index has changed
     if (max_index_changed) {
         // printk(KERN_INFO "New max quorum write index: %d", device->max_replica_fsync_index);
@@ -251,6 +296,7 @@ void process_follower_fsync_index(struct server_device *device, int follower_id,
                 ack_bio_to_user_without_executing(bio);
                 // Remove from queue. Assign to i to we don't get a warning that we're not checking the output
                 i = kfifo_out(&device->fsyncs_pending_replication, &bio, sizeof(struct bio*));
+                up(&device->sem1_fsyncs_pending_replication);
             }
             else {
                 break;
@@ -268,18 +314,25 @@ unsigned int remove_fsync_flags(unsigned int bio_opf) {
     return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA;
 }
 
-// Because we alloc pages when we receive the bios, we haev to free them when it's done writing
+// Because we alloc pages when we receive the bios, we have to free them when it's done writing
 void free_pages_end_io(struct bio *received_bio) {
     struct bio_data *bio_data = received_bio->bi_private;
-    struct server_device *device = bio_data->device;
+    // struct server_device *device = bio_data->device;
     struct bio_vec bvec;
     struct bvec_iter iter;
 
     bio_for_each_segment(bvec, received_bio, iter) {
-        mempool_free(bvec.bv_page, device->page_mempool);
-        // __free_page(bvec.bv_page); 
+        // mempool_free(bvec.bv_page, device->page_mempool);
+        __free_page(bvec.bv_page); 
+#ifdef MEMORY_TRACKING
+        atomic_dec(&device->num_bio_pages_not_freed);
+#endif
     }
-    mempool_free(bio_data, device->bio_data_mempool);
+    // mempool_free(bio_data, device->bio_data_mempool);
+    kfree(bio_data);
+#ifdef MEMORY_TRACKING
+    printk(KERN_INFO "Server %llu freed bio data, remaining: %d", device->bal.id, atomic_dec_return(&device->num_bio_data_not_freed));
+#endif
     bio_put(received_bio);
 }
 
@@ -289,6 +342,11 @@ void try_free_clones(struct bio *clone) {
     // If ref_counter == 0
     if (atomic_dec_and_test(&bio_data->ref_counter)) {
         // printk(KERN_INFO "Freeing clone, write index: %d", deep_clone_bio_data->write_index);
+#ifdef MEMORY_TRACKING
+        // Note: Decrement first, because after the function executes, bio_data will be freed and we won't have a valid pointer to device
+        atomic_dec(&bio_data->device->num_shallow_clones_not_freed);
+        atomic_dec(&bio_data->device->num_deep_clones_not_freed);
+#endif
         bio_put(bio_data->shallow_clone);
         free_pages_end_io(bio_data->deep_clone);
     } else {
@@ -299,39 +357,23 @@ void try_free_clones(struct bio *clone) {
 void disk_end_io(struct bio *bio) {
     struct bio_data *bio_data = bio->bi_private;
     struct server_device *device = bio_data->device;
-    struct bio *next_bio;
 
-    // Decrement counters and dequeue
-    spin_lock(&device->index_lock);
-    device->disk_unacked_ops--;
-    // printk(KERN_INFO "Disk write %d completed, %d unacked ops, will be inaccurate on replicas", bio_data->write_index, device->disk_unacked_ops);
-    if (device->disk_unacked_ops == 0) {
-        // printk(KERN_INFO "Popping operations off queue");
-        while (kfifo_out(&device->queued_ops, &next_bio, sizeof(struct bio *)) > 0) {
-            // printk(KERN_INFO "Popped write %d off queue", next_bio_data->write_index);
-            // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
-            kfifo_in(&device->submit_queue, &next_bio, sizeof(struct bio *));
-            device->disk_unacked_ops++;
-
-            if (requires_fsync(next_bio)) {
-                break;
-            }
-        }
+    // If there are no more unacked ops, wake the submitter (it may have queued writes to submit)
+    if (atomic_dec_and_test(&device->disk_unacked_ops)) {
+        wake_up_interruptible(&device->submit_queue_wait_queue);
     }
-    spin_unlock(&device->index_lock);
-
-    wake_up_interruptible(&device->submit_queue_wait_queue);
 }
 
 void leader_disk_end_io(struct bio *shallow_clone) {
     // struct bio_data *bio_data = shallow_clone->bi_private;
-    // printk(KERN_INFO "Leader shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
+    // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
     disk_end_io(shallow_clone);
     // Unlike replica_disk_end_io, the clone is sharing data with the clone used for networking, so we have to check if we can free
     try_free_clones(shallow_clone);
 }
 
 void replica_disk_end_io(struct bio *received_bio) {
+    // printk(KERN_INFO "Replica clone ended, freeing");
     disk_end_io(received_bio);
     free_pages_end_io(received_bio);
 }
@@ -372,7 +414,8 @@ void broadcast_bio(struct bio *clone) {
     msg_header.msg_controllen = 0;
     msg_header.msg_flags = 0;
 
-    spin_lock(&device->connected_sockets_lock);
+    // Using mutex instead of spinlock because kernel_sendmsg sleeps for TLS and that triggers an error (sleep while holding spinlock)
+    mutex_lock(&device->connected_sockets_lock);
     list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
@@ -422,7 +465,7 @@ void broadcast_bio(struct bio *clone) {
     finish_sending_to_socket:
     }
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
-    spin_unlock(&device->connected_sockets_lock);
+    mutex_unlock(&device->connected_sockets_lock);
 }
 
 // Thread that runs in the background and broadcasts bios
@@ -439,6 +482,8 @@ int broadcaster(void *args) {
             wait_event_interruptible(device->broadcast_queue_wait_queue, !kfifo_is_empty(&device->broadcast_queue));
             continue;
         }
+        // Potentially wake those waiting on space in the kfifo queue
+        up(&device->sem3_broadcast_queue);
 
         broadcast_bio(clone);
         network_end_io(clone);
@@ -452,6 +497,7 @@ int submitter(void *args) {
     struct server_device *device = (struct server_device *)args;
     struct bio *clone;
     int num_bios_gotten;
+    bool is_fsync;
 
     while (!device->shutting_down) {
         num_bios_gotten = kfifo_out(&device->submit_queue, &clone, sizeof(struct bio *));
@@ -461,11 +507,27 @@ int submitter(void *args) {
             wait_event_interruptible(device->submit_queue_wait_queue, !kfifo_is_empty(&device->submit_queue));
             continue;
         }
+        // Potentially wake those waiting on space in the kfifo queue
+        up(&device->sem2_submit_queue);
 
-        // if (device->is_leader) {
-        //     printk(KERN_INFO "Got clone %p", clone);
-        // }
+        // printk(KERN_INFO "Server %llu popped clone off submit queue", device->bal.id);
+
+        // If the clone is an fsync and there are unacked ops, block
+        // If there are any outstanding fsyncs, block until there are no outstanding operations (NOT FSYNCS!), which must include the outstanding fsync
+        is_fsync = requires_fsync(clone);
+        if ((is_fsync || atomic_read(&device->disk_unacked_fsync) != 0) && atomic_read(&device->disk_unacked_ops) != 0) {
+            // printk(KERN_INFO "Server %llu clone blocked waiting for unacked ops", device->bal.id);
+            wait_event_interruptible_with_retry(&device->submit_queue_wait_queue, atomic_read(&device->disk_unacked_ops) == 0);
+            atomic_set(&device->disk_unacked_fsync, 0);
+        }
+
+        // printk(KERN_INFO "Server %llu submitting clone to disk", device->bal.id);
         submit_bio_noacct(clone);
+
+        atomic_inc(&device->disk_unacked_ops);
+        if (is_fsync) {
+            atomic_inc(&device->disk_unacked_fsync);
+        }
     }
 
     return 0;
@@ -478,12 +540,14 @@ struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src)
         printk(KERN_INFO "Could not create clone");
         return NULL;
     }
+#ifdef MEMORY_TRACKING
+    atomic_inc(&device->num_shallow_clones_not_freed);
+#endif
 
     clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
     return clone;
 }
 
-// Note: This does NOT clone the bio_data!
 struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
     struct bio *clone;
     struct bio_vec bvec;
@@ -495,17 +559,23 @@ struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
     if (!clone) {
         return NULL;
     }
+#ifdef MEMORY_TRACKING
+    atomic_inc(&device->num_deep_clones_not_freed);
+#endif
 
     clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
 
     // TODO: dm-crypt uses alloc_pages first to alloc 2^x pages, then mempool_alloc for the rest. We may want to do that too for performance.
     bio_for_each_segment(bvec, bio_src, iter) {
-        page = mempool_alloc(device->page_mempool, GFP_KERNEL);
-        // page = alloc_page(GFP_KERNEL);
+        // page = mempool_alloc(device->page_mempool, GFP_KERNEL);
+        page = alloc_page(GFP_KERNEL);
         if (!page) {
             bio_put(clone);
             return NULL;
         }
+#ifdef MEMORY_TRACKING
+        atomic_inc(&device->num_bio_pages_not_freed);
+#endif
         memcpy(kmap(page), kmap(bvec.bv_page) + bvec.bv_offset, bvec.bv_len);
         kunmap(page);
         kunmap(bvec.bv_page);
@@ -554,40 +624,43 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         is_cloned = true;
         is_fsync = requires_fsync(bio);
 
+        // Reserve space on kfifo queues with semaphores in case it is full
+        if (is_fsync) {
+            down_interruptible_with_retry(&device->sem1_fsyncs_pending_replication);
+        }
+        down_interruptible_with_retry(&device->sem2_submit_queue);
+        down_interruptible_with_retry(&device->sem3_broadcast_queue);
+
         // Increment indices, place ops on queue, submit cloned ops to disk
         spin_lock(&device->index_lock);
         // Increment write index
         bio_data->write_index = ++device->write_index;
-        // Queue if the queue is non-empty or if this is an fsync and there are outstanding operations
-        if (!kfifo_is_empty(&device->queued_ops) || (is_fsync && device->disk_unacked_ops > 0)) {
-            // printk(KERN_INFO "Write %d blocked on prev fsync, is fsync: %d", bio_data->write_index, is_fsync);
-            kfifo_in(&device->queued_ops, &shallow_clone, sizeof(struct bio *));
+        // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
+        kfifo_in(&device->submit_queue, &shallow_clone, sizeof(struct bio *));
+        // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
+        if (is_fsync) {
+            // Add original bio to fsyncs blocked on replication. Remove any fsync flags from the original so it won't trigger a disk IO.
+            bio->bi_opf = remove_fsync_flags(bio->bi_opf);
+            bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
+            kfifo_in(&device->fsyncs_pending_replication, &bio, sizeof(struct bio *));
         }
-        else {
-            // printk(KERN_INFO "Write %d submitted to disk, is fsync: %d", bio_data->write_index, is_fsync);
-            // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
-            kfifo_in(&device->submit_queue, &shallow_clone, sizeof(struct bio *));
-            // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
-            device->disk_unacked_ops++;
-        }
+        // If we're not multithreading the network, then we can use the single socket to preserve total order across the network, so add to the queue while holding the index lock
+#ifndef MULTITHREADED_NETWORK
+        kfifo_in(&device->broadcast_queue, &deep_clone, sizeof(struct bio *));
+#endif
         spin_unlock(&device->index_lock);
 
+        // Wake up threads that process items on the queue
         wake_up_interruptible(&device->submit_queue_wait_queue);
+#ifdef MULTITHREADED_NETWORK
+        kfifo_in_spinlocked(&device->broadcast_queue, &deep_clone, sizeof(struct bio *), &device->broadcast_queue_lock);
+#endif
+        wake_up_interruptible(&device->broadcast_queue_wait_queue);
 
-        // Add original bio to fsyncs blocked on replication. Remove any fsync flags from the original so it won't trigger a disk IO.
-        if (is_fsync) {
-            bio->bi_opf = remove_fsync_flags(bio->bi_opf);
-            bio->bi_private = bio_data->write_index; // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
-            kfifo_in_spinlocked(&device->fsyncs_pending_replication, &bio, sizeof(struct bio *), &device->replica_fsync_lock);
-        }
-        else {
-            // Immediately ack non-fsync writes to the user. The writes are cloned and either queued or submitted
+        // Immediately ack non-fsync writes to the user. The writes are cloned and either queued or submitted
+        if (!is_fsync) {
             ack_bio_to_user_without_executing(bio);
         }
-
-        // Add to networking queue
-        kfifo_in_spinlocked(&device->broadcast_queue, &deep_clone, sizeof(struct bio*), &device->broadcast_queue_lock);
-        wake_up_interruptible(&device->broadcast_queue_wait_queue);
     }
 
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
@@ -648,7 +721,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                 case 0:
                     fallthrough;
                 case TLS_RECORD_TYPE_DATA:
-                    printk(KERN_INFO "We got some TLS control msg but it's all good");
+                    // printk(KERN_INFO "We got some TLS control msg but it's all good");
                     break;
                 case TLS_RECORD_TYPE_ALERT:
                     printk(KERN_ERR "TLS alert received. Uhoh.");
@@ -659,11 +732,11 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         }
 #endif
 
-        printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH | REQ_FUA));
+        // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH | REQ_FUA));
 
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
-            printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
+            // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
             process_follower_fsync_index(device, metadata.bal.id, metadata.write_index);
             continue;
         }
@@ -680,12 +753,15 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         // 2. Expect hash next
         // 3. Receive pages of bio
         for (i = 0; i < metadata.num_pages; i++) {
-            page = mempool_alloc(device->page_mempool, GFP_KERNEL);
-        //     page = alloc_page(GFP_KERNEL);
+            // page = mempool_alloc(device->page_mempool, GFP_KERNEL);
+            page = alloc_page(GFP_KERNEL);
             if (page == NULL) {
                 printk(KERN_ERR "Error allocating page");
                 break;
             }
+#ifdef MEMORY_TRACKING
+            atomic_inc(&device->num_bio_pages_not_freed);
+#endif
             vec.iov_base = page_address(page);
             vec.iov_len = PAGE_SIZE;
 
@@ -694,7 +770,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                 printk(KERN_ERR "Error reading from socket");
                 break;
             }
-            printk(KERN_INFO "Received bio page: %i", i);
+            // printk(KERN_INFO "Received bio page: %i", i);
             __bio_add_page(received_bio, page, PAGE_SIZE, 0);
         }
 
@@ -728,22 +804,12 @@ void blocking_read(struct server_device *device, struct socket *sock) {
                     vec.iov_len -= sent;
                 }
             }
-            printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
+            // printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
         }
 
         // 6. Submit bio
-        spin_lock(&device->index_lock);
-        if (!kfifo_is_empty(&device->queued_ops) || (requires_fsync(received_bio) && device->disk_unacked_ops > 0)) {
-            // printk(KERN_INFO "Replica write %llu blocked on prev fsync, is fsync: %d", metadata.write_index, requires_fsync(received_bio));
-            kfifo_in(&device->queued_ops, &received_bio, sizeof(struct bio *));
-        } else {
-            // printk(KERN_INFO "Replica write %llu submitted to disk, is fsync: %d", metadata.write_index, requires_fsync(received_bio));
-            // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
-            kfifo_in(&device->submit_queue, &received_bio, sizeof(struct bio *));
-            device->disk_unacked_ops++;
-        }
-        spin_unlock(&device->index_lock);
-
+        down_interruptible_with_retry(&device->sem2_submit_queue);
+        kfifo_in(&device->submit_queue, &received_bio, sizeof(struct bio *));
         wake_up_interruptible(&device->submit_queue_wait_queue);
     }
 
@@ -798,9 +864,9 @@ int connect_to_server(void *args) {
         goto cleanup;
     }
     sock_list->sock = thread_params->sock;
-    spin_lock(&thread_params->device->connected_sockets_lock);
+    mutex_lock(&thread_params->device->connected_sockets_lock);
     list_add(&sock_list->list, &thread_params->device->connected_sockets);
-    spin_unlock(&thread_params->device->connected_sockets_lock);
+    mutex_unlock(&thread_params->device->connected_sockets_lock);
 
 #ifdef TLS_ON
     // TLS setup
@@ -968,9 +1034,9 @@ int listen_for_connections(void* args) {
             break;
         }
         new_connected_socket_list->sock = new_sock;
-        spin_lock(&device->connected_sockets_lock);
+        mutex_lock(&device->connected_sockets_lock);
         list_add(&new_connected_socket_list->list, &device->connected_sockets);
-        spin_unlock(&device->connected_sockets_lock);
+        mutex_unlock(&device->connected_sockets_lock);
 
         // Add to list of server sockets
         new_server_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
@@ -1073,6 +1139,21 @@ int start_server(struct server_device *device, ushort port) {
     return 0;
 }
 
+static void server_status(struct dm_target *ti, status_type_t type, unsigned int status_flags, char *result, unsigned int maxlen) {
+    // struct server_device *device = ti->private;
+    unsigned int sz = 0; // Required by DMEMIT
+
+    DMEMIT("\n");
+    // DMEMIT("Pagepool usage: %d%%\n", (int) (device->page_mempool->curr_nr / device->page_mempool->min_nr * 100));
+    // DMEMIT("Bio_data pool usage: %d%%\n", (int) (device->bio_data_mempool->curr_nr / device->bio_data_mempool->min_nr * 100));
+#ifdef MEMORY_TRACKING
+    DMEMIT("Num bio pages not freed: %d\n", atomic_read(&device->num_bio_pages_not_freed));
+    DMEMIT("Num bio_data not freed: %d\n", atomic_read(&device->num_bio_data_not_freed));
+    DMEMIT("Num deep clones not freed: %d\n", atomic_read(&device->num_deep_clones_not_freed));
+    DMEMIT("Num shallow clones not freed: %d\n", atomic_read(&device->num_shallow_clones_not_freed));
+#endif
+}
+
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
@@ -1080,6 +1161,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     ushort port;
     int error;
     int i;
+    unsigned long projected_bytes_used = 0;
 
     device = kmalloc(sizeof(struct server_device), GFP_KERNEL);
     if (device == NULL) {
@@ -1088,27 +1170,19 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     }
 
     bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
-    device->page_mempool = mempool_create_page_pool(ROLLBACCINE_PAGE_POOL_SIZE, 0);
-    if (!device->page_mempool) {
-        printk(KERN_ERR "Error creating page_mempool");
-        return -ENOMEM;
-    }
-    device->bio_data_mempool = mempool_create_kmalloc_pool(ROLLBACCINE_BIO_DATA_POOL_SIZE, sizeof(struct bio_data));
-    if (!device->bio_data_mempool) {
-        printk(KERN_ERR "Error creating bio_data_mempool");
-        return -ENOMEM;
-    }
 
     device->shutting_down = false;
-    spin_lock_init(&device->connected_sockets_lock);
+    mutex_init(&device->connected_sockets_lock);
 
     init_waitqueue_head(&device->broadcast_queue_wait_queue);
     spin_lock_init(&device->broadcast_queue_lock);
+    sema_init(&device->sem3_broadcast_queue, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE / sizeof(struct bio*));
     error = kfifo_alloc(&device->broadcast_queue, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE, GFP_KERNEL);
     if (error < 0) {
         printk(KERN_ERR "Error creating bio_kfifo");
         return error;
     }
+    projected_bytes_used += ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE;
 
     // Get the device from argv[0] and store it in device->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &device->dev)) {
@@ -1143,24 +1217,24 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     spin_lock_init(&device->replica_fsync_lock);
     device->replica_fsync_indices = kzalloc(sizeof(int) * device->n, GFP_KERNEL);
+    sema_init(&device->sem1_fsyncs_pending_replication, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE / sizeof(struct bio*));
     error = kfifo_alloc(&device->fsyncs_pending_replication, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE, GFP_KERNEL);
     if (error < 0) {
         printk(KERN_ERR "Error creating fsyncs_pending_replication");
         return error;
     }
+    projected_bytes_used += ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE;
     
-    device->disk_unacked_ops = 0;
-    error = kfifo_alloc(&device->queued_ops, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE, GFP_KERNEL);
-    if (error < 0) {
-        printk(KERN_ERR "Error creating queued_ops");
-        return error;
-    }
+    atomic_set(&device->disk_unacked_ops, 0);
+    atomic_set(&device->disk_unacked_fsync, 0);
     init_waitqueue_head(&device->submit_queue_wait_queue);
+    sema_init(&device->sem2_submit_queue, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE / sizeof(struct bio*));
     error = kfifo_alloc(&device->submit_queue, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE, GFP_KERNEL);
     if (error < 0) {
         printk(KERN_ERR "Error creating submit_queue");
         return error;
     }
+    projected_bytes_used += ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE;
 
     device->is_leader = strcmp(argv[4], "true") == 0;
 
@@ -1233,6 +1307,12 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         ret = -ENOMEM;
         goto out;
     }
+#ifdef MEMORY_TRACKING
+    atomic_set(&device->num_bio_data_not_freed, 0);
+    atomic_set(&device->num_bio_pages_not_freed, 0);
+    atomic_set(&device->num_deep_clones_not_freed, 0);
+    atomic_set(&device->num_shallow_clones_not_freed, 0);
+#endif
 
     // Enable FUA and PREFLUSH flags
     ti->num_flush_bios = 1;
@@ -1240,7 +1320,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
 
     ti->private = device;
 
-    printk(KERN_INFO "Server constructed");
+    printk(KERN_INFO "Server %llu constructed, projected to use %luMB", device->bal.id, projected_bytes_used >> 20);
     return 0;
 
 out:
@@ -1288,16 +1368,16 @@ static void server_destructor(struct dm_target *ti) {
     }
 
 
-    kfifo_free(&device->broadcast_queue);
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
+    kfifo_free(&device->broadcast_queue);
     kfifo_free(&device->fsyncs_pending_replication);
-    kfifo_free(&device->queued_ops);
     kfifo_free(&device->submit_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
-    mempool_destroy(device->page_mempool);
-    mempool_destroy(device->bio_data_mempool);
+    // mempool_destroy(device->page_mempool);
+    // mempool_destroy(device->bio_data_mempool);
     cleanup(device);
+
     kfree(device);
 
     printk(KERN_INFO "Server destructed");
@@ -1311,6 +1391,7 @@ static struct target_type server_target = {
     .ctr = server_constructor,
     .dtr = server_destructor,
     .map = server_map,
+    .status = server_status,
 };
 
 int __init server_init_module(void) {

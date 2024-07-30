@@ -251,6 +251,13 @@ sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1
 sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --loops=10 --name=servers
 ```
 
+You can find statistics about the running server by calling:
+```bash
+sudo dmsetup status server1
+```
+`server1` can be replaced with `server2` to check the status of the replica instead of the primary.
+To see memory tracking statistics, you will need to uncomment `#define MEMORY_TRACKING`.
+
 #### TLS
 To enable/disable TLS, comment out the `#define TLS` line in [server.c](src/network/server.c).  
 Run the following instructions *before* setting up networking.
