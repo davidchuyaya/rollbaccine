@@ -710,6 +710,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
 
         // Reserve space on kfifo queues with semaphores in case it is full
         if (is_fsync) {
+            // printk(KERN_INFO "Server received fsync with bi_opf: %u", bio->bi_opf);
             down_interruptible_with_retry(&device->sem1_fsyncs_pending_replication);
         }
         down_interruptible_with_retry(&device->sem2_submit_queue);
