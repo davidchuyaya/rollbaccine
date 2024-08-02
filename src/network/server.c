@@ -182,7 +182,7 @@ void blocking_read(struct server_device *device, struct socket *sock);
 void on_tls_handshake_done(void *data, int status, key_serial_t peerid);
 #endif
 int connect_to_server(void *args);
-int start_client_to_server(struct server_device *device, ushort port);
+int start_client_to_server(struct server_device *device, char *addr, ushort port);
 int listen_to_accepted_socket(void *args);
 int listen_for_connections(void *args);
 int start_server(struct server_device *device, ushort port);
@@ -376,6 +376,7 @@ void process_follower_fsync_index(struct server_device *device, int follower_id,
     spin_unlock(&device->replica_fsync_lock);
 }
 
+// TODO: Replace with op_is_sync() to handle REQ_SYNC?
 bool requires_fsync(struct bio *bio) {
     return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA);
 }
@@ -991,7 +992,7 @@ int connect_to_server(void *args) {
     return 0;
 }
 
-int start_client_to_server(struct server_device *device, ushort port) {
+int start_client_to_server(struct server_device *device, char *addr, ushort port) {
     struct socket_list *sock_list;
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
@@ -1014,7 +1015,7 @@ int start_client_to_server(struct server_device *device, ushort port) {
     memset(&thread_params->addr, 0, sizeof(thread_params->addr));
     thread_params->addr.sin_family = AF_INET;
     // Instead of using inet_addr(), which we don't have access to, use in4_pton() to convert IP address from string
-    if (in4_pton("127.0.0.1", 10, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
+    if (in4_pton(addr, strlen(addr) + 1, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
         printk(KERN_ERR "Error converting IP address");
         return -1;
     }
@@ -1249,7 +1250,7 @@ static void server_status(struct dm_target *ti, status_type_t type, unsigned int
     DMEMIT("Max number of elements in broadcast_queue: %lu\n", device->max_broadcast_queue_size / sizeof(struct bio*));
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server addr & ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
     struct task_struct *broadcast_thread, *submit_thread;
@@ -1353,16 +1354,16 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return error;
     }
 
-    // Connect to other servers. argv[6], argv[7], etc are all server ports to connect to.
+    // Connect to other servers. argv[6], argv[7], etc are all server addresses and ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
-    for (i = 6; i < argc; i++) {
-        error = kstrtou16(argv[i], 10, &port);
+    for (i = 6; i < argc; i += 2) {
+        error = kstrtou16(argv[i+1], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
             return error;
         }
         printk(KERN_INFO "Starting thread to connect to server at port: %u", port);
-        start_client_to_server(device, port);
+        start_client_to_server(device, argv[i], port);
     }
 
     // Start broadcast thread

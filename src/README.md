@@ -178,9 +178,6 @@ sudo rmmod rollbaccine
 
 
 ## Benchmarking
-Create an Azure VM with a Ubuntu 24.04 image and at least 8 cores.
-Turn off Secure Boot so we can load kernel modules.
-
 We will benchmark everything using `fio` against direct writes to RAM.
 We use RAM instead of actual disk becuase storage hardware is "noisy".
 First, create a 4GB ramdisk for testing, as described [here](https://blog.cloudflare.com/speeding-up-linux-disk-encryption). We'll use the actual disk for testing [fsync](#fsync).
@@ -236,9 +233,9 @@ TODO: Remove this feature once leader election is implemented.
 Replace `<f>` with a number, minimum 1.  
 Replace `<n>` with the number of nodes in the system, minimum 2.  
 Replace `<id>` with the id of the node, starting from 0.  
-Replace `<listen port>`, `<server port 1>`, and `<server port 2>` with the desired ports, where you can supply a varying number of server ports, depending on how many servers this node should connect to.
+Replace `<listen port>`, `<server addr 1>`, and `<server port 1>` with the desired ports, where you can supply a variable number of server addresses and ports, depending on how many servers this node should connect to.
 ```bash
-echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <f> <n> <id> <is_leader> <listen port> <server port 1> <server port 2>" | sudo dmsetup create server
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <f> <n> <id> <is_leader> <listen port> <server addr 1> <server port 1>" | sudo dmsetup create server
 ```
 
 For example, set up networking locally between 2 ramdisks with 1GBs each, `/dev/ram0` and `/dev/ram1` respectively:
@@ -246,7 +243,7 @@ For example, set up networking locally between 2 ramdisks with 1GBs each, `/dev/
 sudo modprobe brd rd_nr=2 rd_size=1048576
 sudo insmod server.ko
 echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 0 true 12340" | sudo dmsetup create server1
-echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 1 2 1 false 12350 12340" | sudo dmsetup create server2
+echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 1 2 1 false 12350 127.0.0.1 12340" | sudo dmsetup create server2
 sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1 --loops=10 --name=servers
 sudo fio --filename=/dev/mapper/server1 --readwrite=readwrite --bs=4k --direct=1 --fsync=1 --loops=10 --name=servers
 ```
@@ -324,4 +321,22 @@ If the block device is correct, then you should see the following outputs:
 ```
 Wrote to file: Hello, world!
 Read from file: Hello, world!
+```
+
+
+# Running in the cloud
+We will create an Azure VM with a Ubuntu 24.04 image and at least 8 cores, with secure boot turned off so we can load kernel modules.
+
+Launch the VMs in a new resource group. Replace `rollbaccine` with whatever name you wish:
+```bash
+./launch.sh -n rollbaccine
+```
+
+Then follow the instructions outputted by [launch.sh](launch.sh) to SSH into the VM and launch rollbaccine.
+
+
+
+When you're done with the VMs, delete them with, replacing `rollbaccine` with the name you used above:
+```bash
+./cleanup -n rollbaccine
 ```
