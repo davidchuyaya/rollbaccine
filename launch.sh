@@ -75,10 +75,11 @@ echo "Private IP 0: "$PRIVATE_IP_0
 echo "Private IP 1: "$PRIVATE_IP_1
 
 echo "Creating certificates"
+# Note: These CN names are specific to Azure VMs
 openssl req -x509 -newkey rsa:4096 -keyout 0_key.pem -out 0_cert.pem \
-  -sha256 -days 365 -nodes -nodes -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=$PRIVATE_IP_0"
+  -sha256 -days 365 -nodes -nodes -subj '/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN='$NAME'0.internal.cloudapp.net'
 openssl req -x509 -newkey rsa:4096 -keyout 1_key.pem -out 1_cert.pem \
-  -sha256 -days 365 -nodes -nodes -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=$PRIVATE_IP_1"
+  -sha256 -days 365 -nodes -nodes -subj '/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN='$NAME'1.internal.cloudapp.net'
 cat 0_cert.pem 1_cert.pem > tls_certs.pem
 
 echo "Copying certificates and tls config files to servers"
@@ -98,13 +99,12 @@ ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_1 "bash -s" -- < install_ro
 echo "You should now ssh into the servers and launch rollbaccine:"
 echo "ssh $USERNAME@$PUBLIC_IP_0"
 echo "sudo modprobe brd rd_nr=1 rd_size=4194304 # Create 4GB ramdisk"
-echo "cd src/network"
+echo "cd rollbaccine/src/network"
 echo "sudo insmod server.ko # Load the server module"
 echo 'echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 0 true 12340" | sudo dmsetup create server1'
 echo ""
 echo "ssh $USERNAME@$PUBLIC_IP_1"
 echo "sudo modprobe brd rd_nr=1 rd_size=4194304 # Create 4GB ramdisk"
-echo "cd src/network"
+echo "cd rollbaccine/src/network"
 echo "sudo insmod server.ko # Load the server module"
 echo 'echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 1 false 12350 '$PRIVATE_IP_0' 12340" | sudo dmsetup create server2'
-echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 1 false 12350 10.0.0.5 12340" | sudo dmsetup create server2

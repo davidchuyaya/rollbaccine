@@ -325,18 +325,21 @@ Read from file: Hello, world!
 
 
 # Running in the cloud
-We will create an Azure VM with a Ubuntu 24.04 image and at least 8 cores, with secure boot turned off so we can load kernel modules.
+We will create an Azure VM with a Ubuntu 24.04 image and at least 8 cores, with secure boot turned off so we can load kernel modules. 
 
-Launch the VMs in a new resource group. Replace `rollbaccine` with whatever name you wish:
+If you haven't already, install the Azure CLI and log in:
+```bash
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+az login
+```
+
+In the root directory (`~/rollbaccine`), launch the VMs in a new resource group. Replace the `-n` name `rollbaccine` with whatever name you wish:
 ```bash
 ./launch.sh -n rollbaccine
 ```
-
 Then follow the instructions outputted by [launch.sh](launch.sh) to SSH into the VM and launch rollbaccine.
 
-
-
-When you're done with the VMs, delete them with, replacing `rollbaccine` with the name you used above:
+When you're done with the VMs, delete them, replacing `rollbaccine` with the name you used above:
 ```bash
 ./cleanup -n rollbaccine
 ```
