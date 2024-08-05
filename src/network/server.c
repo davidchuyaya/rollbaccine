@@ -735,104 +735,107 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     encryption_bio_data_init(bio_data, device, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
 
     // Copy bio if it's a write
-    if (device->is_leader && bio_data_dir(bio) == WRITE) {
-        // ENCRYPTION LOGIC
-        uint64_t original_sector = bio_data->sector;
-        unsigned int original_size = bio->bi_iter.bi_size;
-        unsigned int original_idx = bio->bi_iter.bi_idx;
+    if (device->is_leader) {
+        switch (bio_data_dir(bio)) {
+            case WRITE:
+                // ENCRYPTION LOGIC
+                uint64_t original_sector = bio_data->sector;
+                unsigned int original_size = bio->bi_iter.bi_size;
+                unsigned int original_idx = bio->bi_iter.bi_idx;
 
-        // Encrypt
-        enc_or_dec_bio(bio_data, WRITE);
+                // Encrypt
+                enc_or_dec_bio(bio_data, WRITE);
 
-        // Reset to the original beginning values of the bio, otherwise nothing will be written
-        bio->bi_iter.bi_sector = original_sector;
-        bio->bi_iter.bi_size = original_size;
-        bio->bi_iter.bi_idx = original_idx;
+                // Reset to the original beginning values of the bio, otherwise nothing will be written
+                bio->bi_iter.bi_sector = original_sector;
+                bio->bi_iter.bi_size = original_size;
+                bio->bi_iter.bi_idx = original_idx;
 
-        // Create the network clone
-        deep_clone = deep_bio_clone(device, bio);
-        if (!deep_clone) {
-            printk(KERN_ERR "Could not create deep clone");
-            return DM_MAPIO_REMAPPED;
+                // Create the network clone
+                deep_clone = deep_bio_clone(device, bio);
+                if (!deep_clone) {
+                    printk(KERN_ERR "Could not create deep clone");
+                    return DM_MAPIO_REMAPPED;
+                }
+
+                // Create the disk clone
+                shallow_clone = shallow_bio_clone(device, deep_clone);
+                if (!shallow_clone) {
+                    printk(KERN_ERR "Could not create shallow clone");
+                    return DM_MAPIO_REMAPPED;
+                }
+                // Set end_io so once this write completes, queued writes can be unblocked
+                shallow_clone->bi_end_io = leader_disk_end_io;
+
+                
+                bio_data->device = device;
+                bio_data->shallow_clone = shallow_clone;
+                bio_data->deep_clone = deep_clone;
+                atomic_set(&bio_data->ref_counter, 2);
+                deep_clone->bi_private = bio_data;
+                shallow_clone->bi_private = bio_data;
+
+                is_cloned = true;
+                is_fsync = requires_fsync(bio);
+
+                // Reserve space on kfifo queues with semaphores in case it is full
+                if (is_fsync) {
+                    // printk(KERN_INFO "Server received fsync with bi_opf: %u", bio->bi_opf);
+                    down_interruptible_with_retry(&device->sem1_fsyncs_pending_replication);
+                }
+                down_interruptible_with_retry(&device->sem2_submit_queue);
+                down_interruptible_with_retry(&device->sem3_broadcast_queue);
+
+                // Increment indices, place ops on queue, submit cloned ops to disk
+                spin_lock(&device->index_lock);
+                // Increment write index
+                bio_data->write_index = ++device->write_index;
+                // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
+                kfifo_in(&device->submit_queue, &shallow_clone, sizeof(struct bio *));
+                // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
+                if (is_fsync) {
+                    // Add original bio to fsyncs blocked on replication. Remove any fsync flags from the original so it won't trigger a disk IO.
+                    bio->bi_opf = remove_fsync_flags(bio->bi_opf);
+                    bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
+                    kfifo_in(&device->fsyncs_pending_replication, &bio, sizeof(struct bio *));
+                }
+                // If we're not multithreading the network, then we can use the single socket to preserve total order across the network, so add to the queue while holding the index lock
+                #ifndef MULTITHREADED_NETWORK
+                        kfifo_in(&device->broadcast_queue, &deep_clone, sizeof(struct bio *));
+                #endif
+                        spin_unlock(&device->index_lock);
+
+                        // Wake up threads that process items on the queue
+                        wake_up_interruptible(&device->submit_queue_wait_queue);
+                #ifdef MULTITHREADED_NETWORK
+                        kfifo_in_spinlocked(&device->broadcast_queue, &deep_clone, sizeof(struct bio *), &device->broadcast_queue_lock);
+                #endif
+                        wake_up_interruptible(&device->broadcast_queue_wait_queue);
+
+                // Immediately ack non-fsync writes to the user. The writes are cloned and either queued or submitted
+                if (!is_fsync) {
+                    ack_bio_to_user_without_executing(bio);
+                }
+        case READ:
+            // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
+            clone = bio_clone_fast(bio, GFP_NOWAIT, &device->bs);
+            if (!clone)
+            {
+                printk(KERN_INFO "Could not create clone");
+                cleanup(device);
+                return 1;
+            }
+            clone->bi_private = bio_data;
+            clone->bi_end_io = decrypt_at_end_io;
+            clone->bi_opf = bio->bi_opf;
+            clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+
+            // Submit the clone, triggering end_io, where the read will actually have data and we can decrypt
+            submit_bio_noacct(clone);
+
+            // TODO: Maybe can just remove this?
+            return DM_MAPIO_SUBMITTED;
         }
-
-        // Create the disk clone
-        shallow_clone = shallow_bio_clone(device, deep_clone);
-        if (!shallow_clone) {
-            printk(KERN_ERR "Could not create shallow clone");
-            return DM_MAPIO_REMAPPED;
-        }
-        // Set end_io so once this write completes, queued writes can be unblocked
-        shallow_clone->bi_end_io = leader_disk_end_io;
-
-        
-        bio_data->device = device;
-        bio_data->shallow_clone = shallow_clone;
-        bio_data->deep_clone = deep_clone;
-        atomic_set(&bio_data->ref_counter, 2);
-        deep_clone->bi_private = bio_data;
-        shallow_clone->bi_private = bio_data;
-
-        is_cloned = true;
-        is_fsync = requires_fsync(bio);
-
-        // Reserve space on kfifo queues with semaphores in case it is full
-        if (is_fsync) {
-            // printk(KERN_INFO "Server received fsync with bi_opf: %u", bio->bi_opf);
-            down_interruptible_with_retry(&device->sem1_fsyncs_pending_replication);
-        }
-        down_interruptible_with_retry(&device->sem2_submit_queue);
-        down_interruptible_with_retry(&device->sem3_broadcast_queue);
-
-        // Increment indices, place ops on queue, submit cloned ops to disk
-        spin_lock(&device->index_lock);
-        // Increment write index
-        bio_data->write_index = ++device->write_index;
-        // Add write to submit queue and actually submit it outside spinlock to avoid deadlock from end_io acquiring the index_lock
-        kfifo_in(&device->submit_queue, &shallow_clone, sizeof(struct bio *));
-        // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
-        if (is_fsync) {
-            // Add original bio to fsyncs blocked on replication. Remove any fsync flags from the original so it won't trigger a disk IO.
-            bio->bi_opf = remove_fsync_flags(bio->bi_opf);
-            bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
-            kfifo_in(&device->fsyncs_pending_replication, &bio, sizeof(struct bio *));
-        }
-        // If we're not multithreading the network, then we can use the single socket to preserve total order across the network, so add to the queue while holding the index lock
-#ifndef MULTITHREADED_NETWORK
-        kfifo_in(&device->broadcast_queue, &deep_clone, sizeof(struct bio *));
-#endif
-        spin_unlock(&device->index_lock);
-
-        // Wake up threads that process items on the queue
-        wake_up_interruptible(&device->submit_queue_wait_queue);
-#ifdef MULTITHREADED_NETWORK
-        kfifo_in_spinlocked(&device->broadcast_queue, &deep_clone, sizeof(struct bio *), &device->broadcast_queue_lock);
-#endif
-        wake_up_interruptible(&device->broadcast_queue_wait_queue);
-
-        // Immediately ack non-fsync writes to the user. The writes are cloned and either queued or submitted
-        if (!is_fsync) {
-            ack_bio_to_user_without_executing(bio);
-        }
-    } else if (bio_data_dir(bio) == READ) {
-        // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
-        clone = bio_clone_fast(bio, GFP_NOWAIT, &device->bs);
-        if (!clone)
-        {
-            printk(KERN_INFO "Could not create clone");
-            cleanup(device);
-            return 1;
-        }
-        clone->bi_private = bio_data;
-        clone->bi_end_io = decrypt_at_end_io;
-        clone->bi_opf = bio->bi_opf;
-        clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
-
-        // Submit the clone, triggering end_io, where the read will actually have data and we can decrypt
-        submit_bio_noacct(clone);
-
-        // TODO: Maybe can just remove this?
-        return DM_MAPIO_SUBMITTED;
     }
 
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
@@ -840,6 +843,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     // Anything we clone and submit ourselves is marked submitted
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
 }
+
 
 static inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
     return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
