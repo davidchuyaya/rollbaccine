@@ -21,10 +21,10 @@
 #define ROLLBACCINE_RETRY_TIMEOUT 5000 // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_HASH_SIZE 256
-// TODO: Adjust this so queueing is rare
-#define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE 1024 * 1024 // Number of bios that can be outstanding between main threads and network broadcast thread. Must be power of 2, according to kfifo specs
-#define ROLLBACCINE_PAGE_POOL_SIZE 1024 // Number of pages to be allocated for the page pool. Should be larger than the set of pages used by bios in-flight.
-#define ROLLBACCINE_BIO_DATA_POOL_SIZE 1024 // Number of bio_data structs to be allocated. Should be larger than the set of bios in-flight at any time.
+#define ROLLBACCINE_POINTER_BYTES 8 // Size of a pointer
+#define ROLLBACCINE_MAX_BUFFERED_OPS 1024 * 32 // Maximum number of write operations that we still have a pointer to in the system, because it's submitting to disk or network. Fio on David's VM on his laptop says 720 is the max, so overshoot by a bit.
+#define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE \
+    ROLLBACCINE_MAX_BUFFERED_OPS * ROLLBACCINE_POINTER_BYTES  // Number of bios outstanding in any buffer
 #define ROLLBACCINE_TLS_TIMEOUT 5000 // Number of milliseconds to wait for TLS handshake to complete
 #define SHA256_LENGTH 256
 #define AES_GCM_IV_SIZE 12
@@ -36,7 +36,7 @@
 
 #define TLS_ON
 // #define MULTITHREADED_NETWORK
-// #define MEMORY_TRACKING // Check the number of mallocs/frees and see if we're leaking memory
+#define MEMORY_TRACKING // Check the number of mallocs/frees and see if we're leaking memory
 
 // TODO: Expand with protocol message types
 enum MsgType { ROLLBACCINE_WRITE, FOLLOWER_ACK };
@@ -67,8 +67,10 @@ struct socket_list {
 struct server_device {
     struct dm_dev *dev;
     struct bio_set bs;
-    struct kmem_cache *bio_data_mempool;
-    struct kmem_cache *page_mempool;
+    struct kmem_cache *bio_data_cache;
+    spinlock_t page_cache_lock;
+    struct page *page_cache;
+    int page_cache_size;
     bool is_leader;
     bool shutting_down; // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     int f;
@@ -119,10 +121,23 @@ struct server_device {
     char* checksums;
     // Counters for tracking memory usage
 #ifdef MEMORY_TRACKING
+    // These counters will tell us if there's a memory leak
     atomic_t num_bio_pages_not_freed;
     atomic_t num_bio_data_not_freed;
     atomic_t num_shallow_clones_not_freed;
     atomic_t num_deep_clones_not_freed;
+    // These counters tell us the maximum amount of memory we need to prealloc
+    atomic_t max_outstanding_num_bio_pages;
+    atomic_t max_outstanding_num_bio_data;
+    atomic_t max_outstanding_num_shallow_clones;
+    atomic_t max_outstanding_num_deep_clones;
+    // These counters tell us if our queue sizes need to change
+    int num_times_fsyncs_pending_replication_full;
+    int num_times_submit_queue_full;
+    int num_times_broadcast_queue_full;
+    int max_fsyncs_pending_replication_size;
+    int max_submit_queue_size;
+    int max_broadcast_queue_size;
 #endif
 };
 
@@ -164,6 +179,10 @@ struct listen_thread_params {
     struct server_device *device;
 };
 
+void page_cache_free(struct server_device *device, struct page *page_to_free);
+void page_cache_destroy(struct server_device *device);
+struct page *page_cache_alloc(struct server_device *device);
+void atomic_max(atomic_t *old, int new);
 void wait_event_interruptible_with_retry(wait_queue_head_t *queue, int condition);
 void down_interruptible_with_retry(struct semaphore *sem);
 struct bio_data *alloc_bio_data(struct server_device *device);
@@ -193,12 +212,82 @@ void blocking_read(struct server_device *device, struct socket *sock);
 void on_tls_handshake_done(void *data, int status, key_serial_t peerid);
 #endif
 int connect_to_server(void *args);
-int start_client_to_server(struct server_device *device, ushort port);
+int start_client_to_server(struct server_device *device, char *addr, ushort port);
 int listen_to_accepted_socket(void *args);
 int listen_for_connections(void *args);
 int start_server(struct server_device *device, ushort port);
 int __init server_init_module(void);
 void server_exit_module(void);
+
+// Put the freed page back in the cache for reuse
+void page_cache_free(struct server_device *device, struct page *page_to_free) {
+    spin_lock(&device->page_cache_lock);
+    if (device->page_cache_size == 0) {
+        device->page_cache = page_to_free;
+    }
+    else {
+        // Point the new page to the current page_cache
+        page_private(page_to_free) = (unsigned long) device->page_cache;
+        device->page_cache = page_to_free;
+    }
+    device->page_cache_size++;
+    spin_unlock(&device->page_cache_lock);
+}
+
+void page_cache_destroy(struct server_device *device) {
+    struct page *tmp;
+
+    spin_lock(&device->page_cache_lock);
+    while (device->page_cache_size > 0) {
+        tmp = device->page_cache;
+        device->page_cache = (struct page *) page_private(device->page_cache);
+        __free_page(tmp);
+        device->page_cache_size--;
+    }
+    spin_unlock(&device->page_cache_lock);
+}
+
+// Get a previously allocated page or allocate a new one if necessary. Store pointers to next pages in page_private, like in drbd.
+struct page *page_cache_alloc(struct server_device *device) {
+    struct page *new_page;
+    bool need_new_page = false;
+
+    spin_lock(&device->page_cache_lock);
+    if (device->page_cache_size == 0) {
+        need_new_page = true;
+    }
+    else if (device->page_cache_size == 1) {
+        // Set page_cache to NULL now that the list is empty
+        new_page = device->page_cache;
+        device->page_cache = NULL;
+        device->page_cache_size--;
+    }
+    else {
+        // Point page_cache to the next element in the list
+        new_page = device->page_cache;
+        device->page_cache = (struct page *) page_private(device->page_cache);
+        device->page_cache_size--;
+    }
+    spin_unlock(&device->page_cache_lock);
+
+    if (need_new_page) {
+        new_page = alloc_page(GFP_KERNEL);
+        if (!new_page) {
+            printk(KERN_ERR "Could not allocate page");
+            return NULL;
+        }
+    }
+
+    return new_page;
+}
+
+// If the new value is greater than the old value, swap the old for the new. While loop necessary because the old value may have been concurrently updated, in which case no swap happens.
+void atomic_max(atomic_t *old, int new) {
+    int old_val;
+    do {
+        old_val = atomic_read(old);
+    } while (old_val < new && atomic_cmpxchg(old, old_val, new) != old_val);
+}
 
 // Waits may return before the condition is true because of a signal. Retry.
 void wait_event_interruptible_with_retry(wait_queue_head_t *queue, int condition) {
@@ -225,14 +314,14 @@ void down_interruptible_with_retry(struct semaphore *sem) {
 }
 
 struct bio_data *alloc_bio_data(struct server_device *device) {
-    // struct bio_data *data = mempool_alloc(device->bio_data_mempool, GFP_KERNEL);
-    struct bio_data *data = kmalloc(sizeof(struct bio_data), GFP_KERNEL);
+    struct bio_data *data = kmem_cache_alloc(device->bio_data_cache, GFP_KERNEL);
+    // struct bio_data *data = kmalloc(sizeof(struct bio_data), GFP_KERNEL);
     if (!data) {
         printk(KERN_ERR "Could not allocate bio_data");
         return NULL;
     }
 #ifdef MEMORY_TRACKING
-    printk(KERN_INFO "Server %llu allocated bio_data, remaining: %d", device->bal.id, atomic_inc_return(&device->num_bio_data_not_freed));
+    atomic_inc(&device->num_bio_data_not_freed);
 #endif
     return data;
 }
@@ -294,6 +383,10 @@ void process_follower_fsync_index(struct server_device *device, int follower_id,
     // Loop through all blocked fsyncs if the max index has changed
     if (max_index_changed) {
         // printk(KERN_INFO "New max quorum write index: %d", device->max_replica_fsync_index);
+#ifdef MEMORY_TRACKING
+        device->max_fsyncs_pending_replication_size = umax(device->max_fsyncs_pending_replication_size, kfifo_len(&device->fsyncs_pending_replication));
+        device->num_times_fsyncs_pending_replication_full += kfifo_is_full(&device->fsyncs_pending_replication);
+#endif
         // Note: Because fsyncs_pending_replication is only best-effort ordered by write index, fsyncs may be stuck waiting for later fsyncs to be acked. This is fine since eventually all fsyncs will be acked anyway and concurrent fsyncs should be rare.
         while (kfifo_out_peek(&device->fsyncs_pending_replication, &bio, sizeof(struct bio*)) > 0) {
             bio_write_index = bio->bi_private;
@@ -313,6 +406,7 @@ void process_follower_fsync_index(struct server_device *device, int follower_id,
     spin_unlock(&device->replica_fsync_lock);
 }
 
+// TODO: Replace with op_is_sync() to handle REQ_SYNC?
 bool requires_fsync(struct bio *bio) {
     return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA);
 }
@@ -324,21 +418,23 @@ unsigned int remove_fsync_flags(unsigned int bio_opf) {
 // Because we alloc pages when we receive the bios, we have to free them when it's done writing
 void free_pages_end_io(struct bio *received_bio) {
     struct bio_data *bio_data = received_bio->bi_private;
-    // struct server_device *device = bio_data->device;
+    struct server_device *device = bio_data->device;
     struct bio_vec bvec;
     struct bvec_iter iter;
 
     bio_for_each_segment(bvec, received_bio, iter) {
-        // mempool_free(bvec.bv_page, device->page_mempool);
-        __free_page(bvec.bv_page); 
+        page_cache_free(device, bvec.bv_page);
+        // __free_page(bvec.bv_page); 
 #ifdef MEMORY_TRACKING
-        atomic_dec(&device->num_bio_pages_not_freed);
+        int num_bio_pages = atomic_dec_return(&device->num_bio_pages_not_freed);
+        atomic_max(&device->max_outstanding_num_bio_pages, num_bio_pages + 1);
 #endif
     }
-    // mempool_free(bio_data, device->bio_data_mempool);
-    kfree(bio_data);
+    kmem_cache_free(device->bio_data_cache, bio_data);
+    // kfree(bio_data);
 #ifdef MEMORY_TRACKING
-    printk(KERN_INFO "Server %llu freed bio data, remaining: %d", device->bal.id, atomic_dec_return(&device->num_bio_data_not_freed));
+    int num_bio_data = atomic_dec_return(&device->num_bio_data_not_freed);
+    atomic_max(&device->max_outstanding_num_bio_data, num_bio_data + 1);
 #endif
     bio_put(received_bio);
 }
@@ -351,8 +447,10 @@ void try_free_clones(struct bio *clone) {
         // printk(KERN_INFO "Freeing clone, write index: %d", deep_clone_bio_data->write_index);
 #ifdef MEMORY_TRACKING
         // Note: Decrement first, because after the function executes, bio_data will be freed and we won't have a valid pointer to device
-        atomic_dec(&bio_data->device->num_shallow_clones_not_freed);
-        atomic_dec(&bio_data->device->num_deep_clones_not_freed);
+        int num_shallow_clones = atomic_dec_return(&bio_data->device->num_shallow_clones_not_freed);
+        atomic_max(&bio_data->device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
+        int num_deep_clones = atomic_dec_return(&bio_data->device->num_deep_clones_not_freed);
+        atomic_max(&bio_data->device->max_outstanding_num_deep_clones, num_deep_clones + 1);
 #endif
         bio_put(bio_data->shallow_clone);
         free_pages_end_io(bio_data->deep_clone);
@@ -502,6 +600,11 @@ int broadcaster(void *args) {
     int num_bios_gotten;
 
     while (!device->shutting_down) {
+#ifdef MEMORY_TRACKING
+        device->max_broadcast_queue_size = umax(device->max_broadcast_queue_size, kfifo_len(&device->broadcast_queue));
+        device->num_times_broadcast_queue_full += kfifo_is_full(&device->broadcast_queue);
+#endif
+
         num_bios_gotten = kfifo_out(&device->broadcast_queue, &clone, sizeof(struct bio*));
         // printk(KERN_INFO "Checked bios, got %d", num_bios_gotten);
         if (num_bios_gotten == 0) {
@@ -527,6 +630,11 @@ int submitter(void *args) {
     bool is_fsync;
 
     while (!device->shutting_down) {
+#ifdef MEMORY_TRACKING
+        device->max_submit_queue_size = umax(device->max_submit_queue_size, kfifo_len(&device->submit_queue));
+        device->num_times_submit_queue_full += kfifo_is_full(&device->submit_queue);
+#endif
+
         num_bios_gotten = kfifo_out(&device->submit_queue, &clone, sizeof(struct bio *));
         // printk(KERN_INFO "Checked bios, got %d", num_bios_gotten);
         if (num_bios_gotten == 0) {
@@ -548,13 +656,13 @@ int submitter(void *args) {
             atomic_set(&device->disk_unacked_fsync, 0);
         }
 
-        // printk(KERN_INFO "Server %llu submitting clone to disk", device->bal.id);
-        submit_bio_noacct(clone);
-
         atomic_inc(&device->disk_unacked_ops);
         if (is_fsync) {
             atomic_inc(&device->disk_unacked_fsync);
         }
+
+        // printk(KERN_INFO "Server %llu submitting clone to disk", device->bal.id);
+        submit_bio_noacct(clone);
     }
 
     return 0;
@@ -594,12 +702,12 @@ struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
 
     // TODO: dm-crypt uses alloc_pages first to alloc 2^x pages, then mempool_alloc for the rest. We may want to do that too for performance.
     bio_for_each_segment(bvec, bio_src, iter) {
-        // page = mempool_alloc(device->page_mempool, GFP_KERNEL);
-        page = alloc_page(GFP_KERNEL);
-        if (!page) {
-            bio_put(clone);
-            return NULL;
-        }
+        page = page_cache_alloc(device);
+        // page = alloc_page(GFP_KERNEL);
+        // if (!page) {
+        //     bio_put(clone);
+        //     return NULL;
+        // }
 #ifdef MEMORY_TRACKING
         atomic_inc(&device->num_bio_pages_not_freed);
 #endif
@@ -670,6 +778,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
 
         // Reserve space on kfifo queues with semaphores in case it is full
         if (is_fsync) {
+            // printk(KERN_INFO "Server received fsync with bi_opf: %u", bio->bi_opf);
             down_interruptible_with_retry(&device->sem1_fsyncs_pending_replication);
         }
         down_interruptible_with_retry(&device->sem2_submit_queue);
@@ -911,12 +1020,12 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         // 2. Expect hash next
         // 3. Receive pages of bio
         for (i = 0; i < metadata.num_pages; i++) {
-            // page = mempool_alloc(device->page_mempool, GFP_KERNEL);
-            page = alloc_page(GFP_KERNEL);
-            if (page == NULL) {
-                printk(KERN_ERR "Error allocating page");
-                break;
-            }
+            page = page_cache_alloc(device);
+            // page = alloc_page(GFP_KERNEL);
+            // if (page == NULL) {
+            //     printk(KERN_ERR "Error allocating page");
+            //     break;
+            // }
 #ifdef MEMORY_TRACKING
             atomic_inc(&device->num_bio_pages_not_freed);
 #endif
@@ -1064,7 +1173,7 @@ int connect_to_server(void *args) {
     return 0;
 }
 
-int start_client_to_server(struct server_device *device, ushort port) {
+int start_client_to_server(struct server_device *device, char *addr, ushort port) {
     struct socket_list *sock_list;
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
@@ -1087,7 +1196,7 @@ int start_client_to_server(struct server_device *device, ushort port) {
     memset(&thread_params->addr, 0, sizeof(thread_params->addr));
     thread_params->addr.sin_family = AF_INET;
     // Instead of using inet_addr(), which we don't have access to, use in4_pton() to convert IP address from string
-    if (in4_pton("127.0.0.1", 10, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
+    if (in4_pton(addr, strlen(addr) + 1, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
         printk(KERN_ERR "Error converting IP address");
         return -1;
     }
@@ -1298,21 +1407,31 @@ int start_server(struct server_device *device, ushort port) {
 }
 
 static void server_status(struct dm_target *ti, status_type_t type, unsigned int status_flags, char *result, unsigned int maxlen) {
-    // struct server_device *device = ti->private;
+    struct server_device *device = ti->private;
     unsigned int sz = 0; // Required by DMEMIT
 
     DMEMIT("\n");
-    // DMEMIT("Pagepool usage: %d%%\n", (int) (device->page_mempool->curr_nr / device->page_mempool->min_nr * 100));
-    // DMEMIT("Bio_data pool usage: %d%%\n", (int) (device->bio_data_mempool->curr_nr / device->bio_data_mempool->min_nr * 100));
-#ifdef MEMORY_TRACKING
+    
+#ifndef MEMORY_TRACKING
+    DMEMIT("Memory tracking is NOT ON! The following statistics will be unreliable.\n");
+#endif
     DMEMIT("Num bio pages not freed: %d\n", atomic_read(&device->num_bio_pages_not_freed));
     DMEMIT("Num bio_data not freed: %d\n", atomic_read(&device->num_bio_data_not_freed));
     DMEMIT("Num deep clones not freed: %d\n", atomic_read(&device->num_deep_clones_not_freed));
     DMEMIT("Num shallow clones not freed: %d\n", atomic_read(&device->num_shallow_clones_not_freed));
-#endif
+    DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
+    DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
+    DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
+    DMEMIT("Max outstanding num shallow clones: %d\n", atomic_read(&device->max_outstanding_num_shallow_clones));
+    DMEMIT("Num times fsync_pending_replication full: %d\n", device->num_times_fsyncs_pending_replication_full);
+    DMEMIT("Num times submit_queue full: %d\n", device->num_times_submit_queue_full);
+    DMEMIT("Num times broadcast_queue full: %d\n", device->num_times_broadcast_queue_full);
+    DMEMIT("Max number of elements in fsync_pending_replication: %lu\n", device->max_fsyncs_pending_replication_size / sizeof(struct bio*));
+    DMEMIT("Max number of elements in submit_queue: %lu\n", device->max_submit_queue_size / sizeof(struct bio*));
+    DMEMIT("Max number of elements in broadcast_queue: %lu\n", device->max_broadcast_queue_size / sizeof(struct bio*));
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server addr & ports
 static int server_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct server_device *device;
     struct task_struct *broadcast_thread, *submit_thread;
@@ -1327,7 +1446,11 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
-    bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
+    bioset_init(&device->bs, 0, 0, BIOSET_NEED_BVECS);
+    device->bio_data_cache = kmem_cache_create("bio_data", sizeof(struct bio_data), 0, 0, NULL);
+    spin_lock_init(&device->page_cache_lock);
+    device->page_cache = NULL;
+    device->page_cache_size = 0;
 
     device->shutting_down = false;
     mutex_init(&device->connected_sockets_lock);
@@ -1412,16 +1535,16 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return error;
     }
 
-    // Connect to other servers. argv[6], argv[7], etc are all server ports to connect to.
+    // Connect to other servers. argv[6], argv[7], etc are all server addresses and ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
-    for (i = 6; i < argc; i++) {
-        error = kstrtou16(argv[i], 10, &port);
+    for (i = 6; i < argc; i += 2) {
+        error = kstrtou16(argv[i+1], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
             return error;
         }
         printk(KERN_INFO "Starting thread to connect to server at port: %u", port);
-        start_client_to_server(device, port);
+        start_client_to_server(device, argv[i], port);
     }
 
     // Start broadcast thread
@@ -1470,6 +1593,16 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     atomic_set(&device->num_bio_pages_not_freed, 0);
     atomic_set(&device->num_deep_clones_not_freed, 0);
     atomic_set(&device->num_shallow_clones_not_freed, 0);
+    atomic_set(&device->max_outstanding_num_bio_data, 0);
+    atomic_set(&device->max_outstanding_num_bio_pages, 0);
+    atomic_set(&device->max_outstanding_num_deep_clones, 0);
+    atomic_set(&device->max_outstanding_num_shallow_clones, 0);
+    device->num_times_fsyncs_pending_replication_full = 0;
+    device->num_times_submit_queue_full = 0;
+    device->num_times_broadcast_queue_full = 0;
+    device->max_fsyncs_pending_replication_size = 0;
+    device->max_submit_queue_size = 0;
+    device->max_broadcast_queue_size = 0;
 #endif
 
     // Enable FUA and PREFLUSH flags
@@ -1535,7 +1668,8 @@ static void server_destructor(struct dm_target *ti) {
     // mempool_destroy(device->page_mempool);
     // mempool_destroy(device->bio_data_mempool);
     cleanup(device);
-
+    kmem_cache_destroy(device->bio_data_cache);
+    page_cache_destroy(device);
     kfree(device);
 
     printk(KERN_INFO "Server destructed");
