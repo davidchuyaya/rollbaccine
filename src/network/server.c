@@ -141,6 +141,8 @@ struct bio_data {
     // current sector
     uint64_t sector;
     struct crypto_wait wait;
+    struct server_device *device;
+
     atomic_t ref_counter; // The number of clones. Once it hits 0, the bio can be freed. Only exists in the deep clone
 };
 
@@ -175,11 +177,16 @@ void disk_end_io(struct bio *bio);
 void leader_disk_end_io(struct bio *shallow_clone);
 void replica_disk_end_io(struct bio *received_bio);
 void network_end_io(struct bio *deep_clone);
+void decrypt_at_end_io(struct bio *read_bio);
 void broadcast_bio(struct bio *clone);
 int broadcaster(void *args);
 int submitter(void *args);
 struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src);
 struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src);
+unsigned char *checksum_index(struct encryption_io *io, sector_t index);
+unsigned char *iv_index(struct encryption_io *io, sector_t index);
+int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec);
+void encryption_bio_data_init(struct bio_data *bio_data, struct server_device *device, struct bio *bio, uint64_t sector);
 void kill_thread(struct socket *sock);
 void blocking_read(struct server_device *device, struct socket *sock);
 #ifdef TLS_ON
@@ -382,6 +389,26 @@ void network_end_io(struct bio *deep_clone) {
     // See if we can free
     // printk(KERN_INFO "Network broadcast %d completed", deep_clone_bio_data->write_index);
     try_free_clones(deep_clone);
+}
+
+/**
+ * How decrypting read works:
+ *
+ * 1. In map(), we create a clone of the read. At this point in time, the read does not have the actual data (which may be on disk).
+ * 2. We submit the clone, triggering bio_end_io(), which calls this function.
+ * 3. We release the clone with bio_put(). The data is fetched in the bio_vecs, so we decrypt it now for the read.
+ * 4. We call bio_endio() on the original read, which returns the decrypted data to the user.
+ */
+void decrypt_at_end_io(struct bio *read_bio)
+{
+    struct bio_data *bio_data = clone->bi_private;
+
+    // the cloned bio is no longer useful
+    bio_put(clone);
+    // decrypt
+    enc_or_dec_bio(bio_data, READ);
+    // release the read bio
+    bio_endio(read_bio->base_bio);
 }
 
 void broadcast_bio(struct bio *clone) {
@@ -593,9 +620,27 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     struct bio_data *bio_data;
 
     bio_set_dev(bio, device->dev->bdev);
+    // Set shared data between clones
+    bio_data = alloc_bio_data(device);
+
+    // initialize fields for bio data that will be useful for encryption
+    encryption_bio_data_init(bio_data, device, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
 
     // Copy bio if it's a write
     if (device->is_leader && bio_data_dir(bio) == WRITE) {
+        // ENCRYPTION LOGIC
+        uint64_t original_sector = bio_data->sector;
+        unsigned int original_size = bio->bi_iter.bi_size;
+        unsigned int original_idx = bio->bi_iter.bi_idx;
+
+        // Encrypt
+        enc_or_dec_bio(bio_data, WRITE);
+
+        // Reset to the original beginning values of the bio, otherwise nothing will be written
+        bio->bi_iter.bi_sector = original_sector;
+        bio->bi_iter.bi_size = original_size;
+        bio->bi_iter.bi_idx = original_idx;
+
         // Create the network clone
         deep_clone = deep_bio_clone(device, bio);
         if (!deep_clone) {
@@ -612,8 +657,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         // Set end_io so once this write completes, queued writes can be unblocked
         shallow_clone->bi_end_io = leader_disk_end_io;
 
-        // Set shared data between clones
-        bio_data = alloc_bio_data(device);
+        
         bio_data->device = device;
         bio_data->shallow_clone = shallow_clone;
         bio_data->deep_clone = deep_clone;
@@ -661,12 +705,126 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         if (!is_fsync) {
             ack_bio_to_user_without_executing(bio);
         }
+    } else if (bio_data_dir(bio) == READ) {
+        // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
+        clone = bio_clone_fast(bio, GFP_NOWAIT, &device->bs);
+        if (!clone)
+        {
+            printk(KERN_INFO "Could not create clone");
+            cleanup(device);
+            return 1;
+        }
+        clone->bi_private = bio_data;
+        clone->bi_end_io = decrypt_at_end_io;
+        clone->bi_opf = bio->bi_opf;
+        clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+
+        // Submit the clone, triggering end_io, where the read will actually have data and we can decrypt
+        submit_bio_noacct(clone);
+
+        // TODO: Maybe can just remove this?
+        return DM_MAPIO_SUBMITTED;
     }
 
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Anything we clone and submit ourselves is marked submitted
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
+}
+
+static inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
+    return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+}
+
+static inline unsigned char *iv_index(struct bio_data *bio_data, sector_t index) {
+    return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
+}
+
+static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
+{
+    int ret;
+    struct bio_vec bv;
+    while (bio_data->bi_iter.bi_size)
+    {
+        struct aead_request *req;
+        struct scatterlist sg[4];
+        uint64_t curr_sector = bio_data->bi_iter.bi_sector;
+        DECLARE_CRYPTO_WAIT(wait);
+        bv = bio_iter_iovec(bio_data->bio_in, bio_data->bi_iter);
+        switch (enc_or_dec)
+        {
+        case READ:
+            if (*checksum_index(bio_data, curr_sector) == 0) {
+            return 0;
+        }
+            break;
+        default:
+            break;
+        }
+        memcpy(iv_index(bio_data, curr_sector), "123456789012", AES_GCM_IV_SIZE);
+        sg_init_table(sg, 4);
+        sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
+        sg_set_buf(&sg[1], iv_index(bio_data, curr_sector), AES_GCM_IV_SIZE);
+        sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
+        sg_set_buf(&sg[3], checksum_index(bio_data, curr_sector), AES_GCM_AUTH_SIZE);
+
+        // /* AEAD request:
+        //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
+        //  *  | (authenticated) | (auth+encryption) |              |
+        //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
+        //  */
+        req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
+        if (!req)
+        {
+            printk(KERN_INFO "aead request allocation failed");
+            aead_request_free(req);
+            ret = -ENOMEM;
+            goto exit;
+        }
+        aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+        // sector + iv size
+        aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
+        switch (enc_or_dec)
+        {
+        case WRITE:
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv_index(io, curr_sector));
+            ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+            break;
+        case READ:
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv_index(io, curr_sector));
+            ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+            break;
+        }
+
+        if (ret)
+        {
+            if (ret == -EBADMSG)
+            {
+                printk(KERN_INFO "invalid integrity check");
+            }
+            else
+            {
+                printk(KERN_INFO "encryption/decryption failed");
+            }
+            aead_request_free(req);
+            goto exit;
+        }
+	aead_request_free(req);
+    bio_advance_iter(bio_data->bio_in, &bio_data->bi_iter, SECTOR_SIZE);
+    }
+    return 0;
+exit:
+    cleanup(bio_data->device);
+    return ret;
+}
+
+static void encryption_bio_data_init(struct bio_data *bio_data, struct server_device *device, struct bio *bio, uint64_t sector) {
+    io->sector = sector;
+    io->base_bio = bio;
+    io->bio_in = bio;
+    io->bi_iter = bio->bi_iter;
+    io->device = device;
+    return;
 }
 
 void kill_thread(struct socket *sock) {
