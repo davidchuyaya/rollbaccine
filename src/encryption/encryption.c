@@ -5,6 +5,7 @@
 #include <linux/crypto.h>
 #include <crypto/internal/hash.h> /* SHA-256 Hash*/
 #include <linux/bio.h>
+#include <linux/device-mapper.h>
 #include <linux/scatterlist.h>
 #include <linux/list.h>
 #include <linux/vmalloc.h>
@@ -56,8 +57,6 @@ typedef struct encryption_io
     // maintain information of original bio before iteration
     struct bio *base_bio;
     // needed for iteration
-    struct bio *bio_in;
-    struct bvec_iter bi_iter;
     uint64_t sector;
     struct crypto_wait wait;
     struct encryption_device *rbd;
@@ -168,13 +167,13 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
 {
     int ret;
     struct bio_vec bv;
-    while (io->bi_iter.bi_size)
+    while (io->base_bio->bi_iter.bi_size)
     {
         struct aead_request *req;
         struct scatterlist sg[4];
-        uint64_t curr_sector = io->bi_iter.bi_sector;
+        uint64_t curr_sector = io->base_bio->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
-        bv = bio_iter_iovec(io->bio_in, io->bi_iter);
+        bv = bio_iter_iovec(io->base_bio, io->base_bio->bi_iter);
         switch (enc_or_dec)
         {
         case READ:
@@ -234,7 +233,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             goto exit;
         }
 	aead_request_free(req);
-        bio_advance_iter(io->bio_in, &io->bi_iter, SECTOR_SIZE);
+    bio_advance_iter(io->base_bio, &io->base_bio->bi_iter, SECTOR_SIZE);
     }
     return 0;
 exit:
@@ -268,11 +267,21 @@ static void encryption_io_init(struct encryption_io *io, struct encryption_devic
     // TODO: maybe look into adding an iv_offset if neccesarry
     io->sector = sector;
     io->base_bio = bio;
-    io->bio_in = bio;
-    io->bi_iter = bio->bi_iter;
     io->rbd = rbd;
     io->error = 0;
     return;
+}
+
+struct bio* shallow_bio_clone(struct encryption_device *device, struct bio *bio_src) {
+    struct bio *clone;
+    clone = bio_alloc_clone(bio_src->bi_bdev, bio_src, GFP_NOIO, &device->bs);
+    if (!clone) {
+        printk(KERN_INFO "Could not create clone");
+        return NULL;
+    }
+
+    clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
+    return clone;
 }
 
 static int encryption_map(struct dm_target *ti, struct bio *bio)
@@ -310,7 +319,7 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
             return DM_MAPIO_REMAPPED;
         case READ:
             // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
-            clone = bio_clone_fast(bio, GFP_NOWAIT, &rbd->bs);
+            clone = shallow_bio_clone(rbd, bio);
             if (!clone)
             {
                 printk(KERN_INFO "Could not create clone");

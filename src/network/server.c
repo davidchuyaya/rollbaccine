@@ -150,13 +150,8 @@ struct bio_data {
 
     // AEAD fields
     struct bio *base_bio;
-    // needed for iteration
-    struct bio *bio_in;
-    struct bvec_iter bi_iter;
     // current sector
     uint64_t sector;
-    struct crypto_wait wait;
-    struct server_device *device;
 
     atomic_t ref_counter; // The number of clones. Once it hits 0, the bio can be freed. Only exists in the deep clone
 };
@@ -816,24 +811,23 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
                 if (!is_fsync) {
                     ack_bio_to_user_without_executing(bio);
                 }
+                break;
         case READ:
             // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
-            clone = bio_clone_fast(bio, GFP_NOWAIT, &device->bs);
-            if (!clone)
-            {
-                printk(KERN_INFO "Could not create clone");
-                cleanup(device);
-                return 1;
+            shallow_clone = shallow_bio_clone(device, deep_clone);
+            if (!shallow_clone) {
+                printk(KERN_ERR "Could not create shallow clone");
+                // TODO diff error return
+                return DM_MAPIO_REMAPPED;
             }
-            clone->bi_private = bio_data;
-            clone->bi_end_io = decrypt_at_end_io;
-            clone->bi_opf = bio->bi_opf;
-            clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+            shallow_clone->bi_private = bio_data;
+            shallow_clone->bi_end_io = decrypt_at_end_io;
+            shallow_clone->bi_opf = bio->bi_opf;
+            shallow_clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
             // Submit the clone, triggering end_io, where the read will actually have data and we can decrypt
-            submit_bio_noacct(clone);
+            submit_bio_noacct(shallow_clone);
 
-            // TODO: Maybe can just remove this?
             return DM_MAPIO_SUBMITTED;
         }
     }
@@ -861,9 +855,9 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
     {
         struct aead_request *req;
         struct scatterlist sg[4];
-        uint64_t curr_sector = bio_data->bi_iter.bi_sector;
+        uint64_t curr_sector = bio_data->base_bio->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
-        bv = bio_iter_iovec(bio_data->bio_in, bio_data->bi_iter);
+        bv = bio_iter_iovec(bio_data->base_bio, bio_data->base_bio->bi_iter);
         switch (enc_or_dec)
         {
         case READ:
@@ -923,7 +917,7 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
             goto exit;
         }
 	aead_request_free(req);
-    bio_advance_iter(bio_data->bio_in, &bio_data->bi_iter, SECTOR_SIZE);
+    bio_advance_iter(bio_data, &bio_data->base_bio->bi_iter, SECTOR_SIZE);
     }
     return 0;
 exit:
@@ -934,8 +928,6 @@ exit:
 static void encryption_bio_data_init(struct bio_data *bio_data, struct server_device *device, struct bio *bio, uint64_t sector) {
     io->sector = sector;
     io->base_bio = bio;
-    io->bio_in = bio;
-    io->bi_iter = bio->bi_iter;
     io->device = device;
     return;
 }
