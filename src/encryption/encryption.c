@@ -2,6 +2,7 @@
 #include <linux/init.h>   /* Needed for the macros */
 #include <linux/printk.h> /* Needed for pr_info() */
 #include <linux/device-mapper.h>
+#include <linux/blkdev.h> /* Needed for get_capacity() */
 #include <linux/crypto.h>
 #include <crypto/internal/hash.h> /* SHA-256 Hash*/
 #include <linux/bio.h>
@@ -45,10 +46,13 @@ struct encryption_device
     struct crypto_aead *tfm;
     // persist key
     char *key;
+    
     // not sure what this is, but it's needed to create a clone of the bio
     struct bio_set bs;
     // array of hashes of each sector
     char* checksums;
+    // total sectors
+    sector_t total_sectors;
 };
 
 // per bio private data
@@ -142,6 +146,9 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     }
     // Check the allocation of the large checksums array
     printk(KERN_INFO "Allocated memory for encryption_device: %zu bytes\n", sizeof(rbd->checksums));
+
+    rbd->total_sectors = get_capacity(rbd->dev->bdev->bd_disk);
+    printk(KERN_INFO "Total sectors: %llu\n", (unsigned long long)rbd->total_sectors);
 
     // TODO: Look into putting hashes inside of here too and some rounding?
     ti->per_io_data_size = sizeof(struct encryption_io);

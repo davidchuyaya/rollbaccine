@@ -6,6 +6,7 @@
  */
 
 #include <linux/device-mapper.h>
+#include <linux/blkdev.h> /* Needed for get_capacity() */
 #include <linux/inet.h>  // For in4_pton to translate IP addresses from strings
 #include <linux/init.h>
 #include <linux/kfifo.h>
@@ -30,7 +31,6 @@
 #define AES_GCM_IV_SIZE 12
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
-#define TOTAL_SECTORS 8388608
 #define MIN_IOS 64
 #define MODULE_NAME "server"
 
@@ -150,8 +150,6 @@ struct bio_data {
 
     // AEAD fields
     struct bio *base_bio;
-    // current sector
-    uint64_t sector;
 
     atomic_t ref_counter; // The number of clones. Once it hits 0, the bio can be freed. Only exists in the deep clone
 };
@@ -200,7 +198,6 @@ struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src);
 unsigned char *checksum_index(struct encryption_io *io, sector_t index);
 unsigned char *iv_index(struct encryption_io *io, sector_t index);
 int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec);
-void encryption_bio_data_init(struct bio_data *bio_data, struct server_device *device, struct bio *bio, uint64_t sector);
 void kill_thread(struct socket *sock);
 void blocking_read(struct server_device *device, struct socket *sock);
 #ifdef TLS_ON
@@ -723,18 +720,20 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     struct bio_data *bio_data;
 
     bio_set_dev(bio, device->dev->bdev);
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     // Set shared data between clones
     bio_data = alloc_bio_data(device);
 
     // initialize fields for bio data that will be useful for encryption
-    encryption_bio_data_init(bio_data, device, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
+    bio_data->base_bio = bio;
+    bio_data->device = device;
 
     // Copy bio if it's a write
     if (device->is_leader) {
         switch (bio_data_dir(bio)) {
             case WRITE:
                 // ENCRYPTION LOGIC
-                uint64_t original_sector = bio_data->sector;
+                uint64_t original_sector = bio->bi_iter.bi_sector;
                 unsigned int original_size = bio->bi_iter.bi_size;
                 unsigned int original_idx = bio->bi_iter.bi_idx;
 
@@ -923,13 +922,6 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
 exit:
     cleanup(bio_data->device);
     return ret;
-}
-
-static void encryption_bio_data_init(struct bio_data *bio_data, struct server_device *device, struct bio *bio, uint64_t sector) {
-    io->sector = sector;
-    io->base_bio = bio;
-    io->device = device;
-    return;
 }
 
 void kill_thread(struct socket *sock) {
@@ -1578,7 +1570,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         goto out;
     }
 
-    device->checksums = kvmalloc_array(TOTAL_TEST_SECTORS, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    device->checksums = kvmalloc_array(get_capacity(device->dev->bdev->bd_disk), AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
     if (!device->checksums) {
         printk(KERN_ERR "Cannot allocate checksums");
         ret = -ENOMEM;
