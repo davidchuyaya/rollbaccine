@@ -16,6 +16,7 @@
 #include <net/sock.h>
 #include <net/handshake.h> // For TLS
 #include <net/tls_prot.h>
+#include <crypto/aead.h>
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
 #define ROLLBACCINE_ENCRYPT_GRANULARITY 4096 // Number of bytes to encrypt, hash, or send at a time
@@ -195,9 +196,9 @@ int broadcaster(void *args);
 int submitter(void *args);
 struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src);
 struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src);
-unsigned char *checksum_index(struct encryption_io *io, sector_t index);
-unsigned char *iv_index(struct encryption_io *io, sector_t index);
-int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec);
+unsigned char *checksum_index(struct bio_data *bio_data, sector_t index);
+unsigned char *iv_index(struct bio_data *bio_data, sector_t index);
+int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec);
 void kill_thread(struct socket *sock);
 void blocking_read(struct server_device *device, struct socket *sock);
 #ifdef TLS_ON
@@ -210,6 +211,7 @@ int listen_for_connections(void *args);
 int start_server(struct server_device *device, ushort port);
 int __init server_init_module(void);
 void server_exit_module(void);
+void cleanup(struct server_device *device);
 
 // Put the freed page back in the cache for reuse
 void page_cache_free(struct server_device *device, struct page *page_to_free) {
@@ -491,14 +493,14 @@ void network_end_io(struct bio *deep_clone) {
  */
 void decrypt_at_end_io(struct bio *read_bio)
 {
-    struct bio_data *bio_data = clone->bi_private;
+    struct bio_data *bio_data = read_bio->bi_private;
 
     // the cloned bio is no longer useful
-    bio_put(clone);
+    bio_put(read_bio);
     // decrypt
     enc_or_dec_bio(bio_data, READ);
-    // release the read bio
-    bio_endio(read_bio->base_bio);
+    // release the base bio
+    bio_endio(bio_data->base_bio);
 }
 
 void broadcast_bio(struct bio *clone) {
@@ -838,21 +840,21 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
 }
 
 
-static inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
+inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
     return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
 }
 
-static inline unsigned char *iv_index(struct bio_data *bio_data, sector_t index) {
+inline unsigned char *iv_index(struct bio_data *bio_data, sector_t index) {
     return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
 }
 
-static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
+int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
 {
     int ret;
     struct bio_vec bv;
     uint64_t curr_sector;
     struct aead_request *req;
-    req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
+    req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
     if (!req)
     {
         printk(KERN_INFO "aead request allocation failed");
@@ -860,7 +862,7 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
         ret = -ENOMEM;
         goto exit;
     }
-    while (bio_data->bi_iter.bi_size)
+    while (bio_data->base_bio->bi_iter.bi_size)
     {
         struct scatterlist sg[4];
         curr_sector = bio_data->base_bio->bi_iter.bi_sector;
@@ -894,11 +896,11 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
         switch (enc_or_dec)
         {
         case WRITE:
-            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv_index(io, curr_sector));
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv_index(bio_data, curr_sector));
             ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
             break;
         case READ:
-            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv_index(io, curr_sector));
+            aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv_index(bio_data, curr_sector));
             ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
             break;
         }
@@ -916,7 +918,7 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
             aead_request_free(req);
             goto exit;
         }
-    	bio_advance_iter(bio_data, &bio_data->base_bio->bi_iter, SECTOR_SIZE);
+    	bio_advance_iter(bio_data->base_bio, &bio_data->base_bio->bi_iter, SECTOR_SIZE);
     }
     aead_request_free(req);
     return 0;
@@ -1574,7 +1576,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     device->checksums = kvmalloc_array(get_capacity(device->dev->bdev->bd_disk), AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
     if (!device->checksums) {
         printk(KERN_ERR "Cannot allocate checksums");
-        ret = -ENOMEM;
+        error = -ENOMEM;
         goto out;
     }
 #ifdef MEMORY_TRACKING
