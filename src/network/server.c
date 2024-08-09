@@ -858,7 +858,6 @@ int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
     if (!req)
     {
         printk(KERN_INFO "aead request allocation failed");
-        aead_request_free(req);
         ret = -ENOMEM;
         goto exit;
     }
