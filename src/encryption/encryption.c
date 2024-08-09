@@ -31,7 +31,6 @@
 
 #define RAM_SIZE_GB 1
 #define TOTAL_RAM_BYTES RAM_SIZE_GB * 1024 * 1024 * 1024
-#define TOTAL_TEST_SECTORS 8388608
 #define TOTAL_SECTORS TOTAL_RAM_BYTES / SECTOR_SIZE
 #define TOTAL_HASH_MEMORY (TOTAL_SECTORS * AES_GCM_AUTH_SIZE)
 
@@ -138,7 +137,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
     bioset_init(&rbd->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
 
-    rbd->checksums = kvmalloc_array(TOTAL_TEST_SECTORS, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    rbd->checksums = kvmalloc_array(get_capacity(rbd->dev->bdev->bd_disk), AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
     if (!rbd->checksums) {
         ti->error = "Cannot allocate checksums";
         ret = -ENOMEM;
@@ -174,11 +173,19 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
 {
     int ret;
     struct bio_vec bv;
+    uint64_t curr_sector;
+    struct aead_request *req;
+    req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
+    if (!req)
+    {
+        printk(KERN_INFO "aead request allocation failed");
+        aead_request_free(req);
+        ret = -ENOMEM;
+        goto exit;
+    }
     while (io->base_bio->bi_iter.bi_size)
     {
-        struct aead_request *req;
-        struct scatterlist sg[4];
-        uint64_t curr_sector = io->base_bio->bi_iter.bi_sector;
+        curr_sector = io->base_bio->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(io->base_bio, io->base_bio->bi_iter);
         switch (enc_or_dec)
@@ -192,6 +199,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             break;
         }
         memcpy(iv_index(io, curr_sector), "123456789012", AES_GCM_IV_SIZE);
+        struct scatterlist sg[4];
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
         sg_set_buf(&sg[1], iv_index(io, curr_sector), AES_GCM_IV_SIZE);
@@ -203,14 +211,8 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         //  *  | (authenticated) | (auth+encryption) |              |
         //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
         //  */
-        req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
-        if (!req)
-        {
-            printk(KERN_INFO "aead request allocation failed");
-            aead_request_free(req);
-            ret = -ENOMEM;
-            goto exit;
-        }
+
+
         aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
         // sector + iv size
         aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
@@ -239,9 +241,10 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             aead_request_free(req);
             goto exit;
         }
-	aead_request_free(req);
+	
     bio_advance_iter(io->base_bio, &io->base_bio->bi_iter, SECTOR_SIZE);
     }
+    aead_request_free(req);
     return 0;
 exit:
     cleanup(io->rbd);

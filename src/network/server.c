@@ -850,11 +850,20 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
 {
     int ret;
     struct bio_vec bv;
+    uint64_t curr_sector;
+    struct aead_request *req;
+    req = aead_request_alloc(io->rbd->tfm, GFP_KERNEL);
+    if (!req)
+    {
+        printk(KERN_INFO "aead request allocation failed");
+        aead_request_free(req);
+        ret = -ENOMEM;
+        goto exit;
+    }
     while (bio_data->bi_iter.bi_size)
     {
-        struct aead_request *req;
         struct scatterlist sg[4];
-        uint64_t curr_sector = bio_data->base_bio->bi_iter.bi_sector;
+        curr_sector = bio_data->base_bio->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(bio_data->base_bio, bio_data->base_bio->bi_iter);
         switch (enc_or_dec)
@@ -879,14 +888,6 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
         //  *  | (authenticated) | (auth+encryption) |              |
         //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
         //  */
-        req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
-        if (!req)
-        {
-            printk(KERN_INFO "aead request allocation failed");
-            aead_request_free(req);
-            ret = -ENOMEM;
-            goto exit;
-        }
         aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
         // sector + iv size
         aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
@@ -915,9 +916,9 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
             aead_request_free(req);
             goto exit;
         }
-	aead_request_free(req);
-    bio_advance_iter(bio_data, &bio_data->base_bio->bi_iter, SECTOR_SIZE);
+    	bio_advance_iter(bio_data, &bio_data->base_bio->bi_iter, SECTOR_SIZE);
     }
+    aead_request_free(req);
     return 0;
 exit:
     cleanup(bio_data->device);
