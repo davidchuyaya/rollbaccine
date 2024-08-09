@@ -724,7 +724,6 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     struct bio_data *bio_data;
 
     bio_set_dev(bio, device->dev->bdev);
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     // Set shared data between clones
     bio_data = alloc_bio_data(device);
 
@@ -824,7 +823,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         case READ:
             // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
             printk(KERN_INFO "shallow clone");
-            shallow_clone = shallow_bio_clone(device, deep_clone);
+            shallow_clone = shallow_bio_clone(device, bio);
             if (!shallow_clone) {
                 printk(KERN_ERR "Could not create shallow clone");
                 // TODO diff error return
@@ -841,7 +840,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
             return DM_MAPIO_SUBMITTED;
         }
     }
-    printk(KERN_INFO "end of server_map")
+    printk(KERN_INFO "end of server_map");
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Anything we clone and submit ourselves is marked submitted
