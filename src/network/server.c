@@ -35,7 +35,7 @@
 #define MIN_IOS 64
 #define MODULE_NAME "server"
 
-#define TLS_ON
+//#define TLS_ON
 // #define MULTITHREADED_NETWORK
 #define MEMORY_TRACKING // Check the number of mallocs/frees and see if we're leaking memory
 
@@ -498,7 +498,9 @@ void decrypt_at_end_io(struct bio *read_bio)
     // the cloned bio is no longer useful
     bio_put(read_bio);
     // decrypt
+    printk(KERN_INFO "starting decryption");
     enc_or_dec_bio(bio_data, READ);
+    printk(KERN_INFO "starting decryption");
     // release the base bio
     bio_endio(bio_data->base_bio);
 }
@@ -730,6 +732,9 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     bio_data->base_bio = bio;
     bio_data->device = device;
 
+    printk(KERN_INFO "initialized bio");
+
+
     // Copy bio if it's a write
     if (device->is_leader) {
         switch (bio_data_dir(bio)) {
@@ -740,7 +745,10 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
                 unsigned int original_idx = bio->bi_iter.bi_idx;
 
                 // Encrypt
+                printk(KERN_INFO "starting encryption");
                 enc_or_dec_bio(bio_data, WRITE);
+                printk(KERN_INFO "finished encryption");
+
 
                 // Reset to the original beginning values of the bio, otherwise nothing will be written
                 bio->bi_iter.bi_sector = original_sector;
@@ -815,6 +823,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
                 break;
         case READ:
             // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
+            printk(KERN_INFO "shallow clone");
             shallow_clone = shallow_bio_clone(device, deep_clone);
             if (!shallow_clone) {
                 printk(KERN_ERR "Could not create shallow clone");
@@ -832,7 +841,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
             return DM_MAPIO_SUBMITTED;
         }
     }
-
+    printk(KERN_INFO "end of server_map")
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Anything we clone and submit ourselves is marked submitted
@@ -1561,7 +1570,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         error = -ENOMEM;
         goto out;
     }
-
+    printk(KERN_INFO "allocated tfm");
     crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
 
     device->key = "1234567890123456";
@@ -1578,6 +1587,8 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         error = -ENOMEM;
         goto out;
     }
+    printk(KERN_INFO "allocated checksums");
+
 #ifdef MEMORY_TRACKING
     atomic_set(&device->num_bio_data_not_freed, 0);
     atomic_set(&device->num_bio_pages_not_freed, 0);
