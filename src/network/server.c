@@ -151,6 +151,9 @@ struct bio_data {
 
     // AEAD fields
     struct bio *base_bio;
+    struct bio *bio_in;
+    struct bvec_iter bi_iter;
+
 
     atomic_t ref_counter; // The number of clones. Once it hits 0, the bio can be freed. Only exists in the deep clone
 };
@@ -494,15 +497,14 @@ void network_end_io(struct bio *deep_clone) {
 void decrypt_at_end_io(struct bio *read_bio)
 {
     struct bio_data *bio_data = read_bio->bi_private;
-
-    // the cloned bio is no longer useful
-    bio_put(read_bio);
     // decrypt
     printk(KERN_INFO "starting decryption");
     enc_or_dec_bio(bio_data, READ);
     printk(KERN_INFO "starting decryption");
     // release the base bio
     bio_endio(bio_data->base_bio);
+    // the cloned bio is no longer useful
+    bio_put(read_bio);
 }
 
 void broadcast_bio(struct bio *clone) {
@@ -728,25 +730,25 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     bio_data = alloc_bio_data(device);
 
     // initialize fields for bio data that will be useful for encryption
-    bio_data->base_bio = bio;
     bio_data->device = device;
+    bio_data->base_bio = bio;
+    bio_data->bio_in = bio;
+    bio_data->bi_iter = bio->bi_iter;
 
     printk(KERN_INFO "initialized bio");
-
-
     // Copy bio if it's a write
     if (device->is_leader) {
         switch (bio_data_dir(bio)) {
             case WRITE:
                 // ENCRYPTION LOGIC
-                uint64_t original_sector = bio->bi_iter.bi_sector;
+                uint64_t original_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
                 unsigned int original_size = bio->bi_iter.bi_size;
                 unsigned int original_idx = bio->bi_iter.bi_idx;
 
                 // Encrypt
                 printk(KERN_INFO "starting encryption");
                 enc_or_dec_bio(bio_data, WRITE);
-                printk(KERN_INFO "finished encryption");
+                //printk(KERN_INFO "finished encryption");
 
 
                 // Reset to the original beginning values of the bio, otherwise nothing will be written
@@ -822,7 +824,6 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
                 break;
         case READ:
             // Create a clone that calls decrypt_at_end_io when the IO returns with actual read data
-            printk(KERN_INFO "shallow clone");
             shallow_clone = shallow_bio_clone(device, bio);
             if (!shallow_clone) {
                 printk(KERN_ERR "Could not create shallow clone");
@@ -831,6 +832,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
             }
             shallow_clone->bi_private = bio_data;
             shallow_clone->bi_end_io = decrypt_at_end_io;
+            bio_set_dev(shallow_clone, device->dev->bdev);
             shallow_clone->bi_opf = bio->bi_opf;
             shallow_clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
@@ -841,7 +843,8 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         }
     }
     printk(KERN_INFO "end of server_map");
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+    // TODO: not needed
+    //bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Anything we clone and submit ourselves is marked submitted
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
@@ -869,16 +872,18 @@ int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
         ret = -ENOMEM;
         goto exit;
     }
-    while (bio_data->base_bio->bi_iter.bi_size)
+    while (bio_data->bi_iter.bi_size)
     {
+        printk(KERN_INFO "enc/dec starting");
         struct scatterlist sg[4];
-        curr_sector = bio_data->base_bio->bi_iter.bi_sector;
+        curr_sector = bio_data->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
-        bv = bio_iter_iovec(bio_data->base_bio, bio_data->base_bio->bi_iter);
+        bv = bio_iter_iovec(bio_data->bio_in, bio_data->bi_iter);
         switch (enc_or_dec)
         {
         case READ:
             if (*checksum_index(bio_data, curr_sector) == 0) {
+            aead_request_free(req);
             return 0;
         }
             break;
@@ -925,7 +930,7 @@ int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec)
             aead_request_free(req);
             goto exit;
         }
-    	bio_advance_iter(bio_data->base_bio, &bio_data->base_bio->bi_iter, SECTOR_SIZE);
+    	bio_advance_iter(bio_data->bio_in, &bio_data->bi_iter, SECTOR_SIZE);
     }
     aead_request_free(req);
     return 0;

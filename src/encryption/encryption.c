@@ -59,8 +59,7 @@ typedef struct encryption_io
 {
     // maintain information of original bio before iteration
     struct bio *base_bio;
-    // needed for iteration
-    uint64_t sector;
+    struct bvec_iter bi_iter;
     struct crypto_wait wait;
     struct encryption_device *rbd;
 
@@ -183,11 +182,11 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
         ret = -ENOMEM;
         goto exit;
     }
-    while (io->base_bio->bi_iter.bi_size)
+    while (io->bi_iter.bi_size)
     {
-        curr_sector = io->base_bio->bi_iter.bi_sector;
+        curr_sector = io->bi_iter.bi_sector;
         DECLARE_CRYPTO_WAIT(wait);
-        bv = bio_iter_iovec(io->base_bio, io->base_bio->bi_iter);
+        bv = bio_iter_iovec(io->base_bio, io->bi_iter);
         switch (enc_or_dec)
         {
         case READ:
@@ -242,7 +241,7 @@ static int enc_or_dec_bio(struct encryption_io *io, int enc_or_dec)
             goto exit;
         }
 	
-    bio_advance_iter(io->base_bio, &io->base_bio->bi_iter, SECTOR_SIZE);
+    bio_advance_iter(io->base_bio, &io->bi_iter, SECTOR_SIZE);
     }
     aead_request_free(req);
     return 0;
@@ -272,16 +271,6 @@ static void decrypt_at_end_io(struct bio *clone)
     bio_endio(read_bio->base_bio);
 }
 
-static void encryption_io_init(struct encryption_io *io, struct encryption_device *rbd, struct bio *bio, uint64_t sector)
-{
-    // TODO: maybe look into adding an iv_offset if neccesarry
-    io->sector = sector;
-    io->base_bio = bio;
-    io->rbd = rbd;
-    io->error = 0;
-    return;
-}
-
 struct bio* shallow_bio_clone(struct encryption_device *device, struct bio *bio_src) {
     struct bio *clone;
     clone = bio_alloc_clone(bio_src->bi_bdev, bio_src, GFP_NOIO, &device->bs);
@@ -305,6 +294,8 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
     // fetch data specific to bio
     io = dm_per_bio_data(bio, ti->per_io_data_size);
     // initialize fields for bio data that will be useful for encryption
+    io->base_bio = bio;
+    io->bi_iter = bio->bi_iter;
     encryption_io_init(io, rbd, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
     //printk(KERN_INFO "io properly initialized\n");
     if (bio_has_data(bio))
