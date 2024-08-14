@@ -142,8 +142,6 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         ret = -ENOMEM;
         goto out;
     }
-    // Check the allocation of the large checksums array
-    printk(KERN_INFO "Allocated memory for encryption_device: %zu bytes\n", sizeof(device->checksums));
 
     device->total_sectors = get_capacity(device->dev->bdev->bd_disk);
     printk(KERN_INFO "Total sectors: %llu\n", (unsigned long long)device->total_sectors);
