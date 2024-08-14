@@ -2,7 +2,6 @@
 #include <linux/init.h>   /* Needed for the macros */
 #include <linux/printk.h> /* Needed for pr_info() */
 #include <linux/device-mapper.h>
-#include <linux/blkdev.h> /* Needed for get_capacity() */
 #include <linux/crypto.h>
 #include <crypto/internal/hash.h> /* SHA-256 Hash*/
 #include <linux/bio.h>
@@ -136,7 +135,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
 
     bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
 
-    device->checksums = kvmalloc_array(get_capacity(device->dev->bdev->bd_disk), AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    device->checksums = kvmalloc_array(ti->len, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
     if (!device->checksums) {
         ti->error = "Cannot allocate checksums";
         ret = -ENOMEM;
