@@ -11,13 +11,11 @@
 #include <crypto/aead.h>        /* Needed for AEAD operations */
 
 #define DM_MSG_PREFIX "encryption"
-
 #define SHA256_LENGTH 256
 #define AES_GCM_IV_SIZE 12
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
 #define MIN_IOS 64
-
 
 // Data attached to each bio
 struct encryption_device {
@@ -39,7 +37,6 @@ struct bio_data {
     struct bvec_iter bi_iter;
     struct crypto_wait wait;
     struct encryption_device *device;
-
 };
 
 void cleanup(struct encryption_device *device) {
@@ -67,7 +64,6 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     struct encryption_device *device;
     printk(KERN_INFO "encryption constructor called\n");
 
-    // TODO: look into vzalloc
     device = kmalloc(sizeof(struct encryption_device), GFP_KERNEL);
     if (device == NULL) {
         ti->error = "Cannot allocate context";
@@ -82,7 +78,6 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         goto out;
     }
 
-    // TODO: Change flag to CRYPTO_ALG_ASYNC to only allow for synchronous calls and find out what CRYPTO_ALG_ALLOCATES_MEMORY does
     device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
     if (IS_ERR(device->tfm)) {
         ti->error = "Cannot allocate transform";
@@ -111,7 +106,6 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         goto out;
     }
 
-    // TODO: Look into putting hashes inside of here too and some rounding?
     ti->per_io_data_size = sizeof(struct bio_data);
     ti->private = device;
 
@@ -139,7 +133,6 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
     if (!req) {
         printk(KERN_ERR "aead request allocation failed");
-        aead_request_free(req);
         ret = -ENOMEM;
         goto exit;
     }
@@ -150,8 +143,8 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
         switch (enc_or_dec) {
             case READ:
                 if (*checksum_index(bio_data, curr_sector) == 0) {
-                return 0;
-            }
+                    return 0;
+                }
                 break;
             default:
                 break;
@@ -169,7 +162,6 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
         //  *  | (authenticated) | (auth+encryption) |              |
         //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
         //  */
-
 
         aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
         // sector + iv size
@@ -228,16 +220,14 @@ struct bio* shallow_bio_clone(struct encryption_device *device, struct bio *bio_
     struct bio *clone;
     clone = bio_alloc_clone(bio_src->bi_bdev, bio_src, GFP_NOIO, &device->bs);
     if (!clone) {
-        printk(KERN_INFO "Could not create clone");
+        printk(KERN_ERR "Could not create clone");
         return NULL;
     }
-
     clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
     return clone;
 }
 
-static int encryption_map(struct dm_target *ti, struct bio *bio)
-{
+static int encryption_map(struct dm_target *ti, struct bio *bio) {
     struct encryption_device *device = ti->private;
     struct bio *clone;
     struct bio_data *bio_data;
@@ -257,22 +247,18 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 original_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
                 unsigned int original_size = bio->bi_iter.bi_size;
                 unsigned int original_idx = bio->bi_iter.bi_idx;
-
                 // Encrypt
                 enc_or_dec_bio(bio_data, WRITE);
-                //printk(KERN_INFO "encryption done properly\n");
-
                 // Reset to the original beginning values of the bio, otherwise nothing will be written
                 bio->bi_iter.bi_sector = original_sector;
                 bio->bi_iter.bi_size = original_size;
                 bio->bi_iter.bi_idx = original_idx;
-
                 return DM_MAPIO_REMAPPED;
             case READ:
                 // Create a clone that calls decrypt_at_end_io when the bio_data returns with actual read data
                 clone = shallow_bio_clone(device, bio);
                 if (!clone) {
-                    printk(KERN_INFO "Could not create clone");
+                    printk(KERN_ERR "Could not create clone");
                     return 1;
                 }
                 clone->bi_private = bio_data;
@@ -280,11 +266,8 @@ static int encryption_map(struct dm_target *ti, struct bio *bio)
                 bio_set_dev(clone, device->dev->bdev);
                 clone->bi_opf = bio->bi_opf;
                 clone->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
-
                 // Submit the clone, triggering end_io, where the read will actually have data and we can decrypt
                 submit_bio_noacct(clone);
-                //printk(KERN_INFO "read properly initialized\n");
-
                 return DM_MAPIO_SUBMITTED;
         }
     }
@@ -304,7 +287,6 @@ static struct target_type encryption_target = {
 int __init dm_encryption_init(void) {
     int r = dm_register_target(&encryption_target);
     printk(KERN_INFO "encryption module loaded\n");
-
     if (r < 0)
         DMERR("register failed %d", r);
     return r;
