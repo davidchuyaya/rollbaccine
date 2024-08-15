@@ -6,7 +6,11 @@
 
 Create a Ubuntu 24.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). The 24.04 version is required for in-kernel TLS.
 
+
+
 Download a [Ubuntu 24.04 LTS image](https://ubuntu.com/download/server). I downloaded the server install image since I don't need the GUI.
+
+**Note: Make sure you download the image that has the same architecture as your computer -- Installations for *Alternate Architectures* can be found on the same page**
 
 ## Mac Setup
 <details Mac>
