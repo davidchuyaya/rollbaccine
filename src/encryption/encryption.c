@@ -1,25 +1,14 @@
-#include <linux/module.h> /* Needed by all modules */
-#include <linux/init.h>   /* Needed for the macros */
-#include <linux/printk.h> /* Needed for pr_info() */
-#include <linux/device-mapper.h>
-#include <linux/crypto.h>
-#include <crypto/internal/hash.h> /* SHA-256 Hash*/
-#include <linux/bio.h>
-#include <linux/device-mapper.h>
-#include <linux/scatterlist.h>
-#include <linux/list.h>
-#include <linux/vmalloc.h>
-#include <linux/string.h>
-#include <linux/gfp.h>
-#include <linux/err.h>
-#include <linux/jiffies.h>
-#include <linux/timex.h>
-#include <linux/random.h>
-#include <crypto/skcipher.h>
-#include <crypto/aead.h>
-#include <crypto/hash.h>
-#include <crypto/if_alg.h>
-#include <crypto/drbg.h>
+#include <linux/module.h>       /* Needed by all modules */
+#include <linux/init.h>         /* Needed for the macros */
+#include <linux/printk.h>       /* Needed for printk() */
+#include <linux/device-mapper.h>/* Needed for device-mapper operations */
+#include <linux/crypto.h>       /* Needed for crypto operations */
+#include <crypto/internal/hash.h> /* Needed for hashing (SHA-256) */
+#include <linux/bio.h>          /* Needed for bio operations */
+#include <linux/scatterlist.h>  /* Needed for scatterlist operations */
+#include <linux/gfp.h>          /* Needed for memory allocation */
+#include <linux/err.h>          /* Needed for error handling */
+#include <crypto/aead.h>        /* Needed for AEAD operations */
 
 #define DM_MSG_PREFIX "encryption"
 
