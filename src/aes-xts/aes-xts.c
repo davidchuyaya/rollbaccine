@@ -11,21 +11,20 @@
 #include <crypto/aead.h>        /* Needed for AEAD operations */
 #include <linux/random.h>       /* Needed for IV generation */
 
-#define DM_MSG_PREFIX "encryption"
-#define SHA256_LENGTH 256
-#define AES_GCM_IV_SIZE 12
-#define AES_GCM_AUTH_SIZE 16
-#define KEY_SIZE 16
+#define DM_MSG_PREFIX "aes-xts"
+#define AES_XTS_KEY_SIZE 32
+#define HMAC_KEY_SIZE 16
+#define HMAC_DIGEST_SIZE 32
 #define MIN_IOS 64
 
 // Data attached to each bio
 struct encryption_device {
     struct dm_dev *dev;
     // symmetric key algorithm instance
-    struct crypto_aead *tfm;
-    // persist key
-    char *key;
-    // not sure what this is, but it's needed to create a clone of the bio
+    struct crypto_skcipher *tfm;  // Symmetric key cipher for AES-XTS
+    struct crypto_ahash *hmac_tfm;  // HMAC for integrity check
+    char *key;  // AES-XTS key
+    char *hmac_key;  // HMAC key
     struct bio_set bs;
     // array of hashes of each sector
     char* checksums;
@@ -46,7 +45,13 @@ void cleanup(struct encryption_device *device) {
     if (device->checksums)
         kvfree(device->checksums);
     if (device->tfm)
-        crypto_free_aead(device->tfm);
+        crypto_free_skcipher(device->tfm);
+    if (device->hmac_tfm)
+        crypto_free_ahash(device->hmac_tfm);
+    if (device->key)
+        kfree(device->key);
+    if (device->hmac_key)
+        kfree(device->hmac_key)
     bioset_exit(&device->bs);
     kfree(device);
 }
@@ -79,33 +84,45 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
         goto out;
     }
 
-    device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+    device->tfm = crypto_alloc_skcipher("xts(aes)", 0, 0);
     if (IS_ERR(device->tfm)) {
-        ti->error = "Cannot allocate transform";
+        ti->error = "Cannot allocate AES-XTS transform";
         ret = -ENOMEM;
         goto out;
     }
     printk(KERN_INFO "transform properly initialized\n");
 
-    // tag size
-    crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
+    device->hmac_tfm = crypto_alloc_ahash("hmac(sha256)", 0, 0);
+    if (IS_ERR(device->hmac_tfm)) {
+        ti->error = "Cannot allocate HMAC transform";
+        ret = -ENOMEM;
+        goto out;
+    }
 
-    device->key = "1234567890123456";
-    if (crypto_aead_setkey(device->tfm, device->key, KEY_SIZE)) {
-        ti->error = "Key could not be set";
-        ret = -EAGAIN;
+    device->key = "12345678901234567890123456789012";
+    ret = crypto_skcipher_setkey(device->tfm, device->key, AES_XTS_KEY_SIZE);
+    if (ret) {
+        ti->error = "AES-XTS key could not be set";
         goto out;
     }
     printk(KERN_INFO "key properly initialized\n");
 
-    bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
+    device->hmac_key = "1234567890123456";
+    ret = crypto_ahash_setkey(device->hmac_tfm, device->hmac_key, HMAC_KEY_SIZE);
+    if (ret) {
+        ti->error = "HMAC key could not be set";
+        goto out;
+    }
 
-    device->checksums = kvmalloc_array(ti->len, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    device->checksums = kvmalloc_array(ti->len, HMAC_DIGEST_SIZE, GFP_KERNEL | __GFP_ZERO);
     if (!device->checksums) {
         ti->error = "Cannot allocate checksums";
         ret = -ENOMEM;
         goto out;
     }
+
+    bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
+
 
     ti->per_io_data_size = sizeof(struct bio_data);
     ti->private = device;
