@@ -8,8 +8,9 @@
 #include <linux/scatterlist.h>  /* Needed for scatterlist operations */
 #include <linux/gfp.h>          /* Needed for memory allocation */
 #include <linux/err.h>          /* Needed for error handling */
-#include <crypto/aead.h>        /* Needed for AEAD operations */
 #include <linux/random.h>       /* Needed for IV generation */
+#include <crypto/aead.h>        /* Needed for AEAD operations */
+#include <crypto/skcipher.h>
 
 #define DM_MSG_PREFIX "aes-xts"
 #define AES_XTS_KEY_SIZE 32
@@ -18,11 +19,12 @@
 #define MIN_IOS 64
 
 // Data attached to each bio
-struct encryption_device {
+struct xts_device {
     struct dm_dev *dev;
     // symmetric key algorithm instance
     struct crypto_skcipher *tfm;  // Symmetric key cipher for AES-XTS
-    struct crypto_ahash *hmac_tfm;  // HMAC for integrity check
+    struct crypto_shash *hmac_tfm;  // HMAC for integrity check
+    struct shash_desc *shash; // Space used by shash
     char *key;  // AES-XTS key
     char *hmac_key;  // HMAC key
     struct bio_set bs;
@@ -36,10 +38,10 @@ struct bio_data {
     struct bio *base_bio;
     struct bvec_iter bi_iter;
     struct crypto_wait wait;
-    struct encryption_device *device;
+    struct xts_device *device;
 };
 
-void cleanup(struct encryption_device *device) {
+void cleanup(struct xts_device *device) {
     if (device == NULL)
         return;
     if (device->checksums)
@@ -47,30 +49,32 @@ void cleanup(struct encryption_device *device) {
     if (device->tfm)
         crypto_free_skcipher(device->tfm);
     if (device->hmac_tfm)
-        crypto_free_ahash(device->hmac_tfm);
+        crypto_free_shash(device->hmac_tfm);
+    if (device->shash)
+	kfree(device->shash);
     if (device->key)
         kfree(device->key);
     if (device->hmac_key)
-        kfree(device->hmac_key)
+        kfree(device->hmac_key);
     bioset_exit(&device->bs);
     kfree(device);
 }
 
-static void encryption_destructor(struct dm_target *ti) {
-    struct encryption_device *device = ti->private;
-    printk(KERN_INFO "encryption destructor called\n");
+static void xts_destructor(struct dm_target *ti) {
+    struct xts_device *device = ti->private;
+    printk(KERN_INFO "xts destructor called\n");
     if (device == NULL)
         return;
-    dm_put_device(ti, device->dev);
     cleanup(device);
+    dm_put_device(ti, device->dev);
 }
 
-static int encryption_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
+static int xts_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     int ret;
-    struct encryption_device *device;
-    printk(KERN_INFO "encryption constructor called\n");
+    struct xts_device *device;
+    printk(KERN_INFO "xts constructor called\n");
 
-    device = kmalloc(sizeof(struct encryption_device), GFP_KERNEL);
+    device = kmalloc(sizeof(struct xts_device), GFP_KERNEL);
     if (device == NULL) {
         ti->error = "Cannot allocate context";
         ret = -ENOMEM;
@@ -92,9 +96,16 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     }
     printk(KERN_INFO "transform properly initialized\n");
 
-    device->hmac_tfm = crypto_alloc_ahash("hmac(sha256)", 0, 0);
+    device->hmac_tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
     if (IS_ERR(device->hmac_tfm)) {
         ti->error = "Cannot allocate HMAC transform";
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    device->shash = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->hmac_tfm), GFP_NOIO);
+    if (!device->shash) {
+        ti->error = "could not allocate shash descriptor";
         ret = -ENOMEM;
         goto out;
     }
@@ -108,7 +119,7 @@ static int encryption_constructor(struct dm_target *ti, unsigned int argc, char 
     printk(KERN_INFO "key properly initialized\n");
 
     device->hmac_key = "1234567890123456";
-    ret = crypto_ahash_setkey(device->hmac_tfm, device->hmac_key, HMAC_KEY_SIZE);
+    ret = crypto_shash_setkey(device->hmac_tfm, device->hmac_key, HMAC_KEY_SIZE);
     if (ret) {
         ti->error = "HMAC key could not be set";
         goto out;
@@ -135,11 +146,7 @@ out:
 }
 
 static inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
-    return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
-}
-
-static inline unsigned char *iv_index(struct bio_data *bio_data, sector_t index) {
-    return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
+    return &bio_data->device->checksums[index * HMAC_DIGEST_SIZE];
 }
 
 
@@ -147,8 +154,9 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     int ret;
     struct bio_vec bv;
     uint64_t curr_sector;
-    struct aead_request *req;
-    req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
+    struct skcipher_request *req;
+    u8 iv[AES_XTS_KEY_SIZE];
+    req = skcipher_request_alloc(bio_data->device->tfm, GFP_KERNEL);
     if (!req) {
         printk(KERN_ERR "aead request allocation failed");
         ret = -ENOMEM;
@@ -156,8 +164,8 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     }
     while (bio_data->bi_iter.bi_size) {
         curr_sector = bio_data->bi_iter.bi_sector;
-        DECLARE_CRYPTO_WAIT(wait);
         bv = bio_iter_iovec(bio_data->base_bio, bio_data->bi_iter);
+	DECLARE_CRYPTO_WAIT(wait);
         switch (enc_or_dec) {
             case READ:
                 if (*checksum_index(bio_data, curr_sector) == 0) {
@@ -167,49 +175,39 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
             default:
                 break;
         }
-        get_random_bytes(iv_index(bio_data, curr_sector), AES_GCM_IV_SIZE);
-        struct scatterlist sg[4];
-        sg_init_table(sg, 4);
-        sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
-        sg_set_buf(&sg[1], iv_index(bio_data, curr_sector), AES_GCM_IV_SIZE);
-        sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset);
-        sg_set_buf(&sg[3], checksum_index(bio_data, curr_sector), AES_GCM_AUTH_SIZE);
+        memcpy(iv, "12345678901234567890123456789012", AES_XTS_KEY_SIZE);
+        struct scatterlist sg;
+        sg_init_one(&sg, bv.bv_page, bv.bv_len);
+        skcipher_request_set_crypt(req, &sg, &sg, bv.bv_len, iv);
+	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 
-        // /* AEAD request:
-        //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
-        //  *  | (authenticated) | (auth+encryption) |              |
-        //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
-        //  */
 
-        aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
-        // sector + iv size
-        aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
         switch (enc_or_dec) {
             case WRITE:
-                aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv_index(bio_data, curr_sector));
-                ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+                ret = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
                 break;
             case READ:
-                aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv_index(bio_data, curr_sector));
-                ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+                ret = crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
                 break;
         }
 
         if (ret) {
-            if (ret == -EBADMSG) {
-                printk(KERN_ERR "invalid integrity check - triggering kernel panic");
-                panic("Kernel panic: integrity check failed during decryption (bad message)");
-            }
-            else {
-                printk(KERN_ERR "encryption/decryption failed - triggering kernel panic");
-                panic("Kernel panic: encryption/decryption operation failed");
-            }
-            aead_request_free(req);
+            printk(KERN_ERR "xts/decryption failed");
+            skcipher_request_free(req);
             goto exit;
         }
+
+        // HMAC calculation
+	ret = crypto_shash_digest(bio_data->device->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, checksum_index(bio_data, curr_sector));
+        if (ret) {
+            printk(KERN_INFO "hash failed");
+            // TODO: Don't fail silently
+            goto exit;
+        }
+    
         bio_advance_iter(bio_data->base_bio, &bio_data->bi_iter, SECTOR_SIZE);
     }
-    aead_request_free(req);
+    skcipher_request_free(req);
     return 0;
 exit:
     cleanup(bio_data->device);
@@ -234,7 +232,7 @@ static void decrypt_at_end_io(struct bio *clone) {
     bio_endio(read_bio->base_bio);
 }
 
-struct bio* shallow_bio_clone(struct encryption_device *device, struct bio *bio_src) {
+struct bio* shallow_bio_clone(struct xts_device *device, struct bio *bio_src) {
     struct bio *clone;
     clone = bio_alloc_clone(bio_src->bi_bdev, bio_src, GFP_NOIO, &device->bs);
     if (!clone) {
@@ -245,15 +243,15 @@ struct bio* shallow_bio_clone(struct encryption_device *device, struct bio *bio_
     return clone;
 }
 
-static int encryption_map(struct dm_target *ti, struct bio *bio) {
-    struct encryption_device *device = ti->private;
+static int xts_map(struct dm_target *ti, struct bio *bio) {
+    struct xts_device *device = ti->private;
     struct bio *clone;
     struct bio_data *bio_data;
 
     bio_set_dev(bio, device->dev->bdev);
     // fetch data specific to bio
     bio_data = dm_per_bio_data(bio, ti->per_io_data_size);
-    // initialize fields for bio data that will be useful for encryption
+    // initialize fields for bio data that will be useful for xts
     bio_data->base_bio = bio;
     // save bi_iter since bi_iter will be moved for reads before the read operation is actually done
     bio_data->bi_iter = bio->bi_iter;
@@ -292,30 +290,30 @@ static int encryption_map(struct dm_target *ti, struct bio *bio) {
     return DM_MAPIO_SUBMITTED;
 }
 
-static struct target_type encryption_target = {
-    .name = "encryption",
+static struct target_type xts_target = {
+    .name = "xts",
     .version = {0, 1, 0},
     .features = DM_TARGET_INTEGRITY, // TODO: Figure out what this means
     .module = THIS_MODULE,
-    .ctr = encryption_constructor,
-    .dtr = encryption_destructor,
-    .map = encryption_map,
+    .ctr = xts_constructor,
+    .dtr = xts_destructor,
+    .map = xts_map,
 };
 
-int __init dm_encryption_init(void) {
-    int r = dm_register_target(&encryption_target);
-    printk(KERN_INFO "encryption module loaded\n");
+int __init dm_xts_init(void) {
+    int r = dm_register_target(&xts_target);
+    printk(KERN_INFO "xts module loaded\n");
     if (r < 0)
         DMERR("register failed %d", r);
     return r;
 }
 
-void dm_encryption_exit(void) {
-    dm_unregister_target(&encryption_target);
-    printk(KERN_INFO "encryption module unloaded\n");
+void dm_xts_exit(void) {
+    dm_unregister_target(&xts_target);
+    printk(KERN_INFO "xts module unloaded\n");
 }
 
-module_init(dm_encryption_init);
-module_exit(dm_encryption_exit);
+module_init(dm_xts_init);
+module_exit(dm_xts_exit);
 
 MODULE_LICENSE("GPL");
