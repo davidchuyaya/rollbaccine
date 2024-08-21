@@ -8,7 +8,6 @@
 #include <linux/device-mapper.h>
 #include <linux/inet.h>  // For in4_pton to translate IP addresses from strings
 #include <linux/init.h>
-#include <linux/kfifo.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/tcp.h>
@@ -23,8 +22,6 @@
 #define ROLLBACCINE_HASH_SIZE 256
 #define ROLLBACCINE_POINTER_BYTES 8 // Size of a pointer
 #define ROLLBACCINE_MAX_BUFFERED_OPS 1024 * 32 // Maximum number of write operations that we still have a pointer to in the system, because it's submitting to disk or network. Fio on David's VM on his laptop says 720 is the max, so overshoot by a bit.
-#define ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE \
-    ROLLBACCINE_MAX_BUFFERED_OPS * ROLLBACCINE_POINTER_BYTES  // Number of bios outstanding in any buffer
 #define ROLLBACCINE_TLS_TIMEOUT 5000 // Number of milliseconds to wait for TLS handshake to complete
 #define MODULE_NAME "server"
 
@@ -76,14 +73,12 @@ struct server_device {
 
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
-    // IMPORTANT: If multiple semaphores must be obtained, obtain in order of their names (sem1, sem2, etc)
     spinlock_t replica_fsync_lock;
     int* replica_fsync_indices; // Len = n
     int max_replica_fsync_index;
-    struct semaphore sem1_fsyncs_pending_replication;
-    struct kfifo fsyncs_pending_replication; // List of all fsyncs waiting for replication. Best-effort ordered by write index.
+    struct bio_list fsyncs_pending_replication; // List of all fsyncs waiting for replication. Ordered by write index.
 
-    // Logic for writes that block on previous fsyncs going to disk
+    // Logic for writes that block on conflicting writes
     struct rb_root outstanding_ops; // Tree of all outstanding operations, sorted by the sectors they write to
     struct list_head pending_ops; // List of all operations that conflict with outstanding operations (or other pending operations)
     bool processing_pending_ops;  // Set to true when a bio is being popped off pending_ops by another bio during its end_io. If the other bio submits the pending op while holding index_lock, it could result in deadlock (because this bio can then trigger its own end_io, which would need to obtain the same index_lock). Instead, the other bio sets this flag to true, then submits the bio without a lock, then reobtains the lock and removes the bio from the pending_ops list. While this flag is on, other bios will not pop things off the pending_ops queue. This guarantees consistent ordering between primary and replicas
@@ -107,8 +102,9 @@ struct server_device {
     atomic_t num_bio_data_not_freed;
     atomic_t num_shallow_clones_not_freed;
     atomic_t num_deep_clones_not_freed;
-    atomic_t num_rb_nodes;
-    atomic_t num_bio_sector_ranges;
+    int num_rb_nodes;
+    int num_bio_sector_ranges;
+    int num_fsyncs_pending_replication;
     // These counters tell us the maximum amount of memory we need to prealloc
     atomic_t max_outstanding_num_bio_pages;
     atomic_t max_outstanding_num_bio_data;
@@ -116,9 +112,7 @@ struct server_device {
     atomic_t max_outstanding_num_deep_clones;
     int max_outstanding_num_rb_nodes;
     int max_outstanding_num_bio_sector_ranges;
-    // These counters tell us if our queue sizes need to change
-    int num_times_fsyncs_pending_replication_full;
-    int max_fsyncs_pending_replication_size;
+    int max_outstanding_fsyncs_pending_replication;
 #endif
 };
 
@@ -230,7 +224,7 @@ bool try_insert_into_outstanding_ops(struct server_device *device, struct bio *s
     }
     // No conflicts, add this bio to the red black tree
 #ifdef MEMORY_TRACKING
-    atomic_inc(&device->num_rb_nodes);
+    device->num_rb_nodes += 1;
 #endif
     rb_link_node(&bio_data->tree_node, potential_parent_node, potential_tree_node_location);
     rb_insert_color(&bio_data->tree_node, &device->outstanding_ops);
@@ -244,7 +238,7 @@ bool try_insert_into_outstanding_ops(struct server_device *device, struct bio *s
         return false;
     }
 #ifdef MEMORY_TRACKING
-    atomic_inc(&device->num_bio_sector_ranges);
+    device->num_bio_sector_ranges += 1;
 #endif
     sector_range->start_sector = start_sector;
     sector_range->end_sector = end_sector;
@@ -257,14 +251,11 @@ void remove_from_outstanding_ops_and_unblock(struct server_device *device, struc
     struct bio_data *bio_data = shallow_clone->bi_private;
     struct bio_sector_range *other_bio_sector_range;
     struct bio_data *other_bio_data;
-#ifdef MEMORY_TRACKING
-    int num_rb_nodes, num_bio_sector_ranges;
-#endif
 
     spin_lock(&device->index_lock);
 #ifdef MEMORY_TRACKING
-    num_rb_nodes = atomic_dec_return(&device->num_rb_nodes);
-    device->max_outstanding_num_rb_nodes = umax(device->max_outstanding_num_rb_nodes, num_rb_nodes + 1);
+    device->num_rb_nodes -= 1;
+    device->max_outstanding_num_rb_nodes = umax(device->max_outstanding_num_rb_nodes, device->num_rb_nodes + 1);
 #endif
     rb_erase(&bio_data->tree_node, &device->outstanding_ops);
     // If another bio is processing pending ops, then we don't need to (if we do, we might actually mess up ordering)
@@ -279,8 +270,8 @@ void remove_from_outstanding_ops_and_unblock(struct server_device *device, struc
         if (!try_insert_into_outstanding_ops(device, other_bio_sector_range->shallow_clone)) {
             kfree(other_bio_sector_range); // Free this range, because the try function will alloc another range on failure
 #ifdef MEMORY_TRACKING
-            num_bio_sector_ranges = atomic_dec_return(&device->num_bio_sector_ranges);
-            device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, num_bio_sector_ranges + 1);
+            device->num_bio_sector_ranges -= 1;
+            device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges + 1);
 #endif
             break;
         }
@@ -295,8 +286,8 @@ void remove_from_outstanding_ops_and_unblock(struct server_device *device, struc
         list_del(&other_bio_sector_range->list);
         kfree(other_bio_sector_range);
 #ifdef MEMORY_TRACKING
-        num_bio_sector_ranges = atomic_dec_return(&device->num_bio_sector_ranges);
-        device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, num_bio_sector_ranges + 1);
+        device->num_bio_sector_ranges -= 1;
+        device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges + 1);
 #endif
     }
     device->processing_pending_ops = false;
@@ -451,27 +442,25 @@ void process_follower_fsync_index(struct server_device *device, int follower_id,
         }
     }
 
-    // TODO: Locking here is overly strict. We just need to lock to change max index and lock when interacting with the kfifo
     // Loop through all blocked fsyncs if the max index has changed
     if (max_index_changed) {
         // printk(KERN_INFO "New max quorum write index: %d", device->max_replica_fsync_index);
-        // TODO: Remove queue and replace with linked list
 #ifdef MEMORY_TRACKING
-        device->max_fsyncs_pending_replication_size = umax(device->max_fsyncs_pending_replication_size, kfifo_len(&device->fsyncs_pending_replication));
-        device->num_times_fsyncs_pending_replication_full += kfifo_is_full(&device->fsyncs_pending_replication);
+        device->max_outstanding_fsyncs_pending_replication = umax(device->max_outstanding_fsyncs_pending_replication, device->num_fsyncs_pending_replication);
 #endif
-        // Note: Because fsyncs_pending_replication is only best-effort ordered by write index, fsyncs may be stuck waiting for later fsyncs to be acked. This is fine since eventually all fsyncs will be acked anyway and concurrent fsyncs should be rare.
-        while (kfifo_out_peek(&device->fsyncs_pending_replication, &bio, sizeof(struct bio*)) > 0) {
+        while (!bio_list_empty(&device->fsyncs_pending_replication)) {
+            bio = bio_list_peek(&device->fsyncs_pending_replication);
             bio_write_index = bio->bi_private;
             if (bio_write_index <= device->max_replica_fsync_index) {
                 // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
                 // Ack the fsync to the user
                 ack_bio_to_user_without_executing(bio);
-                // Remove from queue. Assign to i to we don't get a warning that we're not checking the output
-                i = kfifo_out(&device->fsyncs_pending_replication, &bio, sizeof(struct bio*));
-                up(&device->sem1_fsyncs_pending_replication);
-            }
-            else {
+                // Remove from queue
+                bio_list_pop(&device->fsyncs_pending_replication);
+#ifdef MEMORY_TRACKING
+                device->num_fsyncs_pending_replication -= 1;
+#endif
+            } else {
                 break;
             }
         }
@@ -745,12 +734,6 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         deep_clone->bi_private = bio_data;
         shallow_clone->bi_private = bio_data;
 
-        // Reserve space on kfifo queues with semaphores in case it is full
-        if (is_fsync) {
-            // printk(KERN_INFO "Server received fsync with bi_opf: %u", bio->bi_opf);
-            down_interruptible_with_retry(&device->sem1_fsyncs_pending_replication);
-        }
-
         // Increment indices, place ops on queue, submit cloned ops to disk
         spin_lock(&device->index_lock);
         // Increment write index
@@ -760,7 +743,12 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
         if (is_fsync) {
             // Add original bio to fsyncs blocked on replication
             bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
-            kfifo_in(&device->fsyncs_pending_replication, &bio, sizeof(struct bio *));
+            spin_lock(&device->replica_fsync_lock);
+            bio_list_add(&device->fsyncs_pending_replication, bio);
+#ifdef MEMORY_TRACKING
+            device->num_fsyncs_pending_replication += 1;
+#endif
+            spin_unlock(&device->replica_fsync_lock);
         }
         queue_work(device->broadcast_queue, &bio_data->broadcast_work);
         spin_unlock(&device->index_lock);
@@ -1260,16 +1248,16 @@ static void server_status(struct dm_target *ti, status_type_t type, unsigned int
     DMEMIT("Num bio_data not freed: %d\n", atomic_read(&device->num_bio_data_not_freed));
     DMEMIT("Num deep clones not freed: %d\n", atomic_read(&device->num_deep_clones_not_freed));
     DMEMIT("Num shallow clones not freed: %d\n", atomic_read(&device->num_shallow_clones_not_freed));
-    DMEMIT("Num rb nodes still in tree: %d\n", atomic_read(&device->num_rb_nodes));
-    DMEMIT("Num bio sectors still in queue: %d\n", atomic_read(&device->num_bio_sector_ranges));
+    DMEMIT("Num rb nodes still in tree: %d\n", device->num_rb_nodes);
+    DMEMIT("Num bio sectors still in queue: %d\n", device->num_bio_sector_ranges);
+    DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
     DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
     DMEMIT("Max outstanding num shallow clones: %d\n", atomic_read(&device->max_outstanding_num_shallow_clones));
     DMEMIT("Max size of rb tree for outgoing operations: %d\n", device->max_outstanding_num_rb_nodes);
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
-    DMEMIT("Num times fsync_pending_replication full: %d\n", device->num_times_fsyncs_pending_replication_full);
-    DMEMIT("Max number of elements in fsync_pending_replication: %lu\n", device->max_fsyncs_pending_replication_size / sizeof(struct bio*));
+    DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
 }
 
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server addr & ports
@@ -1334,13 +1322,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     spin_lock_init(&device->replica_fsync_lock);
     device->replica_fsync_indices = kzalloc(sizeof(int) * device->n, GFP_KERNEL);
-    sema_init(&device->sem1_fsyncs_pending_replication, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE / sizeof(struct bio*));
-    error = kfifo_alloc(&device->fsyncs_pending_replication, ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE, GFP_KERNEL);
-    if (error < 0) {
-        printk(KERN_ERR "Error creating fsyncs_pending_replication");
-        return error;
-    }
-    projected_bytes_used += ROLLBACCINE_KFIFO_CIRC_BUFFER_SIZE;
+    bio_list_init(&device->fsyncs_pending_replication);
 
     device->outstanding_ops = RB_ROOT;
     INIT_LIST_HEAD(&device->pending_ops);
@@ -1381,16 +1363,16 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     atomic_set(&device->num_bio_pages_not_freed, 0);
     atomic_set(&device->num_deep_clones_not_freed, 0);
     atomic_set(&device->num_shallow_clones_not_freed, 0);
-    atomic_set(&device->num_rb_nodes, 0);
-    atomic_set(&device->num_bio_sector_ranges, 0);
+    device->num_rb_nodes = 0;
+    device->num_bio_sector_ranges = 0;
+    device->num_fsyncs_pending_replication = 0;
     atomic_set(&device->max_outstanding_num_bio_data, 0);
     atomic_set(&device->max_outstanding_num_bio_pages, 0);
     atomic_set(&device->max_outstanding_num_deep_clones, 0);
     atomic_set(&device->max_outstanding_num_shallow_clones, 0);
     device->max_outstanding_num_rb_nodes = 0;
     device->max_outstanding_num_bio_sector_ranges = 0;
-    device->num_times_fsyncs_pending_replication_full = 0;
-    device->max_fsyncs_pending_replication_size = 0;
+    device->max_outstanding_fsyncs_pending_replication = 0;
 #endif
 
     // Enable FUA and PREFLUSH flags
@@ -1435,7 +1417,6 @@ static void server_destructor(struct dm_target *ti) {
 
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
     destroy_workqueue(device->broadcast_queue);
-    kfifo_free(&device->fsyncs_pending_replication);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
