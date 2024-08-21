@@ -14,8 +14,8 @@
 
 #define DM_MSG_PREFIX "aes-xts"
 #define AES_XTS_KEY_SIZE 32
-#define HMAC_KEY_SIZE 16
-#define HMAC_DIGEST_SIZE 32
+#define AES_BLOCK_SIZE 16
+#define SHA256_LENGTH 256
 #define MIN_IOS 64
 
 // Data attached to each bio
@@ -26,10 +26,10 @@ struct xts_device {
     struct crypto_shash *hmac_tfm;  // HMAC for integrity check
     struct shash_desc *shash; // Space used by shash
     char *key;  // AES-XTS key
-    char *hmac_key;  // HMAC key
     struct bio_set bs;
     // array of hashes of each sector
     char* checksums;
+    char *ivdata;
 };
 
 // per bio private data
@@ -44,6 +44,8 @@ struct bio_data {
 void cleanup(struct xts_device *device) {
     if (device == NULL)
         return;
+    if (device->ivdata)
+        kfree(device->ivdata);
     if (device->checksums)
         kvfree(device->checksums);
     if (device->tfm)
@@ -51,11 +53,9 @@ void cleanup(struct xts_device *device) {
     if (device->hmac_tfm)
         crypto_free_shash(device->hmac_tfm);
     if (device->shash)
-	kfree(device->shash);
+	    kfree(device->shash);
     if (device->key)
         kfree(device->key);
-    if (device->hmac_key)
-        kfree(device->hmac_key);
     bioset_exit(&device->bs);
     kfree(device);
 }
@@ -96,6 +96,22 @@ static int xts_constructor(struct dm_target *ti, unsigned int argc, char **argv)
     }
     printk(KERN_INFO "transform properly initialized\n");
 
+    device->key = "12345678901234567890123456789012";
+    ret = crypto_skcipher_setkey(device->tfm, device->key, AES_XTS_KEY_SIZE);
+    if (ret) {
+        ti->error = "AES-XTS key could not be set";
+        goto out;
+    }
+    printk(KERN_INFO "key properly initialized\n");
+
+    device->ivdata = kmalloc(16, GFP_KERNEL);
+    if (!device->ivdata) {
+        ti->error = "could not allocate ivdata";
+        ret = -ENOMEM;
+        goto out;
+    }
+    memcpy(device->ivdata, "1234567890123456", 16);
+
     device->hmac_tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
     if (IS_ERR(device->hmac_tfm)) {
         ti->error = "Cannot allocate HMAC transform";
@@ -110,27 +126,15 @@ static int xts_constructor(struct dm_target *ti, unsigned int argc, char **argv)
         goto out;
     }
 
-    device->key = "12345678901234567890123456789012";
-    ret = crypto_skcipher_setkey(device->tfm, device->key, AES_XTS_KEY_SIZE);
-    if (ret) {
-        ti->error = "AES-XTS key could not be set";
-        goto out;
-    }
-    printk(KERN_INFO "key properly initialized\n");
+   
 
-    device->hmac_key = "1234567890123456";
-    ret = crypto_shash_setkey(device->hmac_tfm, device->hmac_key, HMAC_KEY_SIZE);
-    if (ret) {
-        ti->error = "HMAC key could not be set";
-        goto out;
-    }
-
-    device->checksums = kvmalloc_array(ti->len, HMAC_DIGEST_SIZE, GFP_KERNEL | __GFP_ZERO);
+    device->checksums = kvmalloc_array(ti->len, SHA256_LENGTH, GFP_KERNEL | __GFP_ZERO);
     if (!device->checksums) {
         ti->error = "Cannot allocate checksums";
         ret = -ENOMEM;
         goto out;
     }
+    printk(KERN_INFO "checksums properly initialized\n");
 
     bioset_init(&device->bs, MIN_IOS, 0, BIOSET_NEED_BVECS);
 
@@ -146,16 +150,22 @@ out:
 }
 
 static inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
-    return &bio_data->device->checksums[index * HMAC_DIGEST_SIZE];
+    return &bio_data->device->checksums[index * SHA256_LENGTH];
 }
 
 
 static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     int ret;
     struct bio_vec bv;
+    struct bio_vec prev_bv;
     uint64_t curr_sector;
     struct skcipher_request *req;
-    u8 iv[AES_XTS_KEY_SIZE];
+    // char *iv = kmalloc(AES_BLOCK_SIZE, GFP_KERNEL);
+    // if (!iv) {
+    //     printk(KERN_ERR "iv allocation failed");
+    //     ret = -ENOMEM;
+    //     goto exit;
+    // }
     req = skcipher_request_alloc(bio_data->device->tfm, GFP_KERNEL);
     if (!req) {
         printk(KERN_ERR "aead request allocation failed");
@@ -165,23 +175,26 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     while (bio_data->bi_iter.bi_size) {
         curr_sector = bio_data->bi_iter.bi_sector;
         bv = bio_iter_iovec(bio_data->base_bio, bio_data->bi_iter);
-	DECLARE_CRYPTO_WAIT(wait);
-        switch (enc_or_dec) {
-            case READ:
-                if (*checksum_index(bio_data, curr_sector) == 0) {
-                    return 0;
-                }
-                break;
-            default:
-                break;
-        }
-        memcpy(iv, "12345678901234567890123456789012", AES_XTS_KEY_SIZE);
+        prev_bv = bv;
+        // memcpy(iv, "1234567890123456", 16);
+	    DECLARE_CRYPTO_WAIT(wait);
+        // switch (enc_or_dec) {
+        //     case READ:
+        //         if (*checksum_index(bio_data, curr_sector) == 0) {
+        //             skcipher_request_free(req);
+        //             kfree(iv);
+        //             return 0;
+        //         }
+        //         break;
+        //     default:
+        //         break;
+        // }
         struct scatterlist sg;
-        sg_init_one(&sg, bv.bv_page, bv.bv_len);
-        skcipher_request_set_crypt(req, &sg, &sg, bv.bv_len, iv);
-	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
-
-
+        sg_init_table(&sg, 1);
+        sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
+        skcipher_request_set_crypt(req, &sg, &sg, SECTOR_SIZE, bio_data->device->ivdata);
+	    skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+        printk(KERN_INFO "enc/dec initialized\n");
         switch (enc_or_dec) {
             case WRITE:
                 ret = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
@@ -194,20 +207,24 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
         if (ret) {
             printk(KERN_ERR "xts/decryption failed");
             skcipher_request_free(req);
+            // kfree(iv);
             goto exit;
         }
+        printk(KERN_INFO "enc/dec finished succesfully\n");
 
         // HMAC calculation
-	ret = crypto_shash_digest(bio_data->device->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, checksum_index(bio_data, curr_sector));
-        if (ret) {
-            printk(KERN_INFO "hash failed");
-            // TODO: Don't fail silently
-            goto exit;
-        }
-    
+	    // ret = crypto_shash_digest(bio_data->device->shash, page_address(prev_bv.bv_page) + prev_bv.bv_offset, SECTOR_SIZE, checksum_index(bio_data, curr_sector));
+        // if (ret) {
+        //     printk(KERN_INFO "hash failed");
+        //     // TODO: Don't fail silently
+        //     goto exit;
+        // }
+        // printk(KERN_INFO "hashing finished succesfully\n");
+
         bio_advance_iter(bio_data->base_bio, &bio_data->bi_iter, SECTOR_SIZE);
     }
     skcipher_request_free(req);
+    // kfree(iv);
     return 0;
 exit:
     cleanup(bio_data->device);

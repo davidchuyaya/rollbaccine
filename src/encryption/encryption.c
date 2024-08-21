@@ -144,6 +144,7 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
         switch (enc_or_dec) {
             case READ:
                 if (*checksum_index(bio_data, curr_sector) == 0) {
+                    aead_request_free(req);
                     return 0;
                 }
                 break;
