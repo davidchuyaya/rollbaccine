@@ -28,6 +28,9 @@
 #define ROLLBACCINE_RETRY_TIMEOUT 5000  // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_TLS_TIMEOUT 5000  // Number of milliseconds to wait for TLS handshake to complete
+#define AES_GCM_IV_SIZE 12
+#define AES_GCM_AUTH_SIZE 16
+#define KEY_SIZE 16
 #define MODULE_NAME "rollbaccine"
 
 #define TLS_ON
@@ -99,6 +102,11 @@ struct rollbaccine_device {
     // TODO: Need to figure out network handshake so we know who we're talking to.
     struct mutex connected_sockets_lock;
     struct list_head connected_sockets;
+
+    // AEAD
+    struct crypto_aead *tfm;
+    char *key;
+    char *checksums;
 
     // Counters for tracking memory usage
 #ifdef MEMORY_TRACKING
@@ -182,6 +190,7 @@ void network_end_io(struct bio *deep_clone);
 void broadcast_bio(struct work_struct *work);
 struct bio *shallow_bio_clone(struct rollbaccine_device *device, struct bio *bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_src);
+int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec);
 void kill_thread(struct socket *sock);
 void blocking_read(struct rollbaccine_device *device, struct socket *sock);
 #ifdef TLS_ON
@@ -694,6 +703,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     struct rollbaccine_device *device = ti->private;
     struct bio *deep_clone, *shallow_clone;  // deep clone is for the network, shallow clone is for submission to disk when necessary
     struct bio_data *bio_data;
+    sector_t original_sector = bio->bi_iter.bi_sector;
+    unsigned int original_size = bio->bi_iter.bi_size;
+    unsigned int original_idx = bio->bi_iter.bi_idx;
 
     bio_set_dev(bio, device->dev->bdev);
 
@@ -702,6 +714,17 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         is_cloned = true;
         is_fsync = requires_fsync(bio);
         bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
+
+        bio_data = alloc_bio_data(device);
+        bio_data->device = device;
+        bio_data->bio_src = bio;
+        bio_data->is_fsync = is_fsync;
+
+        // Encrypt
+        enc_or_dec_bio(bio_data, WRITE);
+        bio->bi_iter.bi_sector = original_sector;
+        bio->bi_iter.bi_size = original_size;
+        bio->bi_iter.bi_idx = original_idx;
 
         // Create the network clone
         deep_clone = deep_bio_clone(device, bio);
@@ -720,12 +743,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         shallow_clone->bi_end_io = leader_disk_end_io;
 
         // Set shared data between clones
-        bio_data = alloc_bio_data(device);
-        bio_data->device = device;
-        bio_data->bio_src = bio;
         bio_data->shallow_clone = shallow_clone;
         bio_data->deep_clone = deep_clone;
-        bio_data->is_fsync = is_fsync;
+        
         atomic_set(&bio_data->ref_counter, 2);
         INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
         deep_clone->bi_private = bio_data;
@@ -760,6 +780,83 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
     // Anything we clone and submit ourselves is marked submitted
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
+}
+
+inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
+    return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+}
+
+inline unsigned char *iv_index(struct bio_data *bio_data, sector_t index) {
+    return &bio_data->device->checksums[index * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
+}
+
+int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
+    int ret;
+    struct bio_vec bv;
+    uint64_t curr_sector;
+    struct aead_request *req;
+    req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
+    if (!req) {
+        printk(KERN_ERR "aead request allocation failed");
+        return -ENOMEM;
+    }
+    while (bio_data->bio_src->bi_iter.bi_size) {
+        // printk(KERN_INFO "enc/dec starting");
+        struct scatterlist sg[4]; // TODO: Move this outside
+        curr_sector = bio_data->bio_src->bi_iter.bi_sector;
+        // TODO: Reuse completion, declare wait outside
+        DECLARE_CRYPTO_WAIT(wait);
+        bv = bio_iter_iovec(bio_data->bio_src, bio_data->bio_src->bi_iter);
+
+        // Skip checksum for any block that has not been written to
+        if (enc_or_dec == READ && *checksum_index(bio_data, curr_sector) == 0) {
+            aead_request_free(req);
+            return 0;
+        }
+        
+        // TODO: Randomly generate IVs and don't hardcode
+        // Set up scatterlist to encrypt/decrypt
+        memcpy(iv_index(bio_data, curr_sector), "123456789012", AES_GCM_IV_SIZE);
+        sg_init_table(sg, 4);
+        sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
+        sg_set_buf(&sg[1], iv_index(bio_data, curr_sector), AES_GCM_IV_SIZE);
+        sg_set_page(&sg[2], bv.bv_page, SECTOR_SIZE, bv.bv_offset); // TODO: change size if we're doing it by page
+        sg_set_buf(&sg[3], checksum_index(bio_data, curr_sector), AES_GCM_AUTH_SIZE);
+        // TODO: If we're encrypting, return checksum and iv index, and only modify later in atomic context
+
+        // /* AEAD request:
+        //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
+        //  *  | (authenticated) | (auth+encryption) |              |
+        //  *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
+        //  */
+        aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+        // sector + iv size
+        aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
+        switch (enc_or_dec) {
+            case WRITE:
+                aead_request_set_crypt(req, sg, sg, SECTOR_SIZE, iv_index(bio_data, curr_sector)); // TODO: Adjust for sector size
+                ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+                break;
+            case READ:
+                aead_request_set_crypt(req, sg, sg, SECTOR_SIZE + AES_GCM_AUTH_SIZE, iv_index(bio_data, curr_sector)); // TODO: Adjust sector size
+                ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+                break;
+        }
+
+        if (ret) {
+            if (ret == -EBADMSG) {
+                printk(KERN_ERR "invalid integrity check");
+            } else {
+                printk_ratelimited(KERN_ERR "encryption/decryption failed with error code %d", ret);
+            }
+            aead_request_free(req);
+            return ret;
+        }
+        // TODO: Adjust sector size
+        bio_advance_iter(bio_data->bio_src, &bio_data->bio_src->bi_iter, SECTOR_SIZE);
+    }
+    aead_request_free(req);
+    return 0;
 }
 
 void kill_thread(struct socket *sock) {
@@ -1354,6 +1451,29 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         start_client_to_server(device, argv[i], port);
     }
 
+    // Set up AEAD
+    device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+    if (IS_ERR(device->tfm)) {
+        printk(KERN_ERR "Error allocating AEAD");
+        return PTR_ERR(device->tfm);
+    }
+    crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
+
+    // TODO: Accept key as input
+    device->key = "1234567890123456";
+    error = crypto_aead_setkey(device->tfm, device->key, KEY_SIZE);
+    if (error < 0) {
+        printk(KERN_ERR "Error setting key");
+        return error;
+    }
+
+    // TODO: Change size from ti->len based on whether we're encryption by sector or page
+    device->checksums = kvmalloc_array(ti->len, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    if (device->checksums == NULL) {
+        printk(KERN_ERR "Error allocating checksums");
+        return -ENOMEM;
+    }
+
 #ifdef MEMORY_TRACKING
     atomic_set(&device->num_bio_data_not_freed, 0);
     atomic_set(&device->num_bio_pages_not_freed, 0);
@@ -1410,6 +1530,8 @@ static void rollbaccine_destructor(struct dm_target *ti) {
         kfree(curr);
     }
 
+    kvfree(device->checksums);
+    crypto_free_aead(device->tfm);
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
     destroy_workqueue(device->broadcast_queue);
     dm_put_device(ti, device->dev);

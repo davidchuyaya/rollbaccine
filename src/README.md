@@ -302,6 +302,15 @@ sudo mkfs.ext4 /dev/mapper/passthrough
 sudo mount /dev/mapper/passthrough /mnt
 ```
 
+### Rollbaccine
+```bash
+sudo modprobe brd rd_nr=2 rd_size=1048576
+sudo insmod rollbaccine.ko
+echo "0 `sudo blockdev --getsz /dev/ram0` rollbaccine /dev/ram0 1 2 0 true 12340" | sudo dmsetup create rollbaccine1
+echo "0 `sudo blockdev --getsz /dev/ram1` rollbaccine /dev/ram1 1 2 1 false 12350 127.0.0.1 12340" | sudo dmsetup create rollbaccine2
+sudo fio --filename=/dev/mapper/rollbaccine1 --readwrite=readwrite --bs=4k --direct=1 --loops=10 --name=rollbaccine
+```
+
 
 ## Testing writes/reads to block device
 We will use `fio` to benchmark performance, as seen in [Benchmarking](#benchmarking). However, `fio` is not ideal for testing to see if a block device works, because it will multiple threads that spam a block device with writes and reads. To see if a block device can handle small individual reads and writes, use [device_tester.c](src/tools/device_tester.c).
