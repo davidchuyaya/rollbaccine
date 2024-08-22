@@ -266,7 +266,6 @@ block:
 void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
     struct bio_sector_range *other_bio_sector_range;
-    struct bio_data *other_bio_data;
 
     spin_lock(&device->index_lock);
 #ifdef MEMORY_TRACKING
@@ -282,6 +281,7 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
     device->processing_pending_ops = true;
     while (!list_empty(&device->pending_ops)) {
         other_bio_sector_range = list_first_entry(&device->pending_ops, struct bio_sector_range, list);
+        list_del(&other_bio_sector_range->list);
         // Check, in order, if the first pending op can be executed. If not, then break
         if (!try_insert_into_outstanding_ops(device, other_bio_sector_range->shallow_clone)) {
             kfree(other_bio_sector_range);  // Free this range, because the try function will alloc another range on failure
@@ -291,15 +291,13 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
 #endif
             break;
         }
-        other_bio_data = other_bio_sector_range->shallow_clone->bi_private;
 
         // Submit the other bio without holding the spinlock, since the other bio could then finish, and attempt to call this function, causing deadlock
         spin_unlock(&device->index_lock);
-        submit_bio_noacct(other_bio_data->shallow_clone);
+        submit_bio_noacct(other_bio_sector_range->shallow_clone);
         spin_lock(&device->index_lock);
 
         // Remove the other bio
-        list_del(&other_bio_sector_range->list);
         kfree(other_bio_sector_range);
 #ifdef MEMORY_TRACKING
         device->num_bio_sector_ranges -= 1;
@@ -540,6 +538,8 @@ void disk_end_io(struct bio *shallow_clone) {
 void leader_read_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
     struct rollbaccine_device *device = bio_data->device;
+
+    disk_end_io(shallow_clone);
     // Decrypt
     enc_or_dec_bio(bio_data, READ);
     // Return to user
@@ -794,11 +794,6 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
                 queue_work(device->broadcast_queue, &bio_data->broadcast_work);
                 spin_unlock(&device->index_lock);
-
-                // Even though submit order != write index order, any conflicting writes will only be submitted later so it's ok.
-                if (doesnt_conflict_with_other_writes) {
-                    submit_bio_noacct(shallow_clone);
-                }
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
@@ -810,9 +805,17 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // Set end_io so once this cloned read completes, we can decrypt and send the original read along
                 shallow_clone->bi_end_io = leader_read_disk_end_io;
                 shallow_clone->bi_private = bio_data;
-                // TODO: Block until read no longer conflicts
-                submit_bio_noacct(shallow_clone);
+
+                // Block read if it conflicts with any other outstanding operations
+                spin_lock(&device->index_lock);
+                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, shallow_clone);
+                spin_unlock(&device->index_lock);
                 break;
+        }
+
+        // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
+        if (doesnt_conflict_with_other_writes) {
+            submit_bio_noacct(shallow_clone);
         }
     }
 
