@@ -184,7 +184,8 @@ unsigned int remove_fsync_flags(unsigned int bio_opf);
 void free_pages_end_io(struct bio *received_bio);
 void try_free_clones(struct bio *clone);
 void disk_end_io(struct bio *shallow_clone);
-void leader_disk_end_io(struct bio *shallow_clone);
+void leader_write_disk_end_io(struct bio *shallow_clone);
+void leader_read_disk_end_io(struct bio *shallow_clone);
 void replica_disk_end_io(struct bio *received_bio);
 void network_end_io(struct bio *deep_clone);
 void broadcast_bio(struct work_struct *work);
@@ -536,7 +537,26 @@ void disk_end_io(struct bio *shallow_clone) {
     remove_from_outstanding_ops_and_unblock(device, shallow_clone);
 }
 
-void leader_disk_end_io(struct bio *shallow_clone) {
+void leader_read_disk_end_io(struct bio *shallow_clone) {
+    struct bio_data *bio_data = shallow_clone->bi_private;
+    struct rollbaccine_device *device = bio_data->device;
+    // Decrypt
+    enc_or_dec_bio(bio_data, READ);
+    // Return to user
+    bio_endio(bio_data->bio_src);
+
+    // Free shallow clone and bio_data
+#ifdef MEMORY_TRACKING
+    int num_shallow_clones = atomic_dec_return(&bio_data->device->num_shallow_clones_not_freed);
+    atomic_max(&bio_data->device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
+    int num_bio_data = atomic_dec_return(&device->num_bio_data_not_freed);
+    atomic_max(&device->max_outstanding_num_bio_data, num_bio_data + 1);
+#endif
+    bio_put(shallow_clone);
+    kmem_cache_free(device->bio_data_cache, bio_data);
+}
+
+void leader_write_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
     // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
     disk_end_io(shallow_clone);
@@ -559,6 +579,7 @@ void network_end_io(struct bio *deep_clone) {
 }
 
 void broadcast_bio(struct work_struct *work) {
+    //TODO: Also send hashes & IVs
     int sent;
     struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
     struct bio *clone = clone_bio_data->deep_clone;
@@ -703,80 +724,97 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     struct rollbaccine_device *device = ti->private;
     struct bio *deep_clone, *shallow_clone;  // deep clone is for the network, shallow clone is for submission to disk when necessary
     struct bio_data *bio_data;
+    // For encryption so we can reset the write to the beginning of the block when we are done
     sector_t original_sector = bio->bi_iter.bi_sector;
     unsigned int original_size = bio->bi_iter.bi_size;
     unsigned int original_idx = bio->bi_iter.bi_idx;
 
     bio_set_dev(bio, device->dev->bdev);
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Copy bio if it's a write
-    if (device->is_leader && bio_data_dir(bio) == WRITE) {
+    if (device->is_leader) {
         is_cloned = true;
-        is_fsync = requires_fsync(bio);
-        bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
 
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->bio_src = bio;
-        bio_data->is_fsync = is_fsync;
-
-        // Encrypt
-        enc_or_dec_bio(bio_data, WRITE);
-        bio->bi_iter.bi_sector = original_sector;
-        bio->bi_iter.bi_size = original_size;
-        bio->bi_iter.bi_idx = original_idx;
-
-        // Create the network clone
-        deep_clone = deep_bio_clone(device, bio);
-        if (!deep_clone) {
-            printk(KERN_ERR "Could not create deep clone");
-            return DM_MAPIO_REMAPPED;
-        }
-
-        // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
-        shallow_clone = shallow_bio_clone(device, deep_clone);
-        if (!shallow_clone) {
-            printk(KERN_ERR "Could not create shallow clone");
-            return DM_MAPIO_REMAPPED;
-        }
-        // Set end_io so once this write completes, queued writes can be unblocked
-        shallow_clone->bi_end_io = leader_disk_end_io;
-
-        // Set shared data between clones
-        bio_data->shallow_clone = shallow_clone;
-        bio_data->deep_clone = deep_clone;
         
-        atomic_set(&bio_data->ref_counter, 2);
-        INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
-        deep_clone->bi_private = bio_data;
-        shallow_clone->bi_private = bio_data;
+        switch (bio_data_dir(bio)) {
+            case WRITE:
+                is_fsync = requires_fsync(bio);
+                bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
 
-        // Increment indices, place ops on queue, submit cloned ops to disk
-        spin_lock(&device->index_lock);
-        // Increment write index
-        bio_data->write_index = ++device->write_index;
-        doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, shallow_clone);
-        // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
-        if (is_fsync) {
-            // Add original bio to fsyncs blocked on replication
-            bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
-            spin_lock(&device->replica_fsync_lock);
-            bio_list_add(&device->fsyncs_pending_replication, bio);
+                // Encrypt
+                enc_or_dec_bio(bio_data, WRITE);
+                bio->bi_iter.bi_sector = original_sector;
+                bio->bi_iter.bi_size = original_size;
+                bio->bi_iter.bi_idx = original_idx;
+
+                // Create the network clone
+                deep_clone = deep_bio_clone(device, bio);
+                if (!deep_clone) {
+                    printk(KERN_ERR "Could not create deep clone");
+                    return DM_MAPIO_REMAPPED;
+                }
+
+                // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
+                shallow_clone = shallow_bio_clone(device, deep_clone);
+                if (!shallow_clone) {
+                    printk(KERN_ERR "Could not create shallow clone");
+                    return DM_MAPIO_REMAPPED;
+                }
+                // Set end_io so once this write completes, queued writes can be unblocked
+                shallow_clone->bi_end_io = leader_write_disk_end_io;
+
+                // Set shared data between clones
+                bio_data->shallow_clone = shallow_clone;
+                bio_data->deep_clone = deep_clone;
+                bio_data->is_fsync = is_fsync;
+                atomic_set(&bio_data->ref_counter, 2);
+                INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
+                deep_clone->bi_private = bio_data;
+                shallow_clone->bi_private = bio_data;
+
+                // Increment indices, place ops on queue, submit cloned ops to disk
+                spin_lock(&device->index_lock);
+                // Increment write index
+                bio_data->write_index = ++device->write_index;
+                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, shallow_clone);
+                // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
+                if (is_fsync) {
+                    // Add original bio to fsyncs blocked on replication
+                    bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
+                    spin_lock(&device->replica_fsync_lock);
+                    bio_list_add(&device->fsyncs_pending_replication, bio);
 #ifdef MEMORY_TRACKING
-            device->num_fsyncs_pending_replication += 1;
+                    device->num_fsyncs_pending_replication += 1;
 #endif
-            spin_unlock(&device->replica_fsync_lock);
-        }
-        queue_work(device->broadcast_queue, &bio_data->broadcast_work);
-        spin_unlock(&device->index_lock);
+                    spin_unlock(&device->replica_fsync_lock);
+                }
+                queue_work(device->broadcast_queue, &bio_data->broadcast_work);
+                spin_unlock(&device->index_lock);
 
-        // Even though submit order != write index order, any conflicting writes will only be submitted later so it's ok.
-        if (doesnt_conflict_with_other_writes) {
-            submit_bio_noacct(shallow_clone);
+                // Even though submit order != write index order, any conflicting writes will only be submitted later so it's ok.
+                if (doesnt_conflict_with_other_writes) {
+                    submit_bio_noacct(shallow_clone);
+                }
+                break;
+            case READ:
+                // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
+                shallow_clone = shallow_bio_clone(device, bio);
+                if (!shallow_clone) {
+                    printk(KERN_ERR "Could not create shallow clone");
+                    return DM_MAPIO_REMAPPED;
+                }
+                // Set end_io so once this cloned read completes, we can decrypt and send the original read along
+                shallow_clone->bi_end_io = leader_read_disk_end_io;
+                shallow_clone->bi_private = bio_data;
+                // TODO: Block until read no longer conflicts
+                submit_bio_noacct(shallow_clone);
+                break;
         }
     }
-
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
     // Anything we clone and submit ourselves is marked submitted
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
