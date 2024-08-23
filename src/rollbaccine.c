@@ -40,6 +40,9 @@
 // #define MULTITHREADED_NETWORK
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 
+// Used to compare against checksums to see if they have been set yet (or if they're all 0)
+static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
+
 // TODO: Expand with protocol message types
 enum MsgType { ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, FOLLOWER_ACK };
 
@@ -211,6 +214,10 @@ int listen_for_connections(void *args);
 int start_server(struct rollbaccine_device *device, ushort port);
 int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
+
+inline bool has_checksum(unsigned char *checksum) {
+    return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
+}
 
 inline unsigned char *global_checksum(struct rollbaccine_device *device, sector_t sector) {
     return &device->checksums[sector * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
@@ -586,9 +593,10 @@ void leader_read_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
     struct rollbaccine_device *device = bio_data->device;
 
-    disk_end_io(shallow_clone);
     // Decrypt
     enc_or_dec_bio(bio_data, READ);
+    // Unblock pending writes
+    disk_end_io(shallow_clone);
     // Return to user
     bio_endio(bio_data->bio_src);
 
@@ -924,8 +932,8 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
             case READ:
                 checksum = global_checksum(bio_data->device, curr_sector);
                 iv = global_iv(bio_data->device, curr_sector);
-                // Skip checksum for any block that has not been written to
-                if (*checksum == 0) {
+                // Skip decryption for any block that has not been written to
+                if (!has_checksum(checksum)) {
                     goto enc_or_dec_next_sector;
                 }
                 break;
