@@ -125,10 +125,8 @@ In order for VSCode to understand Linux kernel headers, we will follow instructi
 cd rollbaccine
 rm -rf .vscode
 git clone https://github.com/amezin/vscode-linux-kernel .vscode
-python3 .vscode/generate_compdb.py -O /lib/modules/6.8.0-38-generic/build $PWD
+python3 .vscode/generate_compdb.py -O /lib/modules/$(uname -r)/build $PWD
 ```
-
-Replace `6.8.0-38-generic` with the output of `uname -r` on the VM.
 
 
 ### Setting up the VM
