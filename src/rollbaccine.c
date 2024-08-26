@@ -111,7 +111,6 @@ struct rollbaccine_device {
 
     // AEAD
     struct crypto_aead *tfm;
-    char *key;
     char *checksums;
 
     // Counters for tracking memory usage
@@ -1544,7 +1543,8 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader. 5 = listen port. 6+ = server addr & ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = key, 6 = listen port. 7+ = server addr & ports
+// Note: Keys on the replicas are not used, since they cannot encrypt or decrypt
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
     ushort port;
@@ -1615,7 +1615,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->is_leader = strcmp(argv[4], "true") == 0;
 
     // Start server
-    error = kstrtou16(argv[5], 10, &port);
+    error = kstrtou16(argv[6], 10, &port);
     if (error < 0) {
         printk(KERN_ERR "Error parsing port");
         return error;
@@ -1630,9 +1630,9 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
 
-    // Connect to other servers. argv[6], argv[7], etc are all server addresses and ports to connect to.
+    // Connect to other servers. argv[7], argv[8], etc are all server addresses and ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
-    for (i = 6; i < argc; i += 2) {
+    for (i = 7; i < argc; i += 2) {
         error = kstrtou16(argv[i + 1], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
@@ -1650,9 +1650,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
     crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
 
-    // TODO: Accept key as input
-    device->key = "1234567890123456";
-    error = crypto_aead_setkey(device->tfm, device->key, KEY_SIZE);
+    error = crypto_aead_setkey(device->tfm, argv[5], KEY_SIZE);
     if (error < 0) {
         printk(KERN_ERR "Error setting key");
         return error;
