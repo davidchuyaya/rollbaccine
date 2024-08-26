@@ -948,6 +948,9 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
             case WRITE:
                 checksum = get_bio_checksum(bio_checksum_and_iv, start_sector, curr_sector);
                 iv = get_bio_iv(bio_checksum_and_iv, start_sector, curr_sector);
+                // Generate a new IV
+                // TODO: Maybe use RDRAND?
+                get_random_bytes(iv, AES_GCM_IV_SIZE);
                 break;
             case READ:
                 checksum = global_checksum(bio_data->device, curr_sector);
@@ -959,10 +962,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
                 break;
         }
 
-        
-        // TODO: Randomly generate IVs and don't hardcode
         // Set up scatterlist to encrypt/decrypt
-        memcpy(iv, "123456789012", AES_GCM_IV_SIZE);
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
         sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
@@ -1748,6 +1748,8 @@ static struct target_type rollbaccine_target = {
 
 int __init rollbaccine_init_module(void) {
     int r = dm_register_target(&rollbaccine_target);
+    // Only start if the RNG has been seeded
+    wait_for_random_bytes();
     printk(KERN_INFO "rollbaccine module loaded");
     return r;
 }
