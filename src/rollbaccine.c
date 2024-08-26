@@ -19,6 +19,7 @@
 #include <linux/module.h>
 #include <linux/scatterlist.h>
 #include <linux/tcp.h>
+#include <linux/timex.h>
 #include <linux/vmalloc.h>
 #include <net/handshake.h>  // For TLS
 #include <net/sock.h>
@@ -39,6 +40,7 @@
 #define TLS_ON
 // #define MULTITHREADED_NETWORK
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
+// #define LATENCY_TRACKING
 
 // Used to compare against checksums to see if they have been set yet (or if they're all 0)
 static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
@@ -176,6 +178,7 @@ struct listen_thread_params {
     struct rollbaccine_device *device;
 };
 
+void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
 // Returns true if the insert was successful, false if there's a conflict
 bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *shallow_clone); 
 void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *shallow_clone);
@@ -248,6 +251,22 @@ inline void update_global_checksum_and_iv(struct rollbaccine_device *device, uns
         memcpy(global_checksum(device, curr_sector), get_bio_checksum(checksum_and_iv, start_sector, curr_sector), AES_GCM_AUTH_SIZE);
         memcpy(global_iv(device, curr_sector), get_bio_iv(checksum_and_iv, start_sector, curr_sector), AES_GCM_IV_SIZE);
     }
+}
+
+inline cycles_t get_cycles_if_flag_on(void) {
+#ifdef LATENCY_TRACKING
+    return get_cycles();
+#else
+    return 0;
+#endif
+}
+
+void print_and_update_latency(char *text, cycles_t *prev_time) {
+#ifdef LATENCY_TRACKING
+    cycles_t curr_time = get_cycles_if_flag_on();
+    printk(KERN_INFO "%s: %llu cycles", text, curr_time - *prev_time);
+    *prev_time = get_cycles_if_flag_on();
+#endif
 }
 
 // Note: Caller must hold index_lock
@@ -651,6 +670,8 @@ void broadcast_bio(struct work_struct *work) {
     struct metadata_msg metadata;
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
+    cycles_t time = get_cycles_if_flag_on();
+    cycles_t total_time = get_cycles_if_flag_on();
 
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
     metadata.bal = device->bal;
@@ -676,6 +697,7 @@ void broadcast_bio(struct work_struct *work) {
     list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
+        print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
 
         // 1. Send metadata
         // Keep retrying send until the whole message is sent
@@ -690,6 +712,7 @@ void broadcast_bio(struct work_struct *work) {
                 vec.iov_len -= sent;
             }
         }
+        print_and_update_latency("broadcast_bio: Send metadata", &time);
 
         // 2. Send hash & IVs
         vec.iov_base = checksum_and_iv;
@@ -705,6 +728,7 @@ void broadcast_bio(struct work_struct *work) {
                 vec.iov_len -= sent;
             }
         }
+        print_and_update_latency("broadcast_bio: Send checksums and IVs", &time);
 
         bio_for_each_segment(bvec, clone, iter) {
 
@@ -726,6 +750,7 @@ void broadcast_bio(struct work_struct *work) {
                 }
             }
         }
+        print_and_update_latency("broadcast_bio: Send pages", &time);
         // Label to jump to if socket cannot be written to, so we can iterate the next socket
     finish_sending_to_socket:
     }
@@ -733,6 +758,7 @@ void broadcast_bio(struct work_struct *work) {
     mutex_unlock(&device->connected_sockets_lock);
 
     network_end_io(clone);
+    print_and_update_latency("broadcast_bio: Broadcast bio", &total_time);
 }
 
 struct bio *shallow_bio_clone(struct rollbaccine_device *device, struct bio *bio_src) {
@@ -755,6 +781,7 @@ struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_sr
     struct bio_vec bvec;
     struct bvec_iter iter;
     struct page *page;
+    cycles_t time = get_cycles_if_flag_on();
 
     // Note: If bi_size is not a multiple of PAGE_SIZE, we have a BIG problem :(
     clone = bio_alloc_bioset(bio_src->bi_bdev, bio_src->bi_iter.bi_size / PAGE_SIZE, bio_src->bi_opf, GFP_NOIO, &device->bs);
@@ -784,6 +811,7 @@ struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_sr
 
         __bio_add_page(clone, page, bvec.bv_len, 0);
     }
+    print_and_update_latency("deep_bio_clone", &time);
     return clone;
 }
 
@@ -799,6 +827,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     sector_t original_sector = bio->bi_iter.bi_sector;
     unsigned int original_size = bio->bi_iter.bi_size;
     unsigned int original_idx = bio->bi_iter.bi_idx;
+    cycles_t total_time = get_cycles_if_flag_on();
+    cycles_t time = get_cycles_if_flag_on();
 
     bio_set_dev(bio, device->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
@@ -818,6 +848,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 // Encrypt
                 bio_checksum_and_iv = enc_or_dec_bio(bio_data, WRITE);
+                print_and_update_latency("rollbaccine_map: encryption", &time);
                 bio->bi_iter.bi_sector = original_sector;
                 bio->bi_iter.bi_size = original_size;
                 bio->bi_iter.bi_idx = original_idx;
@@ -850,6 +881,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 // Increment indices, place ops on queue, submit cloned ops to disk
                 spin_lock(&device->index_lock);
+                print_and_update_latency("rollbaccine_map: encryption -> obtained index lock", &time);
                 // Increment write index
                 bio_data->write_index = ++device->write_index;
                 doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, shallow_clone);
@@ -858,6 +890,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                     // Add original bio to fsyncs blocked on replication
                     bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
                     spin_lock(&device->replica_fsync_lock);
+                    print_and_update_latency("rollbaccine_map: index lock -> obtained replica fsync lock", &time);
                     bio_list_add(&device->fsyncs_pending_replication, bio);
 #ifdef MEMORY_TRACKING
                     device->num_fsyncs_pending_replication += 1;
@@ -865,6 +898,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                     spin_unlock(&device->replica_fsync_lock);
                 }
                 queue_work(device->broadcast_queue, &bio_data->broadcast_work);
+                print_and_update_latency("rollbaccine_map: queued to broadcast", &time);
                 spin_unlock(&device->index_lock);
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
@@ -873,6 +907,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                         update_global_checksum_and_iv(device, bio_checksum_and_iv, original_sector, bio_sectors(bio));
                     }
                     submit_bio_noacct(shallow_clone);
+                    print_and_update_latency("rollbaccine_map: submit", &time);
                 }
                 break;
             case READ:
@@ -897,6 +932,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 break;
         }
     }
+    print_and_update_latency("rollbaccine_map", &total_time);
 
     // Anything we clone and submit ourselves is marked submitted
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
@@ -912,15 +948,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     unsigned char *bio_checksum_and_iv;
     unsigned char *iv;
     unsigned char *checksum;
+    cycles_t time = get_cycles_if_flag_on();
+    cycles_t total_time = get_cycles_if_flag_on();
 
     if (bio_sectors(bio_data->bio_src) == 0) {
         // printk(KERN_INFO "Skipping encryption/decryption for empty bio");
-        return NULL;
-    }
-
-    req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
-    if (!req) {
-        printk(KERN_ERR "aead request allocation failed");
         return NULL;
     }
 
@@ -934,6 +966,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
             printk(KERN_ERR "Could not allocate checksum and iv for bio");
             goto free_and_return;
         }
+        print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
 
         start_sector = bio_data->bio_src->bi_iter.bi_sector;
     }
@@ -947,9 +980,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
             case WRITE:
                 checksum = get_bio_checksum(bio_checksum_and_iv, start_sector, curr_sector);
                 iv = get_bio_iv(bio_checksum_and_iv, start_sector, curr_sector);
+                print_and_update_latency("enc_or_dec_bio: get bio checksum and iv", &time);
                 // Generate a new IV
                 // TODO: Maybe use RDRAND?
                 get_random_bytes(iv, AES_GCM_IV_SIZE);
+                print_and_update_latency("enc_or_dec_bio: get_random_bytes", &time);
                 break;
             case READ:
                 checksum = global_checksum(bio_data->device, curr_sector);
@@ -959,6 +994,16 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
                     goto enc_or_dec_next_sector;
                 }
                 break;
+        }
+
+        // Lazily allocate the AEAD request, because a lot of reads are over blocks that have not been written to (so they will not pass !has_checksum and won't need to alloc)
+        if (req == NULL) {
+            req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
+            if (!req) {
+                printk(KERN_ERR "aead request allocation failed");
+                return NULL;
+            }
+            print_and_update_latency("enc_or_dec_bio: aead_request_alloc", &time);
         }
 
         // Set up scatterlist to encrypt/decrypt
@@ -986,6 +1031,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
                 ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
                 break;
         }
+        print_and_update_latency("enc_or_dec_bio: crypto_aead_encrypt/decrypt", &time);
 
         if (ret) {
             if (ret == -EBADMSG) {
@@ -1003,6 +1049,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
 
     free_and_return:
     aead_request_free(req);
+    print_and_update_latency("enc_or_dec_bio", &total_time);
     return bio_checksum_and_iv; // NOTE: This will be NULL for reads
 }
 
