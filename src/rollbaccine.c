@@ -239,6 +239,10 @@ inline unsigned char *get_bio_iv(unsigned char *checksum_and_iv, sector_t start_
     return &checksum_and_iv[(current_sector - start_sector) * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
 }
 
+inline size_t bio_checksum_and_iv_size(int num_sectors) {
+    return num_sectors * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
+}
+
 inline void update_global_checksum_and_iv(struct rollbaccine_device *device, unsigned char *checksum_and_iv, sector_t start_sector, int num_sectors) {
     sector_t curr_sector;
     for (curr_sector = start_sector; curr_sector < start_sector + num_sectors; curr_sector += ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE) {
@@ -637,10 +641,10 @@ void network_end_io(struct bio *deep_clone) {
 }
 
 void broadcast_bio(struct work_struct *work) {
-    //TODO: Also send hashes & IVs
     int sent;
     struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
     struct bio *clone = clone_bio_data->deep_clone;
+    unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
     struct rollbaccine_device *device = clone_bio_data->device;
     struct msghdr msg_header;
     struct kvec vec;
@@ -688,8 +692,22 @@ void broadcast_bio(struct work_struct *work) {
             }
         }
 
+        // 2. Send hash & IVs
+        vec.iov_base = checksum_and_iv;
+        vec.iov_len = bio_checksum_and_iv_size(bio_sectors(clone));
+        while (vec.iov_len > 0) {
+            // printk(KERN_INFO "Sending checksums and IVs, size: %lu", vec.iov_len);
+            sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
+            if (sent <= 0) {
+                printk(KERN_ERR "Error broadcasting checksums and IVs");
+                goto finish_sending_to_socket;
+            } else {
+                vec.iov_base += sent;
+                vec.iov_len -= sent;
+            }
+        }
+
         bio_for_each_segment(bvec, clone, iter) {
-            // TODO 2. Send hash
 
             // 3. Send bios
             // Note: Replaced with bvec_set_page() in newer kernel versions
@@ -857,7 +875,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
                 if (doesnt_conflict_with_other_writes) {
-                    update_global_checksum_and_iv(device, bio_checksum_and_iv, original_sector, bio_sectors(bio));
+                    if (bio_checksum_and_iv != NULL) {
+                        update_global_checksum_and_iv(device, bio_checksum_and_iv, original_sector, bio_sectors(bio));
+                    }
                     submit_bio_noacct(shallow_clone);
                 }
                 break;
@@ -898,6 +918,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     unsigned char *bio_checksum_and_iv;
     unsigned char *iv;
     unsigned char *checksum;
+
+    if (bio_sectors(bio_data->bio_src) == 0) {
+        // printk(KERN_INFO "Skipping encryption/decryption for empty bio");
+        return NULL;
+    }
 
     req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
     if (!req) {
@@ -948,7 +973,6 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
         sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
         sg_set_page(&sg[2], bv.bv_page, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
         sg_set_buf(&sg[3], checksum, AES_GCM_AUTH_SIZE);
-        // TODO: If we're encrypting, return checksum and iv index, and only modify later in atomic context
 
         // /* AEAD request:
         //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
@@ -998,12 +1022,14 @@ void kill_thread(struct socket *sock) {
 // Function used by all listening sockets to block and listen to messages
 void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     struct metadata_msg metadata;
+    unsigned char *bio_checksum_and_iv;
     struct bio *received_bio;
     struct bio_data *bio_data;
     struct page *page;
     struct msghdr msg_header;
     struct kvec vec;
-    int sent, received, i;
+    int sent, received, i, num_sectors;
+    size_t checksum_and_iv_size;
 #ifdef TLS_ON
     union {
         struct cmsghdr cmsg;
@@ -1071,6 +1097,40 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         received_bio->bi_private = bio_data;
 
         // 2. Expect hash next
+        if (metadata.num_pages != 0) {
+            num_sectors = metadata.num_pages * PAGE_SIZE / SECTOR_SIZE;
+            checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
+            bio_checksum_and_iv = alloc_bio_checksum_and_iv(num_sectors);
+            vec.iov_base = bio_checksum_and_iv;
+            vec.iov_len = checksum_and_iv_size;
+
+            // printk(KERN_INFO "Receiving checksums and IVs, size: %lu", vec.iov_len);
+            received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+            if (received <= 0) {
+                printk(KERN_ERR "Error reading checksum and IV, %d", received);
+                break;
+            }
+
+#ifdef TLS_ON
+            // Handle the TLS control messages.
+            if (msg_header.msg_controllen != sizeof(u)) {
+                switch (tls_get_record_type(sock->sk, &u.cmsg)) {
+                    case 0:
+                        fallthrough;
+                    case TLS_RECORD_TYPE_DATA:
+                        // printk(KERN_INFO "We got some TLS control msg but it's all good");
+                        break;
+                    case TLS_RECORD_TYPE_ALERT:
+                        printk(KERN_ERR "TLS alert received. Uhoh.");
+                        break;
+                    default:
+                        break;
+                }
+            }
+#endif
+            bio_data->checksum_and_iv = bio_checksum_and_iv;
+        }
+
         // 3. Receive pages of bio
         for (i = 0; i < metadata.num_pages; i++) {
             page = page_cache_alloc(device);
@@ -1129,7 +1189,9 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
 
         // 6. Submit bio, if there are no conflicts. Otherwise blocks and waits for a finished bio to unblock it.
         if (try_insert_into_outstanding_ops(device, received_bio)) {
-            // TODO: Get checksum and IV and update global
+            if (metadata.num_pages != 0) {
+                update_global_checksum_and_iv(device, bio_checksum_and_iv, metadata.sector, num_sectors);
+            }
             submit_bio_noacct(received_bio);
         }
     }
