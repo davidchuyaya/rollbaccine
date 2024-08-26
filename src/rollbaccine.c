@@ -710,16 +710,11 @@ void broadcast_bio(struct work_struct *work) {
         bio_for_each_segment(bvec, clone, iter) {
 
             // 3. Send bios
-            // Note: Replaced with bvec_set_page() in newer kernel versions
-            // Note: I'm not really sure if the length is always actually page size. If not, then we have a problem on the receiver
-            chunked_bvec.bv_page = bvec.bv_page;
-            chunked_bvec.bv_offset = bvec.bv_offset;
-            chunked_bvec.bv_len = bvec.bv_len;
+            bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
 
             // Keep retrying send until the whole message is sent
             while (chunked_bvec.bv_len > 0) {
-                // Note: Replaced WRITE with ITER_SOURCE in newer kernel versions
-                iov_iter_bvec(&msg_header.msg_iter, WRITE, &chunked_bvec, 1, chunked_bvec.bv_len);
+                iov_iter_bvec(&msg_header.msg_iter, ITER_SOURCE, &chunked_bvec, 1, chunked_bvec.bv_len);
 
                 sent = sock_sendmsg(curr->sock, &msg_header);
                 if (sent <= 0) {
@@ -1101,6 +1096,9 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
             num_sectors = metadata.num_pages * PAGE_SIZE / SECTOR_SIZE;
             checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
             bio_checksum_and_iv = alloc_bio_checksum_and_iv(num_sectors);
+#ifdef MEMORY_TRACKING
+            atomic_inc(&device->num_checksum_and_ivs);
+#endif
             vec.iov_base = bio_checksum_and_iv;
             vec.iov_len = checksum_and_iv_size;
 
