@@ -98,6 +98,7 @@ ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_1 "bash -s" -- < install_ro
 
 echo "You should now ssh into the servers and launch rollbaccine:"
 echo "ssh $USERNAME@$PUBLIC_IP_0"
+echo "sudo umount /dev/sdb1"
 echo "cd rollbaccine/src"
 echo "sudo insmod rollbaccine.ko"
 echo 'echo "0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 0 true abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1'

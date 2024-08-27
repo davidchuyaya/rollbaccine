@@ -845,7 +845,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         switch (bio_data_dir(bio)) {
             case WRITE:
                 is_fsync = requires_fsync(bio);
-                bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
+                // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
+                // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
 
                 // Encrypt
                 bio_checksum_and_iv = enc_or_dec_bio(bio_data, WRITE);
@@ -1707,15 +1708,11 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     checksum_and_iv_size = (unsigned long)(ti->len / ROLLBACCINE_SECTORS_PER_ENCRYPTION) * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
     printk(KERN_INFO "Checksums and IVs size: %lu", checksum_and_iv_size);
-    // printk(KERN_INFO "Num checksum pages to allocate: %d", 1 << get_order(checksum_and_iv_size));
-
-    // device->checksums = (unsigned char *) __get_free_pages(GFP_KERNEL | __GFP_ZERO, get_order(checksum_and_iv_size));
     device->checksums = vzalloc(checksum_and_iv_size);
     if (device->checksums == NULL) {
         printk(KERN_ERR "Error allocating checksums");
         return -ENOMEM;
     }
-    // projected_bytes_used += (unsigned long) PAGE_SIZE << get_order(checksum_and_iv_size);
     projected_bytes_used += checksum_and_iv_size;
 
 #ifdef MEMORY_TRACKING
