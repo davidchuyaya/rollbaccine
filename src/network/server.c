@@ -125,8 +125,7 @@ struct bio_data {
     struct rb_node tree_node;           // So this bio can be inserted into a tree
 };
 
-// For each bio that is placed on the pending_ops queue. Necessary to keep separate from bio_data because the bio may be submitted (and its bio_data deleted) before it is removed from the pending_ops
-// queue, in order to avoid deadlock. See the note on processing_pending_ops.
+// For each bio that is placed on the pending_ops queue. Necessary to keep separate from bio_data because the bio may be submitted (and its bio_data deleted) before it is removed from the pending_ops queue, in order to avoid deadlock. See the note on processing_pending_ops.
 struct bio_sector_range {
     sector_t start_sector;
     sector_t end_sector;
@@ -227,7 +226,7 @@ bool try_insert_into_outstanding_ops(struct server_device *device, struct bio *s
     rb_insert_color(&bio_data->tree_node, &device->outstanding_ops);
     return true;
 
-block:
+    block:
     // Add to pending list. Malloc a sector range
     sector_range = kmalloc(sizeof(struct bio_sector_range), GFP_KERNEL);
     if (!sector_range) {
@@ -355,7 +354,7 @@ void atomic_max(atomic_t *old, int new) {
     int old_val;
     do {
         old_val = atomic_read(old);
-    } while (old_val < new &&atomic_cmpxchg(old, old_val, new) != old_val);
+    } while (old_val < new && atomic_cmpxchg(old, old_val, new) != old_val);
 }
 
 // Semaphore down may return before it actually locks on the semaphore because of a signal. Retry.
@@ -1312,7 +1311,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     device->outstanding_ops = RB_ROOT;
     INIT_LIST_HEAD(&device->pending_ops);
     device->processing_pending_ops = false;
-
+    
     device->is_leader = strcmp(argv[4], "true") == 0;
 
     // Start server

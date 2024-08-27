@@ -47,6 +47,12 @@ static int passthrough_map(struct dm_target *ti, struct bio *bio) {
     bio_set_dev(bio, rbd->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
+    // Print flags on write
+    // if (bio_data_dir(bio) == WRITE) {
+    //     printk(KERN_INFO "WRITE to sector: %llu, flags: %u, opf: %u", bio->bi_iter.bi_sector, bio->bi_flags, bio->bi_opf);
+    // }
+    // printk(KERN_INFO "not WRITE to sector: %llu, flags: %u, opf: %u", bio->bi_iter.bi_sector, bio->bi_flags, bio->bi_opf);
+
     return DM_MAPIO_REMAPPED;
 }
 
