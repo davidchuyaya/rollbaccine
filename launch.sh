@@ -105,4 +105,4 @@ echo ""
 echo "ssh $USERNAME@$PUBLIC_IP_1"
 echo "cd rollbaccine/src"
 echo "sudo insmod rollbaccine.ko"
-echo '0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 1 false abcdefghijklmnop 12350 127.0.0.1 12340" | sudo dmsetup create rollbaccine2'
+echo 'echo "0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 1 false abcdefghijklmnop 12350 $PRIVATE_IP_0 12340" | sudo dmsetup create rollbaccine2'
