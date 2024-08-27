@@ -129,10 +129,8 @@ In order for VSCode to understand Linux kernel headers, we will follow instructi
 cd rollbaccine
 rm -rf .vscode
 git clone https://github.com/amezin/vscode-linux-kernel .vscode
-python3 .vscode/generate_compdb.py -O /lib/modules/6.8.0-38-generic/build $PWD
+python3 .vscode/generate_compdb.py -O /lib/modules/$(uname -r)/build $PWD
 ```
-
-Replace `6.8.0-38-generic` with the output of `uname -r` on the VM.
 
 
 ### Setting up the VM
@@ -304,6 +302,15 @@ Mount ext4. Replace `/dev/mapper/passthrough` with the device mapper's directory
 ```bash
 sudo mkfs.ext4 /dev/mapper/passthrough
 sudo mount /dev/mapper/passthrough /mnt
+```
+
+### Rollbaccine
+```bash
+sudo modprobe brd rd_nr=2 rd_size=1048576
+sudo insmod rollbaccine.ko
+echo "0 `sudo blockdev --getsz /dev/ram0` rollbaccine /dev/ram0 1 2 0 true abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1
+echo "0 `sudo blockdev --getsz /dev/ram1` rollbaccine /dev/ram1 1 2 1 false abcdefghijklmnop 12350 127.0.0.1 12340" | sudo dmsetup create rollbaccine2
+sudo fio --filename=/dev/mapper/rollbaccine1 --readwrite=readwrite --bs=4k --direct=1 --loops=10 --name=rollbaccine
 ```
 
 

@@ -11,23 +11,19 @@
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/tcp.h>
+#include <net/handshake.h>  // For TLS
 #include <net/sock.h>
-#include <net/handshake.h> // For TLS
 #include <net/tls_prot.h>
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
-#define ROLLBACCINE_ENCRYPT_GRANULARITY 4096 // Number of bytes to encrypt, hash, or send at a time
-#define ROLLBACCINE_RETRY_TIMEOUT 5000 // Number of milliseconds before client attempts to connect to a server again
+#define ROLLBACCINE_RETRY_TIMEOUT 5000        // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
-#define ROLLBACCINE_HASH_SIZE 256
-#define ROLLBACCINE_POINTER_BYTES 8 // Size of a pointer
-#define ROLLBACCINE_MAX_BUFFERED_OPS 1024 * 32 // Maximum number of write operations that we still have a pointer to in the system, because it's submitting to disk or network. Fio on David's VM on his laptop says 720 is the max, so overshoot by a bit.
-#define ROLLBACCINE_TLS_TIMEOUT 5000 // Number of milliseconds to wait for TLS handshake to complete
+#define ROLLBACCINE_TLS_TIMEOUT 5000  // Number of milliseconds to wait for TLS handshake to complete
 #define MODULE_NAME "server"
 
 #define TLS_ON
 // #define MULTITHREADED_NETWORK
-#define MEMORY_TRACKING // Check the number of mallocs/frees and see if we're leaking memory
+#define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 
 // TODO: Expand with protocol message types
 enum MsgType { ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, FOLLOWER_ACK };
@@ -47,7 +43,7 @@ struct metadata_msg {
     // Metadata about the bio
     uint64_t bi_opf;
     sector_t sector;
-} __attribute__((packed)); 
+} __attribute__((packed));
 
 // Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
 struct socket_list {
@@ -63,24 +59,24 @@ struct server_device {
     struct page *page_cache;
     int page_cache_size;
     bool is_leader;
-    bool shutting_down; // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
+    bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     int f;
     int n;
 
     struct ballot bal;
-    int write_index; // Doesn't need to be atomic because only the broadcast thread will modify this
-    spinlock_t index_lock; // Must be obtained for any operation modifying write_index and queues ordered by those indices
+    int write_index;        // Doesn't need to be atomic because only the broadcast thread will modify this
+    spinlock_t index_lock;  // Must be obtained for any operation modifying write_index and queues ordered by those indices
 
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
     spinlock_t replica_fsync_lock;
-    int* replica_fsync_indices; // Len = n
+    int *replica_fsync_indices;  // Len = n
     int max_replica_fsync_index;
-    struct bio_list fsyncs_pending_replication; // List of all fsyncs waiting for replication. Ordered by write index.
+    struct bio_list fsyncs_pending_replication;  // List of all fsyncs waiting for replication. Ordered by write index.
 
     // Logic for writes that block on conflicting writes
-    struct rb_root outstanding_ops; // Tree of all outstanding operations, sorted by the sectors they write to
-    struct list_head pending_ops; // List of all operations that conflict with outstanding operations (or other pending operations)
+    struct rb_root outstanding_ops;  // Tree of all outstanding operations, sorted by the sectors they write to
+    struct list_head pending_ops;    // List of all operations that conflict with outstanding operations (or other pending operations)
     bool processing_pending_ops;  // Set to true when a bio is being popped off pending_ops by another bio during its end_io. If the other bio submits the pending op while holding index_lock, it could result in deadlock (because this bio can then trigger its own end_io, which would need to obtain the same index_lock). Instead, the other bio sets this flag to true, then submits the bio without a lock, then reobtains the lock and removes the bio from the pending_ops list. While this flag is on, other bios will not pop things off the pending_ops queue. This guarantees consistent ordering between primary and replicas
 
     // Communication between main threads and the networking thread
@@ -124,9 +120,9 @@ struct bio_data {
     struct bio *shallow_clone;
     int write_index;
     bool is_fsync;
-    atomic_t ref_counter; // The number of clones. Once it hits 0, the bio can be freed
-    struct work_struct broadcast_work; // So this bio can be scheduled as a job
-    struct rb_node tree_node; // So this bio can be inserted into a tree
+    atomic_t ref_counter;               // The number of clones. Once it hits 0, the bio can be freed
+    struct work_struct broadcast_work;  // So this bio can be scheduled as a job
+    struct rb_node tree_node;           // So this bio can be inserted into a tree
 };
 
 // For each bio that is placed on the pending_ops queue. Necessary to keep separate from bio_data because the bio may be submitted (and its bio_data deleted) before it is removed from the pending_ops queue, in order to avoid deadlock. See the note on processing_pending_ops.
@@ -155,7 +151,7 @@ struct listen_thread_params {
     struct server_device *device;
 };
 
-bool try_insert_into_outstanding_ops(struct server_device *device, struct bio *shallow_clone); // Returns true if the insert was successful, false if there's a conflict
+bool try_insert_into_outstanding_ops(struct server_device *device, struct bio *shallow_clone);  // Returns true if the insert was successful, false if there's a conflict
 void remove_from_outstanding_ops_and_unblock(struct server_device *device, struct bio *shallow_clone);
 void page_cache_free(struct server_device *device, struct page *page_to_free);
 void page_cache_destroy(struct server_device *device);
@@ -174,8 +170,8 @@ void leader_disk_end_io(struct bio *shallow_clone);
 void replica_disk_end_io(struct bio *received_bio);
 void network_end_io(struct bio *deep_clone);
 void broadcast_bio(struct work_struct *work);
-struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src);
-struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src);
+struct bio *shallow_bio_clone(struct server_device *device, struct bio *bio_src);
+struct bio *deep_bio_clone(struct server_device *device, struct bio *bio_src);
 void kill_thread(struct socket *sock);
 void blocking_read(struct server_device *device, struct socket *sock);
 #ifdef TLS_ON
@@ -268,7 +264,7 @@ void remove_from_outstanding_ops_and_unblock(struct server_device *device, struc
         other_bio_sector_range = list_first_entry(&device->pending_ops, struct bio_sector_range, list);
         // Check, in order, if the first pending op can be executed. If not, then break
         if (!try_insert_into_outstanding_ops(device, other_bio_sector_range->shallow_clone)) {
-            kfree(other_bio_sector_range); // Free this range, because the try function will alloc another range on failure
+            kfree(other_bio_sector_range);  // Free this range, because the try function will alloc another range on failure
 #ifdef MEMORY_TRACKING
             device->num_bio_sector_ranges -= 1;
             device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges + 1);
@@ -299,10 +295,9 @@ void page_cache_free(struct server_device *device, struct page *page_to_free) {
     spin_lock(&device->page_cache_lock);
     if (device->page_cache_size == 0) {
         device->page_cache = page_to_free;
-    }
-    else {
+    } else {
         // Point the new page to the current page_cache
-        page_private(page_to_free) = (unsigned long) device->page_cache;
+        page_private(page_to_free) = (unsigned long)device->page_cache;
         device->page_cache = page_to_free;
     }
     device->page_cache_size++;
@@ -315,7 +310,7 @@ void page_cache_destroy(struct server_device *device) {
     spin_lock(&device->page_cache_lock);
     while (device->page_cache_size > 0) {
         tmp = device->page_cache;
-        device->page_cache = (struct page *) page_private(device->page_cache);
+        device->page_cache = (struct page *)page_private(device->page_cache);
         __free_page(tmp);
         device->page_cache_size--;
     }
@@ -330,17 +325,15 @@ struct page *page_cache_alloc(struct server_device *device) {
     spin_lock(&device->page_cache_lock);
     if (device->page_cache_size == 0) {
         need_new_page = true;
-    }
-    else if (device->page_cache_size == 1) {
+    } else if (device->page_cache_size == 1) {
         // Set page_cache to NULL now that the list is empty
         new_page = device->page_cache;
         device->page_cache = NULL;
         device->page_cache_size--;
-    }
-    else {
+    } else {
         // Point page_cache to the next element in the list
         new_page = device->page_cache;
-        device->page_cache = (struct page *) page_private(device->page_cache);
+        device->page_cache = (struct page *)page_private(device->page_cache);
         device->page_cache_size--;
     }
     spin_unlock(&device->page_cache_lock);
@@ -372,8 +365,7 @@ void down_interruptible_with_retry(struct semaphore *sem) {
         if (ret == -ERESTARTSYS) {
             printk(KERN_ERR "down_interruptible_with_retry(sem) interrupted by signal, retrying");
         }
-    }
-    while (ret != 0);
+    } while (ret != 0);
 }
 
 struct bio_data *alloc_bio_data(struct server_device *device) {
@@ -390,7 +382,7 @@ struct bio_data *alloc_bio_data(struct server_device *device) {
 }
 
 // TODO: Make super sure that bios ended this way actually don't go to disk
-void ack_bio_to_user_without_executing(struct bio* bio) {
+void ack_bio_to_user_without_executing(struct bio *bio) {
     bio->bi_status = BLK_STS_OK;
     bio_endio(bio);
 }
@@ -469,13 +461,9 @@ void process_follower_fsync_index(struct server_device *device, int follower_id,
 }
 
 // TODO: Replace with op_is_sync() to handle REQ_SYNC?
-bool requires_fsync(struct bio *bio) {
-    return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA);
-}
+bool requires_fsync(struct bio *bio) { return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA); }
 
-unsigned int remove_fsync_flags(unsigned int bio_opf) {
-    return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA;
-}
+unsigned int remove_fsync_flags(unsigned int bio_opf) { return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA; }
 
 // Because we alloc pages when we receive the bios, we have to free them when it's done writing
 void free_pages_end_io(struct bio *received_bio) {
@@ -486,7 +474,7 @@ void free_pages_end_io(struct bio *received_bio) {
 
     bio_for_each_segment(bvec, received_bio, iter) {
         page_cache_free(device, bvec.bv_page);
-        // __free_page(bvec.bv_page); 
+        // __free_page(bvec.bv_page);
 #ifdef MEMORY_TRACKING
         int num_bio_pages = atomic_dec_return(&device->num_bio_pages_not_freed);
         atomic_max(&device->max_outstanding_num_bio_pages, num_bio_pages + 1);
@@ -571,7 +559,7 @@ void broadcast_bio(struct work_struct *work) {
     metadata.sector = clone->bi_iter.bi_sector;
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
-    WARN_ON(metadata.write_index == 0); // Should be at least one. Means that bio_data was retrieved incorrectly
+    WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
 
     // Note: If bi_size is not a multiple of PAGE_SIZE, we have to send by sector chunks
     WARN_ON(metadata.num_pages * PAGE_SIZE != clone->bi_iter.bi_size);
@@ -604,7 +592,6 @@ void broadcast_bio(struct work_struct *work) {
 
         bio_for_each_segment(bvec, clone, iter) {
             // TODO 2. Send hash
-            
 
             // 3. Send bios
             // Note: Replaced with bvec_set_page() in newer kernel versions
@@ -638,7 +625,7 @@ void broadcast_bio(struct work_struct *work) {
     network_end_io(clone);
 }
 
-struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src) {
+struct bio *shallow_bio_clone(struct server_device *device, struct bio *bio_src) {
     struct bio *clone;
     clone = bio_alloc_clone(bio_src->bi_bdev, bio_src, GFP_NOIO, &device->bs);
     if (!clone) {
@@ -653,7 +640,7 @@ struct bio* shallow_bio_clone(struct server_device *device, struct bio *bio_src)
     return clone;
 }
 
-struct bio* deep_bio_clone(struct server_device *device, struct bio *bio_src) {
+struct bio *deep_bio_clone(struct server_device *device, struct bio *bio_src) {
     struct bio *clone;
     struct bio_vec bvec;
     struct bvec_iter iter;
@@ -695,7 +682,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     bool is_cloned = false;
     bool doesnt_conflict_with_other_writes = true;
     struct server_device *device = ti->private;
-    struct bio *deep_clone, *shallow_clone; // deep clone is for the network, shallow clone is for submission to disk when necessary
+    struct bio *deep_clone, *shallow_clone;  // deep clone is for the network, shallow clone is for submission to disk when necessary
     struct bio_data *bio_data;
 
     bio_set_dev(bio, device->dev->bdev);
@@ -704,7 +691,7 @@ static int server_map(struct dm_target *ti, struct bio *bio) {
     if (device->is_leader && bio_data_dir(bio) == WRITE) {
         is_cloned = true;
         is_fsync = requires_fsync(bio);
-        bio->bi_opf = remove_fsync_flags(bio->bi_opf); // All fsyncs become logical fsyncs
+        bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
 
         // Create the network clone
         deep_clone = deep_bio_clone(device, bio);
@@ -828,7 +815,8 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         }
 #endif
 
-        // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH | REQ_FUA));
+        // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH |
+        // REQ_FUA));
 
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
@@ -840,7 +828,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         received_bio = bio_alloc_bioset(device->dev->bdev, metadata.num_pages, metadata.bi_opf, GFP_NOIO, &device->bs);
         received_bio->bi_iter.bi_sector = metadata.sector;
         received_bio->bi_end_io = replica_disk_end_io;
-        
+
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
@@ -871,7 +859,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         }
 
         // 4. Verify against hash
-        
+
         // 5. If the message is an fsync, reply.
         if (metadata.type == ROLLBACCINE_FSYNC) {
             metadata.type = FOLLOWER_ACK;
@@ -912,7 +900,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
     printk(KERN_INFO "Shutting down, exiting blocking read");
     kernel_sock_shutdown(sock, SHUT_RDWR);
     // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut it down.
-//     sock_release(sock);
+    //     sock_release(sock);
 }
 
 #ifdef TLS_ON
@@ -920,7 +908,7 @@ void on_tls_handshake_done(void *data, int status, key_serial_t peerid) {
     struct completion *tls_handshake_completed = data;
 
     if (status != 0) {
-        printk(KERN_ERR "TLS handshake failed with status %d", status);    
+        printk(KERN_ERR "TLS handshake failed with status %d", status);
     }
 
     complete(tls_handshake_completed);
@@ -934,7 +922,7 @@ int connect_to_server(void *args) {
 #ifdef TLS_ON
     struct tls_handshake_args tls_args;
     struct completion tls_handshake_completed;
-    struct file* sock_file;
+    struct file *sock_file;
     unsigned long timeout_remainder;
 #endif
 
@@ -980,16 +968,14 @@ int connect_to_server(void *args) {
     if (error < 0) {
         printk(KERN_ERR "Client error starting TLS handshake: %d", error);
         return 0;
-    }
-    else {
+    } else {
         // Wait until TLS handshake is done
         printk(KERN_INFO "Client waiting for TLS handshake to complete");
         timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
         if (!timeout_remainder) {
             printk(KERN_ERR "Client TLS handshake timed out");
             return 0;
-        }
-        else {
+        } else {
             printk(KERN_INFO "Client TLS handshake completed");
         }
     }
@@ -997,7 +983,7 @@ int connect_to_server(void *args) {
 
     blocking_read(thread_params->device, thread_params->sock);
 
-    cleanup:
+cleanup:
     kfree(thread_params);
     return 0;
 }
@@ -1074,8 +1060,7 @@ int listen_to_accepted_socket(void *args) {
     if (error < 0) {
         printk(KERN_ERR "Server error starting TLS handshake: %d", error);
         return 0;
-    }
-    else {
+    } else {
         // Wait until TLS handshake is done
         timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
         if (!timeout_remainder) {
@@ -1095,11 +1080,11 @@ int listen_to_accepted_socket(void *args) {
 }
 
 // Thread that listens to connecting clients
-int listen_for_connections(void* args) {
+int listen_for_connections(void *args) {
     struct listen_thread_params *thread_params = (struct listen_thread_params *)args;
     struct server_device *device = thread_params->device;
     struct socket *new_sock;
-    struct accepted_thread_params* new_thread_params;
+    struct accepted_thread_params *new_thread_params;
     struct socket_list *new_server_socket_list;
     struct socket_list *new_connected_socket_list;
     struct task_struct *accepted_thread;
@@ -1152,8 +1137,7 @@ int listen_for_connections(void* args) {
     }
 
     kernel_sock_shutdown(thread_params->sock, SHUT_RDWR);
-    // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut
-    // it down.
+    // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut it down.
     //     sock_release(thread_params->sock);
     kfree(thread_params);
     return 0;
@@ -1167,7 +1151,7 @@ int start_server(struct server_device *device, ushort port) {
     struct task_struct *listener_thread;
     int error;
     int opt = 1;
-    sockptr_t kopt = {.kernel = (char*)&opt, .is_kernel = 1};
+    sockptr_t kopt = {.kernel = (char *)&opt, .is_kernel = 1};
 
     // Create struct to pass parameters to listener thread
     thread_params = kmalloc(sizeof(struct listen_thread_params), GFP_KERNEL);
@@ -1237,10 +1221,10 @@ int start_server(struct server_device *device, ushort port) {
 
 static void server_status(struct dm_target *ti, status_type_t type, unsigned int status_flags, char *result, unsigned int maxlen) {
     struct server_device *device = ti->private;
-    unsigned int sz = 0; // Required by DMEMIT
+    unsigned int sz = 0;  // Required by DMEMIT
 
     DMEMIT("\n");
-    
+
 #ifndef MEMORY_TRACKING
     DMEMIT("Memory tracking is NOT ON! The following statistics will be unreliable.\n");
 #endif
@@ -1349,7 +1333,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
     // Connect to other servers. argv[6], argv[7], etc are all server addresses and ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
     for (i = 6; i < argc; i += 2) {
-        error = kstrtou16(argv[i+1], 10, &port);
+        error = kstrtou16(argv[i + 1], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
             return error;
@@ -1388,10 +1372,9 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
 static void server_destructor(struct dm_target *ti) {
     struct socket_list *curr, *next;
     struct server_device *device = ti->private;
-    if (device == NULL)
-        return;
+    if (device == NULL) return;
 
-    // Warning: Changing this boolean should technically be atomic. I don't think it's a big deal tho, since by the time shutting_down is true, we don't care what the protocol does. •Ideally* it shuts down gracefully.
+    // Warning: Changing this boolean should technically be atomic. I don't think it's a big deal tho, since by the time shutting_down is true, we don't care what the protocol does. *Ideally* it shuts down gracefully.
     device->shutting_down = true;
 
     // Kill threads
@@ -1413,7 +1396,6 @@ static void server_destructor(struct dm_target *ti) {
         list_del(&curr->list);
         kfree(curr);
     }
-
 
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
     destroy_workqueue(device->broadcast_queue);
