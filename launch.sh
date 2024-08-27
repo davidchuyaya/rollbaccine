@@ -98,13 +98,11 @@ ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_1 "bash -s" -- < install_ro
 
 echo "You should now ssh into the servers and launch rollbaccine:"
 echo "ssh $USERNAME@$PUBLIC_IP_0"
-echo "sudo modprobe brd rd_nr=1 rd_size=4194304 # Create 4GB ramdisk"
-echo "cd rollbaccine/src/network"
-echo "sudo insmod server.ko # Load the server module"
-echo 'echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 0 true 12340" | sudo dmsetup create server1'
+echo "cd rollbaccine/src"
+echo "sudo insmod rollbaccine.ko"
+echo 'echo "0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 0 true abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1'
 echo ""
 echo "ssh $USERNAME@$PUBLIC_IP_1"
-echo "sudo modprobe brd rd_nr=1 rd_size=4194304 # Create 4GB ramdisk"
-echo "cd rollbaccine/src/network"
-echo "sudo insmod server.ko # Load the server module"
-echo 'echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 1 2 1 false 12350 '$PRIVATE_IP_0' 12340" | sudo dmsetup create server2'
+echo "cd rollbaccine/src"
+echo "sudo insmod rollbaccine.ko"
+echo '0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 1 false abcdefghijklmnop 12350 127.0.0.1 12340" | sudo dmsetup create rollbaccine2'

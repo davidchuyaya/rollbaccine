@@ -32,6 +32,7 @@
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_ENCRYPTION_GRANULARITY PAGE_SIZE
 // #define ROLLBACCINE_ENCRYPTION_GRANULARITY SECTOR_SIZE
+#define ROLLBACCINE_SECTORS_PER_ENCRYPTION (ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE)
 #define AES_GCM_IV_SIZE 12
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
@@ -222,32 +223,32 @@ inline bool has_checksum(unsigned char *checksum) {
 }
 
 inline unsigned char *global_checksum(struct rollbaccine_device *device, sector_t sector) {
-    return &device->checksums[sector * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+    return &device->checksums[sector / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
 }
 
 inline unsigned char *global_iv(struct rollbaccine_device *device, sector_t sector) {
-    return &device->checksums[sector * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
-}
-
-inline unsigned char *alloc_bio_checksum_and_iv(int num_sectors) {
-    return kmalloc(num_sectors * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE), GFP_KERNEL);
-}
-
-inline unsigned char *get_bio_checksum(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return &checksum_and_iv[(current_sector - start_sector) * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
-}
-
-inline unsigned char *get_bio_iv(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return &checksum_and_iv[(current_sector - start_sector) * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
+    return &device->checksums[sector / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
 }
 
 inline size_t bio_checksum_and_iv_size(int num_sectors) {
-    return num_sectors * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
+    return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
+}
+
+inline unsigned char *alloc_bio_checksum_and_iv(int num_sectors) {
+    return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
+}
+
+inline unsigned char *get_bio_checksum(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
+    return &checksum_and_iv[(current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+}
+
+inline unsigned char *get_bio_iv(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
+    return &checksum_and_iv[(current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
 }
 
 inline void update_global_checksum_and_iv(struct rollbaccine_device *device, unsigned char *checksum_and_iv, sector_t start_sector, int num_sectors) {
     sector_t curr_sector;
-    for (curr_sector = start_sector; curr_sector < start_sector + num_sectors; curr_sector += ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE) {
+    for (curr_sector = start_sector; curr_sector < start_sector + num_sectors; curr_sector += ROLLBACCINE_SECTORS_PER_ENCRYPTION) {
         memcpy(global_checksum(device, curr_sector), get_bio_checksum(checksum_and_iv, start_sector, curr_sector), AES_GCM_AUTH_SIZE);
         memcpy(global_iv(device, curr_sector), get_bio_iv(checksum_and_iv, start_sector, curr_sector), AES_GCM_IV_SIZE);
     }
@@ -1598,6 +1599,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     int error;
     int i;
     unsigned long projected_bytes_used = 0;
+    unsigned long checksum_and_iv_size;
 
     device = kmalloc(sizeof(struct rollbaccine_device), GFP_KERNEL);
     if (device == NULL) {
@@ -1703,12 +1705,18 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
 
-    device->checksums = kvmalloc_array(ti->len * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY, AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE, GFP_KERNEL | __GFP_ZERO);
+    checksum_and_iv_size = (unsigned long)(ti->len / ROLLBACCINE_SECTORS_PER_ENCRYPTION) * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
+    printk(KERN_INFO "Checksums and IVs size: %lu", checksum_and_iv_size);
+    // printk(KERN_INFO "Num checksum pages to allocate: %d", 1 << get_order(checksum_and_iv_size));
+
+    // device->checksums = (unsigned char *) __get_free_pages(GFP_KERNEL | __GFP_ZERO, get_order(checksum_and_iv_size));
+    device->checksums = vzalloc(checksum_and_iv_size);
     if (device->checksums == NULL) {
         printk(KERN_ERR "Error allocating checksums");
         return -ENOMEM;
     }
-    projected_bytes_used += ti->len * SECTOR_SIZE / ROLLBACCINE_ENCRYPTION_GRANULARITY * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
+    // projected_bytes_used += (unsigned long) PAGE_SIZE << get_order(checksum_and_iv_size);
+    projected_bytes_used += checksum_and_iv_size;
 
 #ifdef MEMORY_TRACKING
     atomic_set(&device->num_bio_data_not_freed, 0);
