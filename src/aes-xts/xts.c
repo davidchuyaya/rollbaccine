@@ -103,12 +103,13 @@ static int xts_constructor(struct dm_target *ti, unsigned int argc, char **argv)
     }
     printk(KERN_INFO "key properly initialized\n");
 
-    device->hmac_tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+    device->hmac_tfm = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(device->hmac_tfm)) {
         ti->error = "Cannot allocate HMAC transform";
         ret = -ENOMEM;
         goto out;
     }
+    
 
     device->shash = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->hmac_tfm), GFP_NOIO);
     if (!device->shash) {
@@ -116,6 +117,7 @@ static int xts_constructor(struct dm_target *ti, unsigned int argc, char **argv)
         ret = -ENOMEM;
         goto out;
     }
+    device->shash->tfm = device->hmac_tfm;
 
     device->checksums = kvmalloc_array(ti->len, SHA256_LENGTH, GFP_KERNEL | __GFP_ZERO);
     if (!device->checksums) {
@@ -146,15 +148,14 @@ inline bool has_checksum(unsigned char *checksum) {
     return memcmp(checksum, ZERO_AUTH, SHA256_LENGTH) != 0;
 }
 
-inline bool verify_checksum(unsigned char *new_checksum, unsigned char *old_checksum){
-    return memcmp(new_checksum, old_checksum, SHA256_LENGTH) == 0;
+// inline bool verify_checksum(unsigned char *new_checksum, unsigned char *old_checksum){
+//     return memcmp(new_checksum, old_checksum, SHA256_LENGTH) == 0;
 
-}
+// }
 
 static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     int ret;
     struct bio_vec bv;
-    struct bio_vec prev_bv;
     uint64_t curr_sector;
     struct skcipher_request *req;
     char *iv = kmalloc(AES_BLOCK_SIZE, GFP_KERNEL);
@@ -176,42 +177,56 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
 	    DECLARE_CRYPTO_WAIT(wait);
         switch (enc_or_dec) {
             case WRITE:
-                memset(iv, 0, AES_BLOCK_SIZE);
-                *(__le64 *)iv = cpu_to_le64(curr_sector);
-                //printk(KERN_INFO "WRITE : %llu\n", curr_sector);
+                printk(KERN_INFO "WRITE : %llu\n", curr_sector);
                 break;
             case READ:
+                printk(KERN_INFO "checking checksum");
                 if(!has_checksum(checksum_index(bio_data, curr_sector))) {
                     goto enc_or_dec_next_sector;
                 }
-                //printk(KERN_INFO "READ : %llu\n", curr_sector);
+                unsigned char digest[SHA256_LENGTH];
+                ret = crypto_shash_digest(bio_data->device->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, digest);
+                if (ret) {
+                    printk(KERN_INFO "hash failed");
+                    // TODO: Don't fail silently
+                    goto exit;
+                }
+                if (memcmp(digest, checksum_index(bio_data, curr_sector), SHA256_LENGTH) != 0) {
+                    printk(KERN_ERR "invalid integrity check - triggering kernel panic");
+                    panic("Kernel panic: integrity check failed during decryption (bad message)");
+                    skcipher_request_free(req);
+                    kfree(iv);
+                    goto exit;
+                }
+                printk(KERN_INFO "READ : %llu\n", curr_sector);
                 break;
             default:
                 break;
         }
+        memset(iv, 0, AES_BLOCK_SIZE);
+        *(__le64 *)iv = cpu_to_le64(curr_sector);
         sg_init_table(&sg, 1);
         sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
         skcipher_request_set_crypt(req, &sg, &sg, SECTOR_SIZE, iv);
 	    skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
-        //printk(KERN_INFO "enc/dec initialized\n");
         switch (enc_or_dec) {
             case WRITE:
                 ret = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
                 break;
             case READ:
-                ret = crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
+                ret = crypto_wait_req(crypto_skcipher_decrypt(req), &wait); 
                 break;
         }
-
         if (ret) {
             printk(KERN_ERR "xts/decryption failed");
             skcipher_request_free(req);
             kfree(iv);
             goto exit;
         }
-
+        // HASHING
         switch (enc_or_dec) {
             case WRITE:
+                printk(KERN_INFO "hashing...");
                 ret = crypto_shash_digest(bio_data->device->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, checksum_index(bio_data, curr_sector));
                 if (ret) {
                     printk(KERN_INFO "hash failed");
@@ -219,21 +234,7 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
                     goto exit;
                 }
                 break;
-            case READ:
-                unsigned char new_checksum[SHA256_LENGTH];
-                ret = crypto_shash_digest(bio_data->device->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, new_checksum);
-                if (ret) {
-                    printk(KERN_INFO "hash failed");
-                    // TODO: Don't fail silently
-                    goto exit;
-                }
-                if (!verify_checksum(new_checksum, checksum_index(bio_data, curr_sector))) {
-                    printk(KERN_ERR "invalid integrity check - triggering kernel panic");
-                    panic("Kernel panic: integrity check failed during decryption (bad message)");
-                    skcipher_request_free(req);
-                    kfree(iv);
-                    goto exit;
-                }
+            default:
                 break;
         }
 
