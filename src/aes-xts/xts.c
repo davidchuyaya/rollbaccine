@@ -18,6 +18,9 @@
 #define SHA256_LENGTH 256
 #define MIN_IOS 64
 
+// Used to compare against checksums to see if they have been set yet (or if they're all 0)
+static const char ZERO_AUTH[SHA256_LENGTH] = {0};
+
 // Data attached to each bio
 struct xts_device {
     struct dm_dev *dev;
@@ -29,14 +32,12 @@ struct xts_device {
     struct bio_set bs;
     // array of hashes of each sector
     char* checksums;
-    char *ivdata;
 };
 
 // per bio private data
 struct bio_data {
     // maintain information of original bio before iteration
     struct bio *base_bio;
-    struct bvec_iter bi_iter;
     struct crypto_wait wait;
     struct xts_device *device;
 };
@@ -44,8 +45,6 @@ struct bio_data {
 void cleanup(struct xts_device *device) {
     if (device == NULL)
         return;
-    if (device->ivdata)
-        kfree(device->ivdata);
     if (device->checksums)
         kvfree(device->checksums);
     if (device->tfm)
@@ -104,14 +103,6 @@ static int xts_constructor(struct dm_target *ti, unsigned int argc, char **argv)
     }
     printk(KERN_INFO "key properly initialized\n");
 
-    device->ivdata = kmalloc(16, GFP_KERNEL);
-    if (!device->ivdata) {
-        ti->error = "could not allocate ivdata";
-        ret = -ENOMEM;
-        goto out;
-    }
-    memcpy(device->ivdata, "1234567890123456", 16);
-
     device->hmac_tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
     if (IS_ERR(device->hmac_tfm)) {
         ti->error = "Cannot allocate HMAC transform";
@@ -125,8 +116,6 @@ static int xts_constructor(struct dm_target *ti, unsigned int argc, char **argv)
         ret = -ENOMEM;
         goto out;
     }
-
-   
 
     device->checksums = kvmalloc_array(ti->len, SHA256_LENGTH, GFP_KERNEL | __GFP_ZERO);
     if (!device->checksums) {
@@ -149,10 +138,18 @@ out:
     return ret;
 }
 
-static inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
+inline unsigned char *checksum_index(struct bio_data *bio_data, sector_t index) {
     return &bio_data->device->checksums[index * SHA256_LENGTH];
 }
 
+inline bool has_checksum(unsigned char *checksum) {
+    return memcmp(checksum, ZERO_AUTH, SHA256_LENGTH) != 0;
+}
+
+inline bool verify_checksum(unsigned char *new_checksum, unsigned char *old_checksum){
+    return memcmp(new_checksum, old_checksum, SHA256_LENGTH) == 0;
+
+}
 
 static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     int ret;
@@ -160,41 +157,43 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     struct bio_vec prev_bv;
     uint64_t curr_sector;
     struct skcipher_request *req;
-    // char *iv = kmalloc(AES_BLOCK_SIZE, GFP_KERNEL);
-    // if (!iv) {
-    //     printk(KERN_ERR "iv allocation failed");
-    //     ret = -ENOMEM;
-    //     goto exit;
-    // }
+    char *iv = kmalloc(AES_BLOCK_SIZE, GFP_KERNEL);
+    if (!iv) {
+        printk(KERN_ERR "iv allocation failed");
+        ret = -ENOMEM;
+        goto exit;
+    }
     req = skcipher_request_alloc(bio_data->device->tfm, GFP_KERNEL);
     if (!req) {
         printk(KERN_ERR "aead request allocation failed");
         ret = -ENOMEM;
         goto exit;
     }
-    while (bio_data->bi_iter.bi_size) {
-        curr_sector = bio_data->bi_iter.bi_sector;
-        bv = bio_iter_iovec(bio_data->base_bio, bio_data->bi_iter);
-        prev_bv = bv;
-        // memcpy(iv, "1234567890123456", 16);
+    struct scatterlist sg;
+    while (bio_data->base_bio->bi_iter.bi_size) {
+        curr_sector = bio_data->base_bio->bi_iter.bi_sector;
+        bv = bio_iter_iovec(bio_data->base_bio, bio_data->base_bio->bi_iter);
 	    DECLARE_CRYPTO_WAIT(wait);
-        // switch (enc_or_dec) {
-        //     case READ:
-        //         if (*checksum_index(bio_data, curr_sector) == 0) {
-        //             skcipher_request_free(req);
-        //             kfree(iv);
-        //             return 0;
-        //         }
-        //         break;
-        //     default:
-        //         break;
-        // }
-        struct scatterlist sg;
+        switch (enc_or_dec) {
+            case WRITE:
+                memset(iv, 0, AES_BLOCK_SIZE);
+                *(__le64 *)iv = cpu_to_le64(curr_sector);
+                //printk(KERN_INFO "WRITE : %llu\n", curr_sector);
+                break;
+            case READ:
+                if(!has_checksum(checksum_index(bio_data, curr_sector))) {
+                    goto enc_or_dec_next_sector;
+                }
+                //printk(KERN_INFO "READ : %llu\n", curr_sector);
+                break;
+            default:
+                break;
+        }
         sg_init_table(&sg, 1);
         sg_set_page(&sg, bv.bv_page, SECTOR_SIZE, bv.bv_offset);
-        skcipher_request_set_crypt(req, &sg, &sg, SECTOR_SIZE, bio_data->device->ivdata);
+        skcipher_request_set_crypt(req, &sg, &sg, SECTOR_SIZE, iv);
 	    skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
-        printk(KERN_INFO "enc/dec initialized\n");
+        //printk(KERN_INFO "enc/dec initialized\n");
         switch (enc_or_dec) {
             case WRITE:
                 ret = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
@@ -207,24 +206,43 @@ static int enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
         if (ret) {
             printk(KERN_ERR "xts/decryption failed");
             skcipher_request_free(req);
-            // kfree(iv);
+            kfree(iv);
             goto exit;
         }
-        printk(KERN_INFO "enc/dec finished succesfully\n");
 
-        // HMAC calculation
-	    // ret = crypto_shash_digest(bio_data->device->shash, page_address(prev_bv.bv_page) + prev_bv.bv_offset, SECTOR_SIZE, checksum_index(bio_data, curr_sector));
-        // if (ret) {
-        //     printk(KERN_INFO "hash failed");
-        //     // TODO: Don't fail silently
-        //     goto exit;
-        // }
-        // printk(KERN_INFO "hashing finished succesfully\n");
+        switch (enc_or_dec) {
+            case WRITE:
+                ret = crypto_shash_digest(bio_data->device->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, checksum_index(bio_data, curr_sector));
+                if (ret) {
+                    printk(KERN_INFO "hash failed");
+                    // TODO: Don't fail silently
+                    goto exit;
+                }
+                break;
+            case READ:
+                unsigned char new_checksum[SHA256_LENGTH];
+                ret = crypto_shash_digest(bio_data->device->shash, page_address(bv.bv_page) + bv.bv_offset, SECTOR_SIZE, new_checksum);
+                if (ret) {
+                    printk(KERN_INFO "hash failed");
+                    // TODO: Don't fail silently
+                    goto exit;
+                }
+                if (!verify_checksum(new_checksum, checksum_index(bio_data, curr_sector))) {
+                    printk(KERN_ERR "invalid integrity check - triggering kernel panic");
+                    panic("Kernel panic: integrity check failed during decryption (bad message)");
+                    skcipher_request_free(req);
+                    kfree(iv);
+                    goto exit;
+                }
+                break;
+        }
 
-        bio_advance_iter(bio_data->base_bio, &bio_data->bi_iter, SECTOR_SIZE);
+        printk(KERN_INFO "hashing finished succesfully\n");
+        enc_or_dec_next_sector:
+        bio_advance_iter(bio_data->base_bio, &bio_data->base_bio->bi_iter, SECTOR_SIZE);
     }
     skcipher_request_free(req);
-    // kfree(iv);
+    kfree(iv);
     return 0;
 exit:
     cleanup(bio_data->device);
@@ -265,21 +283,22 @@ static int xts_map(struct dm_target *ti, struct bio *bio) {
     struct bio *clone;
     struct bio_data *bio_data;
 
+     // For encryption so we can reset the write to the beginning of the block when we are done
+    sector_t original_sector = bio->bi_iter.bi_sector;
+    unsigned int original_size = bio->bi_iter.bi_size;
+    unsigned int original_idx = bio->bi_iter.bi_idx;
+
     bio_set_dev(bio, device->dev->bdev);
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     // fetch data specific to bio
     bio_data = dm_per_bio_data(bio, ti->per_io_data_size);
     // initialize fields for bio data that will be useful for xts
     bio_data->base_bio = bio;
-    // save bi_iter since bi_iter will be moved for reads before the read operation is actually done
-    bio_data->bi_iter = bio->bi_iter;
     bio_data->device = device;
     if (bio_has_data(bio)) {
 	    uint64_t original_sector;
         switch (bio_data_dir(bio)){
             case WRITE:
-                original_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
-                unsigned int original_size = bio->bi_iter.bi_size;
-                unsigned int original_idx = bio->bi_iter.bi_idx;
                 // Encrypt
                 enc_or_dec_bio(bio_data, WRITE);
                 // Reset to the original beginning values of the bio, otherwise nothing will be written
