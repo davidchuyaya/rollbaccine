@@ -357,13 +357,3 @@ When you're done with the VMs, delete them, replacing `rollbaccine` with the nam
 ```bash
 ./cleanup -n rollbaccine
 ```
-
-## Mounting over disk
-```bash
-# Execute this on both VMs
-sudo umount /dev/sdb1
-# On one VM 
-echo "0 `sudo blockdev --getsz /dev/sdb1` server /dev/sdb1 1 2 0 true 12340" | sudo dmsetup create server1
-# On the other VM
-echo "0 `sudo blockdev --getsz /dev/sdb1` server /dev/sdb1 1 2 1 false 12350 10.0.0.5 12340" | sudo dmsetup create server2
-```

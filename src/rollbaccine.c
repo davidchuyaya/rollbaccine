@@ -1073,6 +1073,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     struct kvec vec;
     int sent, received, i, num_sectors;
     size_t checksum_and_iv_size;
+    bool no_conflict;
 #ifdef TLS_ON
     union {
         struct cmsghdr cmsg;
@@ -1234,7 +1235,10 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         }
 
         // 6. Submit bio, if there are no conflicts. Otherwise blocks and waits for a finished bio to unblock it.
-        if (try_insert_into_outstanding_ops(device, received_bio)) {
+        spin_lock(&device->index_lock);
+        no_conflict = try_insert_into_outstanding_ops(device, received_bio);
+        spin_unlock(&device->index_lock);
+        if (no_conflict) {
             if (metadata.num_pages != 0) {
                 update_global_checksum_and_iv(device, bio_checksum_and_iv, metadata.sector, num_sectors);
             }
