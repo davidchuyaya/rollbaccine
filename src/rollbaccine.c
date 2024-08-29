@@ -1138,6 +1138,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
+        bio_data->bio_src = received_bio;
         received_bio->bi_private = bio_data;
 
         // 2. Expect hash next
