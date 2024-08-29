@@ -33,6 +33,7 @@
 #define ROLLBACCINE_ENCRYPTION_GRANULARITY PAGE_SIZE
 // #define ROLLBACCINE_ENCRYPTION_GRANULARITY SECTOR_SIZE
 #define ROLLBACCINE_SECTORS_PER_ENCRYPTION (ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE)
+#define SECTORS_PER_PAGE (PAGE_SIZE / SECTOR_SIZE)
 #define AES_GCM_IV_SIZE 12
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
@@ -79,6 +80,12 @@ struct rollbaccine_device {
     spinlock_t page_cache_lock;
     struct page *page_cache;
     int page_cache_size;
+
+    // For limiting the amount of memory used. Do not access ints without obtaining the waitqueue lock.
+    wait_queue_head_t memory_wait_queue;
+    int max_memory_pages;
+    int num_used_memory_pages;
+
     bool is_leader;
     bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     int f;
@@ -135,6 +142,7 @@ struct rollbaccine_device {
     int max_outstanding_num_rb_nodes;
     int max_outstanding_num_bio_sector_ranges;
     int max_outstanding_fsyncs_pending_replication;
+    int max_num_pages_in_memory;
 #endif
 };
 
@@ -187,26 +195,27 @@ void page_cache_free(struct rollbaccine_device *device, struct page *page_to_fre
 void page_cache_destroy(struct rollbaccine_device *device);
 struct page *page_cache_alloc(struct rollbaccine_device *device);
 void atomic_max(atomic_t *old, int new);
-void down_interruptible_with_retry(struct semaphore *sem);
-struct bio_data *alloc_bio_data(struct rollbaccine_device *device);
-void ack_bio_to_user_without_executing(struct bio *bio);
-void process_follower_fsync_index(struct rollbaccine_device *device, int follower_id, int follower_fsync_index);
-bool requires_fsync(struct bio *bio);
+void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed);
+void release_memory(struct rollbaccine_device *device, int num_pages_released);
+struct bio_data *alloc_bio_data(struct rollbaccine_device * device);
+void ack_bio_to_user_without_executing(struct bio * bio);
+void process_follower_fsync_index(struct rollbaccine_device * device, int follower_id, int follower_fsync_index);
+bool requires_fsync(struct bio * bio);
 unsigned int remove_fsync_flags(unsigned int bio_opf);
-void free_pages_end_io(struct bio *received_bio);
-void try_free_clones(struct bio *clone);
-void disk_end_io(struct bio *shallow_clone);
-void leader_write_disk_end_io(struct bio *shallow_clone);
-void leader_read_disk_end_io(struct bio *shallow_clone);
-void replica_disk_end_io(struct bio *received_bio);
-void network_end_io(struct bio *deep_clone);
-void broadcast_bio(struct work_struct *work);
-struct bio *shallow_bio_clone(struct rollbaccine_device *device, struct bio *bio_src);
-struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_src);
+void free_pages_end_io(struct bio * received_bio);
+void try_free_clones(struct bio * clone);
+void disk_end_io(struct bio * shallow_clone);
+void leader_write_disk_end_io(struct bio * shallow_clone);
+void leader_read_disk_end_io(struct bio * shallow_clone);
+void replica_disk_end_io(struct bio * received_bio);
+void network_end_io(struct bio * deep_clone);
+void broadcast_bio(struct work_struct * work);
+struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
+struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 // Returns array of checksums and IVs for writes, NULL for reads
-unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec);
-void kill_thread(struct socket *sock);
-void blocking_read(struct rollbaccine_device *device, struct socket *sock);
+unsigned char *enc_or_dec_bio(struct bio_data * bio_data, int enc_or_dec);
+void kill_thread(struct socket * sock);
+void blocking_read(struct rollbaccine_device * device, struct socket * sock);
 #ifdef TLS_ON
 void on_tls_handshake_done(void *data, int status, key_serial_t peerid);
 #endif
@@ -446,15 +455,23 @@ void atomic_max(atomic_t *old, int new) {
     } while (old_val < new &&atomic_cmpxchg(old, old_val, new) != old_val);
 }
 
-// Semaphore down may return before it actually locks on the semaphore because of a signal. Retry.
-void down_interruptible_with_retry(struct semaphore *sem) {
-    int ret;
-    do {
-        ret = down_interruptible(sem);
-        if (ret == -ERESTARTSYS) {
-            printk(KERN_ERR "down_interruptible_with_retry(sem) interrupted by signal, retrying");
-        }
-    } while (ret != 0);
+void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed) {
+    spin_lock(&device->memory_wait_queue.lock);
+    wait_event_interruptible_locked(device->memory_wait_queue, device->num_used_memory_pages + num_pages_needed <= device->max_memory_pages);
+    device->num_used_memory_pages += num_pages_needed;
+    spin_unlock(&device->memory_wait_queue.lock);
+}
+
+void release_memory(struct rollbaccine_device *device, int num_pages_released) {
+    if (num_pages_released > 0) {
+        spin_lock(&device->memory_wait_queue.lock);
+#ifdef MEMORY_TRACKING
+        device->max_num_pages_in_memory = umax(device->max_num_pages_in_memory, device->num_used_memory_pages);
+#endif
+        device->num_used_memory_pages -= num_pages_released;
+        wake_up_locked(&device->memory_wait_queue);
+        spin_unlock(&device->memory_wait_queue.lock);
+    }
 }
 
 struct bio_data *alloc_bio_data(struct rollbaccine_device *device) {
@@ -483,6 +500,7 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
     bool max_index_changed = false;
     struct bio *bio;
     int bio_write_index;
+    int num_freed_sectors = 0;
 
     spin_lock(&device->replica_fsync_lock);
     // Special case for f = 1, n = 2, since there's only 1 follower, so we don't need to iterate.
@@ -535,6 +553,7 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
             if (bio_write_index <= device->max_replica_fsync_index) {
                 // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
                 // Ack the fsync to the user
+                num_freed_sectors += bio_sectors(bio);
                 ack_bio_to_user_without_executing(bio);
                 // Remove from queue
                 bio_list_pop(&device->fsyncs_pending_replication);
@@ -547,6 +566,8 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
         }
     }
     spin_unlock(&device->replica_fsync_lock);
+
+    release_memory(device, num_freed_sectors / SECTORS_PER_PAGE);
 }
 
 // TODO: Replace with op_is_sync() to handle REQ_SYNC?
@@ -561,6 +582,7 @@ void free_pages_end_io(struct bio *received_bio) {
     struct bio_vec bvec;
     struct bvec_iter iter;
 
+    release_memory(device, bio_sectors(received_bio) / SECTORS_PER_PAGE);
     bio_for_each_segment(bvec, received_bio, iter) {
         page_cache_free(device, bvec.bv_page);
         // __free_page(bvec.bv_page);
@@ -641,8 +663,11 @@ void leader_write_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
     // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
     disk_end_io(shallow_clone);
-    // Return to the user
-    ack_bio_to_user_without_executing(bio_data->bio_src);
+    // Return to the user. If this is an fsync, wait for replication
+    if (!bio_data->is_fsync) {
+        release_memory(bio_data->device, bio_sectors(bio_data->bio_src) / SECTORS_PER_PAGE);
+        ack_bio_to_user_without_executing(bio_data->bio_src);
+    }
     // Unlike replica_disk_end_io, the clone is sharing data with the clone used for networking, so we have to check if we can free
     try_free_clones(shallow_clone);
 }
@@ -844,6 +869,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         
         switch (bio_data_dir(bio)) {
             case WRITE:
+                // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
+                block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
+
                 is_fsync = requires_fsync(bio);
                 // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
                 // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
@@ -1180,6 +1208,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         }
 
         // 3. Receive pages of bio
+        block_if_not_enough_memory(device, metadata.num_pages);
         for (i = 0; i < metadata.num_pages; i++) {
             page = page_cache_alloc(device);
             // page = alloc_page(GFP_KERNEL);
@@ -1587,6 +1616,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num rb nodes still in tree: %d\n", device->num_rb_nodes);
     DMEMIT("Num bio sectors still in queue: %d\n", device->num_bio_sector_ranges);
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
+    DMEMIT("Num pages still in memory: %d\n", device->num_used_memory_pages);
     DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
@@ -1595,9 +1625,10 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max size of rb tree for outgoing operations: %d\n", device->max_outstanding_num_rb_nodes);
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
+    DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = key, 6 = listen port. 7+ = server addr & ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = max_memory_pages, 6 = key, 7= listen port. 8+ = server addr & ports
 // Note: Keys on the replicas are not used, since they cannot encrypt or decrypt
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
@@ -1669,8 +1700,16 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     device->is_leader = strcmp(argv[4], "true") == 0;
 
+    error = kstrtoint(argv[5], 10, &device->max_memory_pages);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing max_memory_pages");
+        return error;
+    }
+    device->num_used_memory_pages = 0;
+    init_waitqueue_head(&device->memory_wait_queue);
+
     // Start server
-    error = kstrtou16(argv[6], 10, &port);
+    error = kstrtou16(argv[7], 10, &port);
     if (error < 0) {
         printk(KERN_ERR "Error parsing port");
         return error;
@@ -1687,7 +1726,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     // Connect to other servers. argv[7], argv[8], etc are all server addresses and ports to connect to.
     INIT_LIST_HEAD(&device->client_sockets);
-    for (i = 7; i < argc; i += 2) {
+    for (i = 8; i < argc; i += 2) {
         error = kstrtou16(argv[i + 1], 10, &port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing port");
@@ -1705,7 +1744,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
     crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
 
-    error = crypto_aead_setkey(device->tfm, argv[5], KEY_SIZE);
+    error = crypto_aead_setkey(device->tfm, argv[6], KEY_SIZE);
     if (error < 0) {
         printk(KERN_ERR "Error setting key");
         return error;

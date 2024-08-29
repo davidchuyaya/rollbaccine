@@ -96,14 +96,15 @@ echo "Installing rollbaccine on servers"
 ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_0 "bash -s" -- < install_rollbaccine.sh
 ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_1 "bash -s" -- < install_rollbaccine.sh
 
-echo "You should now ssh into the servers and launch rollbaccine:"
+echo "You should now ssh into the servers and launch rollbaccine. Increase 250000 (the max number of pages that can be in memory) depending on the circumstances:"
 echo "ssh $USERNAME@$PUBLIC_IP_0"
 echo "sudo umount /dev/sdb1"
 echo "cd rollbaccine/src"
 echo "sudo insmod rollbaccine.ko"
-echo 'echo "0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 0 true abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1'
+echo 'echo "0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 0 true 250000 abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1'
 echo ""
 echo "ssh $USERNAME@$PUBLIC_IP_1"
+echo "sudo umount /dev/sdb1"
 echo "cd rollbaccine/src"
 echo "sudo insmod rollbaccine.ko"
-echo 'echo "0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 1 false abcdefghijklmnop 12350 $PRIVATE_IP_0 12340" | sudo dmsetup create rollbaccine2'
+echo 'echo "0 `sudo blockdev --getsz /dev/sdb1` rollbaccine /dev/sdb1 1 2 1 false 250000 abcdefghijklmnop 12350 $PRIVATE_IP_0 12340" | sudo dmsetup create rollbaccine2'

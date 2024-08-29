@@ -305,11 +305,12 @@ sudo mount /dev/mapper/passthrough /mnt
 ```
 
 ### Rollbaccine
+250000 = 1GB / 4KB, so we're allowing 1GB of memory to be allocated at any time.
 ```bash
 sudo modprobe brd rd_nr=2 rd_size=1048576
 sudo insmod rollbaccine.ko
-echo "0 `sudo blockdev --getsz /dev/ram0` rollbaccine /dev/ram0 1 2 0 true abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1
-echo "0 `sudo blockdev --getsz /dev/ram1` rollbaccine /dev/ram1 1 2 1 false abcdefghijklmnop 12350 127.0.0.1 12340" | sudo dmsetup create rollbaccine2
+echo "0 `sudo blockdev --getsz /dev/ram0` rollbaccine /dev/ram0 1 2 0 true 250000 abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1
+echo "0 `sudo blockdev --getsz /dev/ram1` rollbaccine /dev/ram1 1 2 1 false 250000 abcdefghijklmnop 12350 127.0.0.1 12340" | sudo dmsetup create rollbaccine2
 sudo fio --filename=/dev/mapper/rollbaccine1 --readwrite=readwrite --bs=4k --direct=1 --loops=10 --name=rollbaccine
 ```
 
