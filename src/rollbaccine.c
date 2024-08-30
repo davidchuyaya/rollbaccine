@@ -456,6 +456,11 @@ void atomic_max(atomic_t *old, int new) {
 }
 
 void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed) {
+    if (num_pages_needed > device->max_memory_pages) {
+        printk_ratelimited(KERN_ERR "Write requires more memory than max pages allocated: %d, automatically allowing write through", num_pages_needed);
+        return;
+    }
+
     spin_lock(&device->memory_wait_queue.lock);
     wait_event_interruptible_locked(device->memory_wait_queue, device->num_used_memory_pages + num_pages_needed <= device->max_memory_pages);
     device->num_used_memory_pages += num_pages_needed;
