@@ -109,6 +109,8 @@ struct rollbaccine_device {
 
     // Communication between main threads and the networking thread
     struct workqueue_struct *broadcast_queue;
+    // Workqueue to submit pending bios because bio_endio can't submit work (because it might sleep)
+    struct workqueue_struct *submit_bio_queue;
 
     // Sockets, tracked so we can kill them on exit.
     struct list_head server_sockets;
@@ -156,6 +158,7 @@ struct bio_data {
     bool is_fsync;
     atomic_t ref_counter;               // The number of clones. Once it hits 0, the bio can be freed
     struct work_struct broadcast_work;  // So this bio can be scheduled as a job
+    struct work_struct submit_bio_work; // So this bio can be scheduled for submission after popping off pending ops
     struct rb_node tree_node;           // So this bio can be inserted into a tree
     unsigned char *checksum_and_iv;     // Checksums and IVs for each sector or page, if this is a write
 };
@@ -188,6 +191,7 @@ struct listen_thread_params {
 };
 
 void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
+void submit_bio_task(struct work_struct *work);
 // Returns true if the insert was successful, false if there's a conflict
 bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *shallow_clone); 
 void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *shallow_clone);
@@ -279,6 +283,22 @@ void print_and_update_latency(char *text, cycles_t *prev_time) {
 #endif
 }
 
+void submit_bio_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
+    struct rollbaccine_device *device = bio_data->device;
+    // printk(KERN_INFO "Submitting bio from workqueue: %d", bio_data->write_index);
+
+    if (bio_data->checksum_and_iv != NULL) {
+        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->bio_src->bi_iter.bi_sector, bio_sectors(bio_data->bio_src));
+    }
+    if (bio_data->shallow_clone != NULL) {
+        submit_bio_noacct(bio_data->shallow_clone);
+    }
+    else {
+        submit_bio_noacct(bio_data->bio_src);
+    }
+}
+
 // Note: Caller must hold index_lock
 bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
@@ -367,15 +387,10 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
             break;
         }
 
-        // Submit the other bio without holding the spinlock, since the other bio could then finish, and attempt to call this function, causing deadlock
-        spin_unlock(&device->index_lock);
-        // Update global checksum/ivs
+        // Submit the other bio
         other_bio_data = other_bio_sector_range->shallow_clone->bi_private;
-        if (other_bio_data->checksum_and_iv != NULL) {
-            update_global_checksum_and_iv(device, other_bio_data->checksum_and_iv, other_bio_sector_range->start_sector, bio_sectors(other_bio_sector_range->shallow_clone));
-        }
-        submit_bio_noacct(other_bio_sector_range->shallow_clone);
-        spin_lock(&device->index_lock);
+        INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
+        queue_work(device->submit_bio_queue, &other_bio_data->submit_bio_work);
 
         // Remove the other bio
         kfree(other_bio_sector_range);
@@ -1663,6 +1678,12 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->broadcast_queue = alloc_ordered_workqueue("broadcast queue", 0);
     if (!device->broadcast_queue) {
         printk(KERN_ERR "Cannot allocate broadcast queue");
+        return -ENOMEM;
+    }
+
+    device->submit_bio_queue = alloc_workqueue("submit bio queue", 0, 0);
+    if (!device->broadcast_queue) {
+        printk(KERN_ERR "Cannot allocate submit bio queue");
         return -ENOMEM;
     }
 
