@@ -1166,6 +1166,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
+        device->write_index = metadata.write_index;
         bio_data->bio_src = received_bio;
         received_bio->bi_private = bio_data;
 
@@ -1606,6 +1607,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
 
     DMEMIT("\n");
 
+    DMEMIT("Latest write index: %d\n", device->write_index);
 #ifndef MEMORY_TRACKING
     DMEMIT("Memory tracking is NOT ON! The following statistics will be unreliable.\n");
 #endif
