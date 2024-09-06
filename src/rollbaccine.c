@@ -185,6 +185,8 @@ struct listen_thread_params {
 
 void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
 void submit_bio_task(struct work_struct *work);
+void add_to_pending_ops_head(struct rollbaccine_device *device, struct bio_data *bio_data);
+void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data);
 // Returns true if the insert was successful, false if there's a conflict
 bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *shallow_clone); 
 void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *shallow_clone);
@@ -291,6 +293,22 @@ void submit_bio_task(struct work_struct *work) {
     }
 }
 
+void add_to_pending_ops_head(struct rollbaccine_device *device, struct bio_data *bio_data) {
+#ifdef MEMORY_TRACKING
+    device->num_bio_sector_ranges += 1;
+    device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges);
+#endif
+    list_add_tail(&bio_data->pending_list, &device->pending_ops);
+}
+
+void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data) {
+#ifdef MEMORY_TRACKING
+    device->num_bio_sector_ranges += 1;
+    device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges);
+#endif
+    list_add_tail(&bio_data->pending_list, &device->pending_ops);
+}
+
 // Note: Caller must hold index_lock
 bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *bio) {
     struct bio_data *bio_data = bio->bi_private;
@@ -301,7 +319,7 @@ bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct b
     // See if we conflict with any operations that are already blocked
     list_for_each_entry(other_bio_data, &device->pending_ops, pending_list) {
         if (bio_data->start_sector < other_bio_data->end_sector && other_bio_data->start_sector < bio_data->end_sector) {
-            goto block;
+            return false;
         }
     }
 
@@ -315,7 +333,7 @@ bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct b
         else if (bio_data->start_sector >= other_bio_data->end_sector)
             other_bio_tree_node_location = &other_bio_tree_node->rb_right;
         else
-            goto block;
+            return false;
     }
     // No conflicts, add this bio to the red black tree
 #ifdef MEMORY_TRACKING
@@ -325,14 +343,6 @@ bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct b
     rb_link_node(&bio_data->tree_node, other_bio_tree_node, other_bio_tree_node_location);
     rb_insert_color(&bio_data->tree_node, &device->outstanding_ops);
     return true;
-
-block:
-#ifdef MEMORY_TRACKING
-    device->num_bio_sector_ranges += 1;
-    device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges);
-#endif
-    list_add_tail(&bio_data->pending_list, &device->pending_ops);
-    return false;
 }
 
 void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *bio) {
@@ -353,6 +363,7 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
 #ifdef MEMORY_TRACKING
             device->num_bio_sector_ranges -= 1;
 #endif
+            add_to_pending_ops_head(device, other_bio_data);
             break;
         }
 
@@ -882,6 +893,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // Increment write index
                 bio_data->write_index = ++device->write_index;
                 doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data->shallow_clone);
+                if (!doesnt_conflict_with_other_writes) {
+                    add_to_pending_ops_tail(device, bio_data);
+                }
                 // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
                 if (bio_data->is_fsync) {
                     // Add original bio to fsyncs blocked on replication
@@ -921,6 +935,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // Block read if it conflicts with any other outstanding operations
                 spin_lock(&device->index_lock);
                 doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data->shallow_clone);
+                if (!doesnt_conflict_with_other_writes) {
+                    add_to_pending_ops_tail(device, bio_data);
+                }
                 spin_unlock(&device->index_lock);
 
                 if (doesnt_conflict_with_other_writes) {
@@ -1237,6 +1254,9 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         // 6. Submit bio, if there are no conflicts. Otherwise blocks and waits for a finished bio to unblock it.
         spin_lock(&device->index_lock);
         no_conflict = try_insert_into_outstanding_ops(device, received_bio);
+        if (!no_conflict) {
+            add_to_pending_ops_tail(device, bio_data);
+        }
         spin_unlock(&device->index_lock);
         if (no_conflict) {
             if (metadata.num_pages != 0) {
