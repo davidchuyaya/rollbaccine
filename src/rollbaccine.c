@@ -105,7 +105,6 @@ struct rollbaccine_device {
     // Logic for writes that block on conflicting writes
     struct rb_root outstanding_ops;  // Tree of all outstanding operations, sorted by the sectors they write to
     struct list_head pending_ops;    // List of all operations that conflict with outstanding operations (or other pending operations)
-    bool processing_pending_ops;  // Set to true when a bio is being popped off pending_ops by another bio during its end_io. If the other bio submits the pending op while holding index_lock, it could result in deadlock (because this bio can then trigger its own end_io, which would need to obtain the same index_lock). Instead, the other bio sets this flag to true, then submits the bio without a lock, then reobtains the lock and removes the bio from the pending_ops list. While this flag is on, other bios will not pop things off the pending_ops queue. This guarantees consistent ordering between primary and replicas
 
     // Communication between main threads and the networking thread
     struct workqueue_struct *broadcast_queue;
@@ -152,24 +151,18 @@ struct rollbaccine_device {
 struct bio_data {
     struct rollbaccine_device *device;
     struct bio *bio_src;
-    struct bio *deep_clone;
-    struct bio *shallow_clone;
+    struct bio *deep_clone; // Only present in leader, for broadcasting
+    struct bio *shallow_clone; // Only present in leader, for submitting to disk with a different end_io
+    sector_t start_sector; // Start: For checking against conflicts. These values may change after the bio is submitted, so store them here
+    sector_t end_sector;
     int write_index;
     bool is_fsync;
     atomic_t ref_counter;               // The number of clones. Once it hits 0, the bio can be freed
     struct work_struct broadcast_work;  // So this bio can be scheduled as a job
     struct work_struct submit_bio_work; // So this bio can be scheduled for submission after popping off pending ops
     struct rb_node tree_node;           // So this bio can be inserted into a tree
+    struct list_head pending_list;      // So this bio can be inserted into pending_ops
     unsigned char *checksum_and_iv;     // Checksums and IVs for each sector or page, if this is a write
-};
-
-// For each bio that is placed on the pending_ops queue. Necessary to keep separate from bio_data because the bio may be submitted (and its bio_data deleted) before it is removed from the pending_ops
-// queue, in order to avoid deadlock. See the note on processing_pending_ops.
-struct bio_sector_range {
-    sector_t start_sector;
-    sector_t end_sector;
-    struct bio *shallow_clone;
-    struct list_head list;
 };
 
 // Thread params: Parameters passed into threads. Should be freed by the thread when it exits.
@@ -208,7 +201,6 @@ bool requires_fsync(struct bio * bio);
 unsigned int remove_fsync_flags(unsigned int bio_opf);
 void free_pages_end_io(struct bio * received_bio);
 void try_free_clones(struct bio * clone);
-void disk_end_io(struct bio * shallow_clone);
 void leader_write_disk_end_io(struct bio * shallow_clone);
 void leader_read_disk_end_io(struct bio * shallow_clone);
 void replica_disk_end_io(struct bio * received_bio);
@@ -289,7 +281,7 @@ void submit_bio_task(struct work_struct *work) {
     // printk(KERN_INFO "Submitting bio from workqueue: %d", bio_data->write_index);
 
     if (bio_data->checksum_and_iv != NULL) {
-        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->bio_src->bi_iter.bi_sector, bio_sectors(bio_data->bio_src));
+        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
     }
     if (bio_data->shallow_clone != NULL) {
         submit_bio_noacct(bio_data->shallow_clone);
@@ -300,35 +292,28 @@ void submit_bio_task(struct work_struct *work) {
 }
 
 // Note: Caller must hold index_lock
-bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *shallow_clone) {
-    struct bio_data *bio_data = shallow_clone->bi_private;
-    struct bio_sector_range *sector_range;
-    sector_t start_sector = shallow_clone->bi_iter.bi_sector;
-    sector_t end_sector = start_sector + bio_sectors(shallow_clone);
-    struct bio_sector_range *pending_bio_range;
-    struct rb_node **potential_tree_node_location = &(device->outstanding_ops.rb_node);
-    struct rb_node *potential_parent_node = NULL;
-    struct bio_data *potential_parent_bio_data;
-    sector_t potential_parent_start_sector, potential_parent_end_sector;
+bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *bio) {
+    struct bio_data *bio_data = bio->bi_private;
+    struct rb_node **other_bio_tree_node_location = &(device->outstanding_ops.rb_node);
+    struct rb_node *other_bio_tree_node = NULL;
+    struct bio_data *other_bio_data;
 
     // See if we conflict with any operations that are already blocked
-    list_for_each_entry(pending_bio_range, &device->pending_ops, list) {
-        if (start_sector < pending_bio_range->end_sector && pending_bio_range->start_sector < end_sector) {
+    list_for_each_entry(other_bio_data, &device->pending_ops, pending_list) {
+        if (bio_data->start_sector < other_bio_data->end_sector && other_bio_data->start_sector < bio_data->end_sector) {
             goto block;
         }
     }
 
     // See if we conflict with any outstanding operations. If not, then get the place in the red black tree where we should insert this bio
-    while (*potential_tree_node_location != NULL) {
-        potential_parent_bio_data = container_of(*potential_tree_node_location, struct bio_data, tree_node);
-        potential_parent_start_sector = potential_parent_bio_data->bio_src->bi_iter.bi_sector;
-        potential_parent_end_sector = potential_parent_start_sector + bio_sectors(potential_parent_bio_data->bio_src);
+    while (*other_bio_tree_node_location != NULL) {
+        other_bio_data = container_of(*other_bio_tree_node_location, struct bio_data, tree_node);
+        other_bio_tree_node = *other_bio_tree_node_location;
 
-        potential_parent_node = *potential_tree_node_location;
-        if (end_sector <= potential_parent_start_sector)
-            potential_tree_node_location = &potential_parent_node->rb_left;
-        else if (start_sector >= potential_parent_end_sector)
-            potential_tree_node_location = &potential_parent_node->rb_right;
+        if (bio_data->end_sector <= other_bio_data->start_sector)
+            other_bio_tree_node_location = &other_bio_tree_node->rb_left;
+        else if (bio_data->start_sector >= other_bio_data->end_sector)
+            other_bio_tree_node_location = &other_bio_tree_node->rb_right;
         else
             goto block;
     }
@@ -336,30 +321,22 @@ bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct b
 #ifdef MEMORY_TRACKING
     device->num_rb_nodes += 1;
 #endif
-    rb_link_node(&bio_data->tree_node, potential_parent_node, potential_tree_node_location);
+    // Insert into rb tree with other_bio_tree_node as the parent at other_bio_tree_node_location
+    rb_link_node(&bio_data->tree_node, other_bio_tree_node, other_bio_tree_node_location);
     rb_insert_color(&bio_data->tree_node, &device->outstanding_ops);
     return true;
 
 block:
-    // Add to pending list. Malloc a sector range
-    sector_range = kmalloc(sizeof(struct bio_sector_range), GFP_KERNEL);
-    if (!sector_range) {
-        printk(KERN_ERR "Could not allocate sector range");
-        return false;
-    }
 #ifdef MEMORY_TRACKING
     device->num_bio_sector_ranges += 1;
+    device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges);
 #endif
-    sector_range->start_sector = start_sector;
-    sector_range->end_sector = end_sector;
-    sector_range->shallow_clone = shallow_clone;
-    list_add_tail(&sector_range->list, &device->pending_ops);
+    list_add_tail(&bio_data->pending_list, &device->pending_ops);
     return false;
 }
 
-void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *shallow_clone) {
-    struct bio_data *bio_data = shallow_clone->bi_private;
-    struct bio_sector_range *other_bio_sector_range;
+void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *bio) {
+    struct bio_data *bio_data = bio->bi_private;
     struct bio_data *other_bio_data;
 
     spin_lock(&device->index_lock);
@@ -368,38 +345,24 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
     device->max_outstanding_num_rb_nodes = umax(device->max_outstanding_num_rb_nodes, device->num_rb_nodes + 1);
 #endif
     rb_erase(&bio_data->tree_node, &device->outstanding_ops);
-    // If another bio is processing pending ops, then we don't need to (if we do, we might actually mess up ordering)
-    if (device->processing_pending_ops) {
-        spin_unlock(&device->index_lock);
-        return;
-    }
-    device->processing_pending_ops = true;
     while (!list_empty(&device->pending_ops)) {
-        other_bio_sector_range = list_first_entry(&device->pending_ops, struct bio_sector_range, list);
-        list_del(&other_bio_sector_range->list);
+        other_bio_data = list_first_entry(&device->pending_ops, struct bio_data, pending_list);
+        list_del(&other_bio_data->pending_list);
         // Check, in order, if the first pending op can be executed. If not, then break
-        if (!try_insert_into_outstanding_ops(device, other_bio_sector_range->shallow_clone)) {
-            kfree(other_bio_sector_range);  // Free this range, because the try function will alloc another range on failure
+        if (!try_insert_into_outstanding_ops(device, other_bio_data->bio_src)) {
 #ifdef MEMORY_TRACKING
             device->num_bio_sector_ranges -= 1;
-            device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges + 1);
 #endif
             break;
         }
 
         // Submit the other bio
-        other_bio_data = other_bio_sector_range->shallow_clone->bi_private;
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
         queue_work(device->submit_bio_queue, &other_bio_data->submit_bio_work);
-
-        // Remove the other bio
-        kfree(other_bio_sector_range);
 #ifdef MEMORY_TRACKING
         device->num_bio_sector_ranges -= 1;
-        device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges + 1);
 #endif
     }
-    device->processing_pending_ops = false;
     spin_unlock(&device->index_lock);
 }
 
@@ -471,6 +434,7 @@ void atomic_max(atomic_t *old, int new) {
 }
 
 void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed) {
+    return; // TODO: This function does nothing for now because it stalls. Remove once this works
     if (num_pages_needed > device->max_memory_pages) {
         printk_ratelimited(KERN_ERR "Write requires more memory than max pages allocated: %d, automatically allowing write through", num_pages_needed);
         return;
@@ -483,6 +447,7 @@ void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages
 }
 
 void release_memory(struct rollbaccine_device *device, int num_pages_released) {
+    return;  // TODO: This function does nothing for now because it stalls. Remove once this works
     if (num_pages_released > 0) {
         spin_lock(&device->memory_wait_queue.lock);
 #ifdef MEMORY_TRACKING
@@ -573,7 +538,6 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
             if (bio_write_index <= device->max_replica_fsync_index) {
                 // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
                 // Ack the fsync to the user
-                num_freed_sectors += bio_sectors(bio);
                 ack_bio_to_user_without_executing(bio);
                 // Remove from queue
                 bio_list_pop(&device->fsyncs_pending_replication);
@@ -586,8 +550,6 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
         }
     }
     spin_unlock(&device->replica_fsync_lock);
-
-    release_memory(device, num_freed_sectors / SECTORS_PER_PAGE);
 }
 
 // TODO: Replace with op_is_sync() to handle REQ_SYNC?
@@ -602,7 +564,11 @@ void free_pages_end_io(struct bio *received_bio) {
     struct bio_vec bvec;
     struct bvec_iter iter;
 
-    release_memory(device, bio_sectors(received_bio) / SECTORS_PER_PAGE);
+    release_memory(device, (bio_data->end_sector - bio_data->start_sector) / SECTORS_PER_PAGE);
+    // Free each page. Reset bio to start first, in case it's pointing to the end
+    received_bio->bi_iter.bi_sector = bio_data->start_sector;
+    received_bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
+    received_bio->bi_iter.bi_idx = 0;
     bio_for_each_segment(bvec, received_bio, iter) {
         page_cache_free(device, bvec.bv_page);
         // __free_page(bvec.bv_page);
@@ -639,19 +605,12 @@ void try_free_clones(struct bio *clone) {
         int num_deep_clones = atomic_dec_return(&bio_data->device->num_deep_clones_not_freed);
         atomic_max(&bio_data->device->max_outstanding_num_deep_clones, num_deep_clones + 1);
 #endif
+        release_memory(bio_data->device, (bio_data->end_sector - bio_data->start_sector) / SECTORS_PER_PAGE);
         bio_put(bio_data->shallow_clone);
         free_pages_end_io(bio_data->deep_clone);
     } else {
         // printk(KERN_INFO "Decrementing clone ref count to %d, write index: %d", atomic_read(&deep_clone_bio_data->ref_counter), deep_clone_bio_data->write_index);
     }
-}
-
-void disk_end_io(struct bio *shallow_clone) {
-    struct bio_data *bio_data = shallow_clone->bi_private;
-    struct rollbaccine_device *device = bio_data->device;
-
-    // Try to wake any pending writes
-    remove_from_outstanding_ops_and_unblock(device, shallow_clone);
 }
 
 void leader_read_disk_end_io(struct bio *shallow_clone) {
@@ -661,7 +620,7 @@ void leader_read_disk_end_io(struct bio *shallow_clone) {
     // Decrypt
     enc_or_dec_bio(bio_data, READ);
     // Unblock pending writes
-    disk_end_io(shallow_clone);
+    remove_from_outstanding_ops_and_unblock(device, shallow_clone);
     // Return to user
     bio_endio(bio_data->bio_src);
 
@@ -682,10 +641,9 @@ void leader_read_disk_end_io(struct bio *shallow_clone) {
 void leader_write_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
     // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
-    disk_end_io(shallow_clone);
+    remove_from_outstanding_ops_and_unblock(bio_data->device, shallow_clone);
     // Return to the user. If this is an fsync, wait for replication
     if (!bio_data->is_fsync) {
-        release_memory(bio_data->device, bio_sectors(bio_data->bio_src) / SECTORS_PER_PAGE);
         ack_bio_to_user_without_executing(bio_data->bio_src);
     }
     // Unlike replica_disk_end_io, the clone is sharing data with the clone used for networking, so we have to check if we can free
@@ -693,8 +651,9 @@ void leader_write_disk_end_io(struct bio *shallow_clone) {
 }
 
 void replica_disk_end_io(struct bio *received_bio) {
+    struct bio_data *bio_data = received_bio->bi_private;
     // printk(KERN_INFO "Replica clone ended, freeing");
-    disk_end_io(received_bio);
+    remove_from_outstanding_ops_and_unblock(bio_data->device, received_bio);
     free_pages_end_io(received_bio);
 }
 
@@ -762,7 +721,7 @@ void broadcast_bio(struct work_struct *work) {
 
         // 2. Send hash & IVs
         vec.iov_base = checksum_and_iv;
-        vec.iov_len = bio_checksum_and_iv_size(bio_sectors(clone));
+        vec.iov_len = bio_checksum_and_iv_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
         while (vec.iov_len > 0) {
             // printk(KERN_INFO "Sending checksums and IVs, size: %lu", vec.iov_len);
             sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
@@ -862,17 +821,10 @@ struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_sr
 }
 
 static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
-    bool is_fsync = false;
     bool is_cloned = false;
     bool doesnt_conflict_with_other_writes = true;
     struct rollbaccine_device *device = ti->private;
-    struct bio *deep_clone, *shallow_clone;  // deep clone is for the network, shallow clone is for submission to disk when necessary
     struct bio_data *bio_data;
-    unsigned char *bio_checksum_and_iv;
-    // For encryption so we can reset the write to the beginning of the block when we are done
-    sector_t original_sector = bio->bi_iter.bi_sector;
-    unsigned int original_size = bio->bi_iter.bi_size;
-    unsigned int original_idx = bio->bi_iter.bi_idx;
     cycles_t total_time = get_cycles_if_flag_on();
     cycles_t time = get_cycles_if_flag_on();
 
@@ -886,57 +838,52 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->bio_src = bio;
+        bio_data->start_sector = bio->bi_iter.bi_sector;
+        bio_data->end_sector = bio->bi_iter.bi_sector + bio_sectors(bio);
         
         switch (bio_data_dir(bio)) {
             case WRITE:
                 // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
                 block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
 
-                is_fsync = requires_fsync(bio);
+                bio_data->is_fsync = requires_fsync(bio);
                 // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
                 // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
 
                 // Encrypt
-                bio_checksum_and_iv = enc_or_dec_bio(bio_data, WRITE);
+                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, WRITE);
                 print_and_update_latency("rollbaccine_map: encryption", &time);
-                bio->bi_iter.bi_sector = original_sector;
-                bio->bi_iter.bi_size = original_size;
-                bio->bi_iter.bi_idx = original_idx;
 
                 // Create the network clone
-                deep_clone = deep_bio_clone(device, bio);
-                if (!deep_clone) {
+                bio_data->deep_clone = deep_bio_clone(device, bio);
+                if (!bio_data->deep_clone) {
                     printk(KERN_ERR "Could not create deep clone");
                     return DM_MAPIO_REMAPPED;
                 }
 
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
-                shallow_clone = shallow_bio_clone(device, deep_clone);
-                if (!shallow_clone) {
+                bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
+                if (!bio_data->shallow_clone) {
                     printk(KERN_ERR "Could not create shallow clone");
                     return DM_MAPIO_REMAPPED;
                 }
                 // Set end_io so once this write completes, queued writes can be unblocked
-                shallow_clone->bi_end_io = leader_write_disk_end_io;
+                bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
 
                 // Set shared data between clones
-                bio_data->shallow_clone = shallow_clone;
-                bio_data->deep_clone = deep_clone;
-                bio_data->is_fsync = is_fsync;
-                bio_data->checksum_and_iv = bio_checksum_and_iv;
                 atomic_set(&bio_data->ref_counter, 2);
                 INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
-                deep_clone->bi_private = bio_data;
-                shallow_clone->bi_private = bio_data;
+                bio_data->deep_clone->bi_private = bio_data;
+                bio_data->shallow_clone->bi_private = bio_data;
 
                 // Increment indices, place ops on queue, submit cloned ops to disk
                 spin_lock(&device->index_lock);
                 print_and_update_latency("rollbaccine_map: encryption -> obtained index lock", &time);
                 // Increment write index
                 bio_data->write_index = ++device->write_index;
-                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, shallow_clone);
-                // printk(KERN_INFO "Inserted clone %p, write index: %d", shallow_clone, bio_data->write_index);
-                if (is_fsync) {
+                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data->shallow_clone);
+                // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
+                if (bio_data->is_fsync) {
                     // Add original bio to fsyncs blocked on replication
                     bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
                     spin_lock(&device->replica_fsync_lock);
@@ -953,31 +900,31 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
                 if (doesnt_conflict_with_other_writes) {
-                    if (bio_checksum_and_iv != NULL) {
-                        update_global_checksum_and_iv(device, bio_checksum_and_iv, original_sector, bio_sectors(bio));
+                    if (bio_data->checksum_and_iv != NULL) {
+                        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
                     }
-                    submit_bio_noacct(shallow_clone);
+                    submit_bio_noacct(bio_data->shallow_clone);
                     print_and_update_latency("rollbaccine_map: submit", &time);
                 }
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
-                shallow_clone = shallow_bio_clone(device, bio);
-                if (!shallow_clone) {
+                bio_data->shallow_clone = shallow_bio_clone(device, bio);
+                if (!bio_data->shallow_clone) {
                     printk(KERN_ERR "Could not create shallow clone");
                     return DM_MAPIO_REMAPPED;
                 }
                 // Set end_io so once this cloned read completes, we can decrypt and send the original read along
-                shallow_clone->bi_end_io = leader_read_disk_end_io;
-                shallow_clone->bi_private = bio_data;
+                bio_data->shallow_clone->bi_end_io = leader_read_disk_end_io;
+                bio_data->shallow_clone->bi_private = bio_data;
 
                 // Block read if it conflicts with any other outstanding operations
                 spin_lock(&device->index_lock);
-                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, shallow_clone);
+                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data->shallow_clone);
                 spin_unlock(&device->index_lock);
 
                 if (doesnt_conflict_with_other_writes) {
-                    submit_bio_noacct(shallow_clone);
+                    submit_bio_noacct(bio_data->shallow_clone);
                 }
                 break;
         }
@@ -991,7 +938,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     int ret = 0;
     struct bio_vec bv;
-    uint64_t start_sector, curr_sector;
+    uint64_t curr_sector;
     struct aead_request *req;
     struct scatterlist sg[4];
     DECLARE_CRYPTO_WAIT(wait);
@@ -1001,7 +948,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
-    if (bio_sectors(bio_data->bio_src) == 0) {
+    if (bio_data->end_sector == bio_data->start_sector) {
         // printk(KERN_INFO "Skipping encryption/decryption for empty bio");
         return NULL;
     }
@@ -1017,8 +964,6 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
             goto free_and_return;
         }
         print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
-
-        start_sector = bio_data->bio_src->bi_iter.bi_sector;
     }
 
     while (bio_data->bio_src->bi_iter.bi_size) {
@@ -1028,8 +973,8 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
 
         switch (enc_or_dec) {
             case WRITE:
-                checksum = get_bio_checksum(bio_checksum_and_iv, start_sector, curr_sector);
-                iv = get_bio_iv(bio_checksum_and_iv, start_sector, curr_sector);
+                checksum = get_bio_checksum(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
+                iv = get_bio_iv(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
                 print_and_update_latency("enc_or_dec_bio: get bio checksum and iv", &time);
                 // Generate a new IV
                 // TODO: Maybe use RDRAND?
@@ -1099,6 +1044,10 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, int enc_or_dec) {
 
     free_and_return:
     aead_request_free(req);
+    // Reset bio to start after iterating for encryption
+    bio_data->bio_src->bi_iter.bi_sector = bio_data->start_sector;
+    bio_data->bio_src->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
+    bio_data->bio_src->bi_iter.bi_idx = 0;
     print_and_update_latency("enc_or_dec_bio", &total_time);
     return bio_checksum_and_iv; // NOTE: This will be NULL for reads
 }
@@ -1113,7 +1062,6 @@ void kill_thread(struct socket *sock) {
 // Function used by all listening sockets to block and listen to messages
 void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     struct metadata_msg metadata;
-    unsigned char *bio_checksum_and_iv;
     struct bio *received_bio;
     struct bio_data *bio_data;
     struct page *page;
@@ -1188,17 +1136,19 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         bio_data->write_index = metadata.write_index;
         device->write_index = metadata.write_index;
         bio_data->bio_src = received_bio;
+        bio_data->start_sector = metadata.sector;
+        bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
         received_bio->bi_private = bio_data;
 
         // 2. Expect hash next
         if (metadata.num_pages != 0) {
-            num_sectors = metadata.num_pages * PAGE_SIZE / SECTOR_SIZE;
+            num_sectors = metadata.num_pages * SECTORS_PER_PAGE;
             checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(num_sectors);
+            bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(num_sectors);
 #ifdef MEMORY_TRACKING
             atomic_inc(&device->num_checksum_and_ivs);
 #endif
-            vec.iov_base = bio_checksum_and_iv;
+            vec.iov_base = bio_data->checksum_and_iv;
             vec.iov_len = checksum_and_iv_size;
 
             // printk(KERN_INFO "Receiving checksums and IVs, size: %lu", vec.iov_len);
@@ -1225,7 +1175,6 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
                 }
             }
 #endif
-            bio_data->checksum_and_iv = bio_checksum_and_iv;
         }
 
         // 3. Receive pages of bio
@@ -1291,7 +1240,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         spin_unlock(&device->index_lock);
         if (no_conflict) {
             if (metadata.num_pages != 0) {
-                update_global_checksum_and_iv(device, bio_checksum_and_iv, metadata.sector, num_sectors);
+                update_global_checksum_and_iv(device, bio_data->checksum_and_iv, metadata.sector, num_sectors);
             }
             submit_bio_noacct(received_bio);
         }
@@ -1724,7 +1673,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     device->outstanding_ops = RB_ROOT;
     INIT_LIST_HEAD(&device->pending_ops);
-    device->processing_pending_ops = false;
 
     device->is_leader = strcmp(argv[4], "true") == 0;
 
