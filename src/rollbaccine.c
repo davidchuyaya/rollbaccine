@@ -317,16 +317,13 @@ bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct b
     struct bio_data *other_bio_data;
 
     // See if we conflict with any operations that are already blocked
-    printk(KERN_INFO "try_insert %d, Checking for conflicts with pending ops", bio_data->write_index);
     list_for_each_entry(other_bio_data, &device->pending_ops, pending_list) {
         if (bio_data->start_sector < other_bio_data->end_sector && other_bio_data->start_sector < bio_data->end_sector) {
-            printk(KERN_INFO "try_insert %d, Conflict with pending op %d", bio_data->write_index, other_bio_data->write_index);
             return false;
         }
     }
 
     // See if we conflict with any outstanding operations. If not, then get the place in the red black tree where we should insert this bio
-    printk(KERN_INFO "try_insert %d, Checking for conflicts with outstanding ops", bio_data->write_index);
     while (*other_bio_tree_node_location != NULL) {
         other_bio_data = container_of(*other_bio_tree_node_location, struct bio_data, tree_node);
         other_bio_tree_node = *other_bio_tree_node_location;
@@ -335,20 +332,16 @@ bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct b
             other_bio_tree_node_location = &other_bio_tree_node->rb_left;
         else if (bio_data->start_sector >= other_bio_data->end_sector)
             other_bio_tree_node_location = &other_bio_tree_node->rb_right;
-        else {
-            printk(KERN_INFO "try_insert %d, Conflict with outstanding op %d", bio_data->write_index, other_bio_data->write_index);
+        else
             return false;
-        }
     }
     // No conflicts, add this bio to the red black tree
 #ifdef MEMORY_TRACKING
     device->num_rb_nodes += 1;
 #endif
     // Insert into rb tree with other_bio_tree_node as the parent at other_bio_tree_node_location
-    printk(KERN_INFO "try_insert %d, Inserting into rb tree", bio_data->write_index);
     rb_link_node(&bio_data->tree_node, other_bio_tree_node, other_bio_tree_node_location);
     rb_insert_color(&bio_data->tree_node, &device->outstanding_ops);
-    printk(KERN_INFO "try_insert %d, Inserted into rb tree", bio_data->write_index);
     return true;
 }
 
@@ -357,40 +350,32 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
     struct bio_data *other_bio_data;
     unsigned long flags;
 
-    printk(KERN_INFO "remove_from_outstanding_ops %d, Obtaining lock", bio_data->write_index);
     spin_lock_irqsave(&device->index_lock, flags);
 #ifdef MEMORY_TRACKING
     device->num_rb_nodes -= 1;
     device->max_outstanding_num_rb_nodes = umax(device->max_outstanding_num_rb_nodes, device->num_rb_nodes + 1);
 #endif
-    printk(KERN_INFO "remove_from_outstanding_ops %d, Removing from rb tree", bio_data->write_index);
     rb_erase(&bio_data->tree_node, &device->outstanding_ops);
-    printk(KERN_INFO "remove_from_outstanding_ops %d, Removed from rb tree", bio_data->write_index);
     while (!list_empty(&device->pending_ops)) {
         other_bio_data = list_first_entry(&device->pending_ops, struct bio_data, pending_list);
         list_del(&other_bio_data->pending_list);
         // Check, in order, if the first pending op can be executed. If not, then break
-        printk(KERN_INFO "remove_from_outstanding_ops %d, Checking if we can execute pending op %d", bio_data->write_index, other_bio_data->write_index);
         if (!try_insert_into_outstanding_ops(device, other_bio_data->bio_src)) {
 #ifdef MEMORY_TRACKING
             device->num_bio_sector_ranges -= 1;
 #endif
             add_to_pending_ops_head(device, other_bio_data);
-            printk(KERN_INFO "remove_from_outstanding_ops %d, Can't execute pending op %d", bio_data->write_index, other_bio_data->write_index);
             break;
         }
-        printk(KERN_INFO "remove_from_outstanding_ops %d, Queuing pending op %d", bio_data->write_index, other_bio_data->write_index);
 
         // Submit the other bio
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
         queue_work(device->submit_bio_queue, &other_bio_data->submit_bio_work);
-        printk(KERN_INFO "remove_from_outstanding_ops %d, Queued pending op %d", bio_data->write_index, other_bio_data->write_index);
 #ifdef MEMORY_TRACKING
         device->num_bio_sector_ranges -= 1;
 #endif
     }
     spin_unlock_irqrestore(&device->index_lock, flags);
-    printk(KERN_INFO "remove_from_outstanding_ops %d, Released lock", bio_data->write_index);
 }
 
 // Put the freed page back in the cache for reuse
