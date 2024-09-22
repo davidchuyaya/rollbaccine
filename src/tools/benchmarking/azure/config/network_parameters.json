@@ -1,0 +1,7 @@
+{
+    "vnet_name": "rollbaccine_vnet",
+    "subnet_name": "rollbaccine_subset",
+    "address_space": "10.0.0.0/16",
+    "subnet_prefix": "10.0.0.0/16",
+    "location": "eastus"
+}

@@ -1,0 +1,19 @@
+{
+    "location": "eastus",
+    "hardware_profile": {
+        "vm_size": "Standard_DS1_v2"  
+    },
+    "storage_profile": {
+        "image_reference": {
+            "publisher": "Canonical",
+            "offer": "UbuntuServer",
+            "sku": "24.04-LTS", 
+            "version": "latest"
+        }
+    },
+    "os_profile": {
+        "computer_name": "myVM",  
+        "admin_username": "rollbaccine", 
+        "admin_password": "rollbaccine" 
+    }
+}
