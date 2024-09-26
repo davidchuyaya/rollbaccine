@@ -1,19 +1,26 @@
 {
-    "location": "eastus",
+    "location": "northeurope",
     "hardware_profile": {
-        "vm_size": "Standard_DS1_v2"  
+        "vm_size": "Standard_DC16ads_v5"
     },
     "storage_profile": {
         "image_reference": {
             "publisher": "Canonical",
             "offer": "UbuntuServer",
-            "sku": "24.04-LTS", 
+            "sku": "24_04-lts",
             "version": "latest"
         }
     },
     "os_profile": {
-        "computer_name": "myVM",  
-        "admin_username": "rollbaccine", 
-        "admin_password": "rollbaccine" 
+        "admin_username": "rollbaccine",
+        "linux_configuration": {
+            "disable_password_authentication": true,
+            "ssh": {
+                "public_keys": [{
+                    "path": "/home/rollbaccine/.ssh/authorized_keys",
+                    "key_data": "your-ssh-public-key"
+                }]
+            }
+        }
     }
 }
