@@ -133,14 +133,16 @@ for i in range(NUM_VMS):
                 )
             )
         ),
-        "network_profile": {
-            "network_interfaces": [
-                NetworkInterfaceReference(
-                    id=f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP_NAME}/providers/Microsoft.Network/networkInterfaces/{INTERFACE_NAME}",
-                    properties={"primary": True}
-                )
+        "networkProfile": {
+            "networkInterfaces": [
+                {
+                    "id": f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP_NAME}/providers/Microsoft.Network/networkInterfaces/{INTERFACE_NAME}",
+                    "properties": {
+                        "primary": True
+                    }
+                }
             ]
-        },
+    },
         "security_profile": {
             "security_type": "ConfidentialVM",
             "uefi_settings": {
