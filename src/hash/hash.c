@@ -10,6 +10,8 @@
 
 #define SHA256_LENGTH 256
 #define MIN_IOS 64
+// Defined if hash should be used as signature
+#define HMAC
 
 // Data attached to each bio
 struct hash_device
@@ -64,7 +66,13 @@ static int hash_constructor(struct dm_target *ti, unsigned int argc, char **argv
     }
 
     // initialize cipher handle (instance) of sha256
+#ifdef HMAC
+    printk(KERN_INFO "Using HMAC");
+    rbd->alg = crypto_alloc_shash("hmac(sha256)", 0, 0);
+    crypto_shash_setkey(rbd->alg, "abcdefghijklmnop", 16);
+#elif
     rbd->alg = crypto_alloc_shash("sha256", 0, 0);
+#endif
     if (IS_ERR(rbd->alg))
     {
         pr_info("can't alloc alg sha256\n");
@@ -136,7 +144,7 @@ static void hash_at_end_io(struct bio *clone) {
     bio_put(clone);
 
     // hash 
-    hash_bio(read_bio, rbd);
+    // hash_bio(read_bio, rbd);
 
     // release the read bio
     bio_endio(read_bio);
