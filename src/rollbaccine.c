@@ -43,7 +43,7 @@
 #define TLS_ON
 // #define MULTITHREADED_NETWORK
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
-#define LATENCY_TRACKING
+// #define LATENCY_TRACKING
 
 // Used to compare against checksums to see if they have been set yet (or if they're all 0)
 static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
@@ -202,10 +202,9 @@ struct listen_thread_params {
 
 void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
 void submit_bio_task(struct work_struct *work);
-void add_to_pending_ops_head(struct rollbaccine_device *device, struct bio_data *bio_data);
 void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data);
 // Returns true if the insert was successful, false if there's a conflict
-bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *shallow_clone); 
+bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio_data *bio_data, bool check_pending); 
 void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *shallow_clone);
 void page_cache_free(struct rollbaccine_device *device, struct page *page_to_free);
 void page_cache_destroy(struct rollbaccine_device *device);
@@ -311,14 +310,6 @@ void submit_bio_task(struct work_struct *work) {
     }
 }
 
-void add_to_pending_ops_head(struct rollbaccine_device *device, struct bio_data *bio_data) {
-#ifdef MEMORY_TRACKING
-    device->num_bio_sector_ranges += 1;
-    device->max_outstanding_num_bio_sector_ranges = umax(device->max_outstanding_num_bio_sector_ranges, device->num_bio_sector_ranges);
-#endif
-    list_add_tail(&bio_data->pending_list, &device->pending_ops);
-}
-
 void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data) {
 #ifdef MEMORY_TRACKING
     device->num_bio_sector_ranges += 1;
@@ -328,16 +319,17 @@ void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data 
 }
 
 // Note: Caller must hold index_lock
-bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio *bio) {
-    struct bio_data *bio_data = bio->bi_private;
+bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct bio_data *bio_data, bool check_pending) {
     struct rb_node **other_bio_tree_node_location = &(device->outstanding_ops.rb_node);
     struct rb_node *other_bio_tree_node = NULL;
     struct bio_data *other_bio_data;
 
     // See if we conflict with any operations that are already blocked
-    list_for_each_entry(other_bio_data, &device->pending_ops, pending_list) {
-        if (bio_data->start_sector < other_bio_data->end_sector && other_bio_data->start_sector < bio_data->end_sector) {
-            return false;
+    if (check_pending) {
+        list_for_each_entry(other_bio_data, &device->pending_ops, pending_list) {
+            if (bio_data->start_sector < other_bio_data->end_sector && other_bio_data->start_sector < bio_data->end_sector) {
+                return false;
+            }
         }
     }
 
@@ -376,18 +368,14 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
     rb_erase(&bio_data->tree_node, &device->outstanding_ops);
     while (!list_empty(&device->pending_ops)) {
         other_bio_data = list_first_entry(&device->pending_ops, struct bio_data, pending_list);
-        list_del(&other_bio_data->pending_list);
         // Check, in order, if the first pending op can be executed. If not, then break
-        if (!try_insert_into_outstanding_ops(device, other_bio_data->bio_src)) {
-#ifdef MEMORY_TRACKING
-            device->num_bio_sector_ranges -= 1;
-#endif
-            add_to_pending_ops_head(device, other_bio_data);
+        if (!try_insert_into_outstanding_ops(device, other_bio_data, false)) {
             break;
         }
 
         // Submit the other bio
-        INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
+        list_del(&other_bio_data->pending_list);
+        INIT_WORK(&other_bio_data->submit_bio_work, submit_bio_task);
         queue_work(device->submit_bio_queue, &other_bio_data->submit_bio_work);
 #ifdef MEMORY_TRACKING
         device->num_bio_sector_ranges -= 1;
@@ -520,7 +508,6 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
     bool max_index_changed = false;
     struct bio *bio;
     int bio_write_index;
-    int num_freed_sectors = 0;
     unsigned long flags;
 
     spin_lock_irqsave(&device->replica_fsync_lock, flags);
@@ -927,7 +914,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 print_and_update_latency("rollbaccine_map: encryption -> obtained index lock", &time);
                 // Increment write index
                 bio_data->write_index = ++device->write_index;
-                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data->shallow_clone);
+                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true);
                 if (!doesnt_conflict_with_other_writes) {
                     add_to_pending_ops_tail(device, bio_data);
                 }
@@ -969,7 +956,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 // Block read if it conflicts with any other outstanding operations
                 spin_lock_irqsave(&device->index_lock, flags);
-                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data->shallow_clone);
+                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true); // Note: It actually doesn't matter for correctness whether reads check the pending list or not
                 if (!doesnt_conflict_with_other_writes) {
                     add_to_pending_ops_tail(device, bio_data);
                 }
@@ -1325,7 +1312,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
 
         // 6. Submit bio, if there are no conflicts. Otherwise blocks and waits for a finished bio to unblock it.
         spin_lock_irqsave(&device->index_lock, flags);
-        no_conflict = try_insert_into_outstanding_ops(device, received_bio);
+        no_conflict = try_insert_into_outstanding_ops(device, bio_data, true);
         if (!no_conflict) {
             add_to_pending_ops_tail(device, bio_data);
         }
@@ -1794,7 +1781,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
 
     device->submit_bio_queue = alloc_workqueue("submit bio queue", 0, 0);
-    if (!device->broadcast_queue) {
+    if (!device->submit_bio_queue) {
         printk(KERN_ERR "Cannot allocate submit bio queue");
         return -ENOMEM;
     }
@@ -1967,6 +1954,7 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     crypto_free_aead(device->tfm);
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
     destroy_workqueue(device->broadcast_queue);
+    destroy_workqueue(device->submit_bio_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
