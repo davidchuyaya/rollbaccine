@@ -7,29 +7,42 @@ from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.compute.models import ProximityPlacementGroup, DiskCreateOptionTypes, ImageReference, OSProfile, LinuxConfiguration, SshConfiguration, SshPublicKey
-from azure.mgmt.network.models import NetworkSecurityGroup
+from azure.mgmt.network.models import NetworkSecurityGroup, SecurityRule
 
 
 load_dotenv()
-SUBSCRIPTION_ID = os.getenv('SUBSCRIPTION_ID')
+
+with open('config.json') as config_file:
+    config = json.load(config_file)
+
+for key, value in config.items():
+    if isinstance(value, str) and value.startswith("$"):
+        env_var = value[1:]  # Strip out the $ sign
+        config[key] = os.getenv(env_var)  # Replace with env variable if available
+
+# Now the `config` dictionary has the actual environment variables injected
+print(config)
+
+SUBSCRIPTION_ID = config['subscription_id']
+RESOURCE_GROUP_NAME = config['resource_group_name']
+PROXIMITY_PLACEMENT_GROUP_NAME = config['proximity_placement_group_name']
+USERNAME = config['username']
+VM_SIZE = config['vm_size']
+NUM_VMS = config['num_vms']
+LOCATION = config['location']
+ZONE = config['zone']
+NSG_NAME = config['nsg_name']
+VNET_NAME = config['vnet_name']
+SUBNET_NAME = config['subnet_name']
+INTERFACE_NAME = config['interface_name']
+PRIVATE_KEY_PATH = config['ssh_key_path']
+SCRIPT_PATH = config['install_script_path']
+vm_ip_data = {}
+
 
 resource_client = ResourceManagementClient(credential=DefaultAzureCredential(), subscription_id=SUBSCRIPTION_ID)
 compute_client = ComputeManagementClient(credential=DefaultAzureCredential(), subscription_id=SUBSCRIPTION_ID)
 network_client = NetworkManagementClient(credential=DefaultAzureCredential(), subscription_id=SUBSCRIPTION_ID)
-
-RESOURCE_GROUP_NAME = 'rollbaccine_adit'
-PROXIMITY_PLACEMENT_GROUP_NAME = 'rollbaccine_placement_group'
-USERNAME = 'adit'
-VM_SIZE = 'Standard_DC16ads_v5'
-NUM_VMS = 3
-LOCATION = "eastus"
-ZONE = 2
-NSG_NAME = f"{RESOURCE_GROUP_NAME}_nsg"
-VNET_NAME = f"{RESOURCE_GROUP_NAME}_vnet"
-SUBNET_NAME = f"{RESOURCE_GROUP_NAME}_subnet"
-INTERFACE_NAME = f"{RESOURCE_GROUP_NAME}_interface"
-vm_ip_data = {}
-
 
 print(f"Creating Resource Group: {RESOURCE_GROUP_NAME}")
 # Create resource group
@@ -54,6 +67,29 @@ nsg_result = network_client.network_security_groups.begin_create_or_update(
 ).result()
 
 print(f"Network Security Group with rules created: {NSG_NAME}")
+
+# Define inbound SSH rule (Allow SSH on port 22)
+ssh_rule_params = SecurityRule(
+    protocol='Tcp',
+    source_address_prefix='*',
+    destination_address_prefix='*',
+    access='Allow',
+    direction='Inbound',
+    source_port_range='*',
+    destination_port_range='22', 
+    priority=1000,
+    name='Allow_SSH'
+)
+
+# Create the security rule in the NSG
+nsg_rule_result = network_client.security_rules.begin_create_or_update(
+    RESOURCE_GROUP_NAME, 
+    NSG_NAME, 
+    'Allow_SSH',
+    ssh_rule_params
+).result()
+
+print("SSH rule added to NSG.")
 
 print(f"Creating Virtual Network: {VNET_NAME}")
 # Create vnet
@@ -217,7 +253,6 @@ with open('vm_ips.json', 'w') as json_file:
     json.dump(vm_ip_data, json_file, indent=4)
 
 print("Public and Private IPs saved to vm_ips.json")
-    
-# Run setup script on VM using SSH and Paramiko
+
 
 

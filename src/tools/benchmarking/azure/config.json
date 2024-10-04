@@ -1,0 +1,16 @@
+{
+    "subscription_id": "$SUBSCRIPTION_ID",
+    "resource_group_name": "rollbaccine_adit",
+    "proximity_placement_group_name": "rollbaccine_placement_group",
+    "username": "adit",
+    "vm_size": "Standard_DC16ads_v5",
+    "num_vms": 2,
+    "location": "eastus",
+    "zone": 2,
+    "nsg_name": "rollbaccine_adit_nsg",
+    "vnet_name": "rollbaccine_adit_vnet",
+    "subnet_name": "rollbaccine_adit_subnet",
+    "interface_name": "rollbaccine_adit_interface",
+    "ssh_key_path": "$PRIVATE_KEY_PATH",
+    "install_script_path": "install_rollbaccine.sh"
+  }
