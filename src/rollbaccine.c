@@ -157,6 +157,8 @@ struct rollbaccine_device {
 #endif
 };
 
+DEFINE_PER_CPU(int, num_ops_on_cpu);
+
 // Associated data for each bio, shared between clones
 struct bio_data {
     struct rollbaccine_device *device;
@@ -904,6 +906,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bio_set_dev(bio, device->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
+    this_cpu_inc(num_ops_on_cpu);
+
     // Copy bio if it's a write
     if (device->is_leader) {
         is_cloned = true;
@@ -1618,6 +1622,7 @@ int start_server(struct rollbaccine_device *device, ushort port) {
 static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigned int status_flags, char *result, unsigned int maxlen) {
     struct rollbaccine_device *device = ti->private;
     unsigned int sz = 0;  // Required by DMEMIT
+    int cpu_id;
 
     DMEMIT("\n");
 
@@ -1642,6 +1647,10 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
+
+    for_each_online_cpu(cpu_id) {
+        DMEMIT("Number of operations on CPU %d: %d\n", cpu_id, per_cpu(num_ops_on_cpu, cpu_id));
+    }
 }
 
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = max_memory_pages, 6 = key, 7= listen port. 8+ = server addr & ports
