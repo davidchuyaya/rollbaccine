@@ -4,7 +4,7 @@
 - [Everyday development](#everyday-development)
 - [Benchmarking](#benchmarking)
 
-Create a Ubuntu 24.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758). The 24.04 version is required for in-kernel TLS.
+Create a Ubuntu 24.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758).
 
 
 
@@ -256,35 +256,6 @@ sudo dmsetup status server1
 ```
 `server1` can be replaced with `server2` to check the status of the replica instead of the primary.
 To see memory tracking statistics, you will need to uncomment `#define MEMORY_TRACKING`.
-
-#### TLS
-To enable/disable TLS, comment out the `#define TLS` line in [server.c](src/network/server.c).  
-Run the following instructions *before* setting up networking.
-
-Create the certificates for TLS, if the files don't already exist in the [network](network) directory. As we create more replicas, we'll have to add all their certificates to the `tls_certs.pem` file by concatenating them. Replace `localhost` with the address of the node:
-```bash
-openssl req -x509 -newkey rsa:4096 -keyout 0_key.pem -out 0_cert.pem -sha256 -days 365 -nodes -nodes -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=localhost"
-openssl req -x509 -newkey rsa:4096 -keyout 1_key.pem -out 1_cert.pem -sha256 -days 365 -nodes -nodes -subj "/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN=localhost"
-cat 0_cert.pem 1_cert.pem > tls_certs.pem
-```
-
-Install [ktls-utils](https://github.com/oracle/ktls-utils), since kTLS itself can't actually perform the handshake; [it requires an application in userspace to do it](https://docs.kernel.org/networking/tls-handshake.html#user-handshake-agent) for security concerns [[1](https://lwn.net/Articles/892216/)][[2](https://lwn.net/Articles/896746/)]:
-```bash
-sudo apt install -y automake pkg-config cmake-data gnutls-bin libgnutls28-dev libkeyutils-dev libglib2.0-dev libnl-3-dev libnl-genl-3-dev
-git clone https://github.com/oracle/ktls-utils
-cd ktls-utils
-sudo ./autogen.sh
-sudo ./configure --with-systemd
-sudo make
-sudo make install
-sudo cp *.pem /etc # Move all the certificates to the right directory
-sudo cp tlshd.conf /etc # Move the config
-sudo systemctl daemon-reload
-sudo systemctl enable --now tlshd
-```
-This is known to work for commit e55cefda944595fd83b609eba7ad8f819fa1c9d3. Roll it back with `git checkout`.
-
-If ktls-utils stops working, check its logs with `journalctl -b` and filter for "tls".
 
 
 ### Integrity

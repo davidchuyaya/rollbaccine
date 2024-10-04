@@ -74,24 +74,6 @@ echo "Public IP 1: "$PUBLIC_IP_1
 echo "Private IP 0: "$PRIVATE_IP_0
 echo "Private IP 1: "$PRIVATE_IP_1
 
-echo "Creating certificates"
-# Note: These CN names are specific to Azure VMs
-openssl req -x509 -newkey rsa:4096 -keyout 0_key.pem -out 0_cert.pem \
-  -sha256 -days 365 -nodes -nodes -subj '/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN='$NAME'0.internal.cloudapp.net'
-openssl req -x509 -newkey rsa:4096 -keyout 1_key.pem -out 1_cert.pem \
-  -sha256 -days 365 -nodes -nodes -subj '/C=US/ST=CA/L=Berkeley/O=UCB/OU=SkyLab/CN='$NAME'1.internal.cloudapp.net'
-cat 0_cert.pem 1_cert.pem > tls_certs.pem
-
-echo "Copying certificates and tls config files to servers"
-scp -r -o StrictHostKeyChecking=no *.pem $USERNAME@$PUBLIC_IP_0:~/
-scp -r -o StrictHostKeyChecking=no src/network/conf0/tlshd.conf $USERNAME@$PUBLIC_IP_0:~/
-scp -r -o StrictHostKeyChecking=no *.pem $USERNAME@$PUBLIC_IP_1:~/
-scp -r -o StrictHostKeyChecking=no src/network/conf1/tlshd.conf $USERNAME@$PUBLIC_IP_1:~/
-
-echo "Installing ktls-utils on servers"
-ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_0 "bash -s" -- < install_ktls_utils.sh
-ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_1 "bash -s" -- < install_ktls_utils.sh
-
 echo "Installing rollbaccine on servers"
 ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_0 "bash -s" -- < install_rollbaccine.sh
 ssh -o StrictHostKeyChecking=no $USERNAME@$PUBLIC_IP_1 "bash -s" -- < install_rollbaccine.sh
