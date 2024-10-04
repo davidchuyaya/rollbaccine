@@ -483,7 +483,6 @@ void atomic_max(atomic_t *old, int new) {
 }
 
 void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed) {
-    return; // TODO: This function does nothing for now because it stalls. Remove once this works
     unsigned long flags;
     if (num_pages_needed > device->max_memory_pages) {
         printk_ratelimited(KERN_ERR "Write requires more memory than max pages allocated: %d, automatically allowing write through", num_pages_needed);
@@ -497,7 +496,6 @@ void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages
 }
 
 void release_memory(struct rollbaccine_device *device, int num_pages_released) {
-    return;  // TODO: This function does nothing for now because it stalls. Remove once this works
     unsigned long flags;
     if (num_pages_released > 0) {
         spin_lock_irqsave(&device->memory_wait_queue.lock, flags);
