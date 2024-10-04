@@ -11,23 +11,37 @@ from azure.mgmt.network.models import NetworkSecurityGroup, SecurityRule
 
 
 load_dotenv()
-SUBSCRIPTION_ID = os.getenv('SUBSCRIPTION_ID')
+username = os.getenv('AZURE_USERNAME')
+
+with open('config.json') as config_file:
+    config = json.load(config_file)
+
+for key, value in config.items():
+    if isinstance(value, str) and value.startswith("$"):
+        env_var = value[1:]
+        config[key] = os.getenv(env_var)
+    if isinstance(value, str) and "{username}" in value:
+        config[key] = value.replace("{username}", username)
+
+SUBSCRIPTION_ID = config['subscription_id']
+RESOURCE_GROUP_NAME = config['resource_group_name']
+PROXIMITY_PLACEMENT_GROUP_NAME = config['proximity_placement_group_name']
+USERNAME = config['username']
+VM_SIZE = config['vm_size']
+NUM_VMS = config['num_vms']
+LOCATION = config['location']
+ZONE = config['zone']
+NSG_NAME = config['nsg_name']
+VNET_NAME = config['vnet_name']
+SUBNET_NAME = config['subnet_name']
+INTERFACE_NAME = config['interface_name']
+PRIVATE_KEY_PATH = config['ssh_key_path']
+SCRIPT_PATH = config['install_script_path']
+
 
 resource_client = ResourceManagementClient(credential=DefaultAzureCredential(), subscription_id=SUBSCRIPTION_ID)
 compute_client = ComputeManagementClient(credential=DefaultAzureCredential(), subscription_id=SUBSCRIPTION_ID)
 network_client = NetworkManagementClient(credential=DefaultAzureCredential(), subscription_id=SUBSCRIPTION_ID)
-
-RESOURCE_GROUP_NAME = 'rollbaccine_adit'
-PROXIMITY_PLACEMENT_GROUP_NAME = 'rollbaccine_placement_group'
-USERNAME = 'adit'
-VM_SIZE = 'Standard_DC16ads_v5'
-NUM_VMS = 3
-LOCATION = "eastus"
-ZONE = 2
-NSG_NAME = f"{RESOURCE_GROUP_NAME}_nsg"
-VNET_NAME = f"{RESOURCE_GROUP_NAME}_vnet"
-SUBNET_NAME = f"{RESOURCE_GROUP_NAME}_subnet"
-INTERFACE_NAME = f"{RESOURCE_GROUP_NAME}_interface"
 
 def delete_resources():
     # Check and delete Virtual Machines

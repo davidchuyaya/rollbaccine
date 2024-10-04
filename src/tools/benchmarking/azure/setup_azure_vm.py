@@ -12,13 +12,17 @@ from azure.mgmt.network.models import NetworkSecurityGroup, SecurityRule
 
 load_dotenv()
 
+username = os.getenv('AZURE_USERNAME')
+
 with open('config.json') as config_file:
     config = json.load(config_file)
 
 for key, value in config.items():
     if isinstance(value, str) and value.startswith("$"):
-        env_var = value[1:]  # Strip out the $ sign
-        config[key] = os.getenv(env_var)  # Replace with env variable if available
+        env_var = value[1:]
+        config[key] = os.getenv(env_var)
+    if isinstance(value, str) and "{username}" in value:
+        config[key] = value.replace("{username}", username)
 
 # Now the `config` dictionary has the actual environment variables injected
 print(config)
