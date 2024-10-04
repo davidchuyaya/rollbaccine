@@ -21,14 +21,11 @@
 #include <linux/tcp.h>
 #include <linux/timex.h>
 #include <linux/vmalloc.h>
-#include <net/handshake.h>  // For TLS
 #include <net/sock.h>
-#include <net/tls_prot.h>
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
 #define ROLLBACCINE_RETRY_TIMEOUT 5000  // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
-#define ROLLBACCINE_TLS_TIMEOUT 5000  // Number of milliseconds to wait for TLS handshake to complete
 #define ROLLBACCINE_ENCRYPTION_GRANULARITY PAGE_SIZE
 // #define ROLLBACCINE_ENCRYPTION_GRANULARITY SECTOR_SIZE
 #define ROLLBACCINE_SECTORS_PER_ENCRYPTION (ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE)
@@ -38,9 +35,9 @@
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
+#define SHA256_SIZE 32
 #define MODULE_NAME "rollbaccine"
 
-#define TLS_ON
 // #define MULTITHREADED_NETWORK
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 // #define LATENCY_TRACKING
@@ -61,6 +58,8 @@ struct ballot {
 struct metadata_msg {
     enum MsgType type;
     struct ballot bal;
+    uint64_t sender_id;
+    uint64_t msg_index;
     uint64_t write_index;
     uint64_t num_pages;
 
@@ -69,18 +68,12 @@ struct metadata_msg {
     sector_t sector;
     // Hash and IV for each write
     char checksum_and_iv[ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE];
+    char msg_hash[SHA256_SIZE];
 } __attribute__((packed));
 
 // Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
 struct socket_list {
     struct socket *sock;
-    struct list_head list;
-};
-
-struct socket_pair_list {
-    struct socket *tls_sock;
-    struct socket *regular_sock;
-    uint64_t id;
     struct list_head list;
 };
 
@@ -104,7 +97,9 @@ struct rollbaccine_device {
     uint64_t id;
 
     struct ballot bal;
-    int write_index;        // Doesn't need to be atomic because only the broadcast thread will modify this
+    int write_index;
+    // TODO: Track last msg index per unique sender (since the primary may change)
+    uint64_t last_msg_index;     // Doesn't need to be atomic because only the broadcast thread will modify this
     spinlock_t index_lock;  // Must be obtained for any operation modifying write_index and queues ordered by those indices
 
     // Logic for fsyncs blocking on replication
@@ -129,11 +124,15 @@ struct rollbaccine_device {
     // Connected sockets. Should be a subset of the sockets above. Handy for broadcasting
     // TODO: Need to figure out network handshake so we know who we're talking to.
     struct mutex connected_sockets_lock;
-    struct list_head connected_socket_pairs;
+    struct list_head connected_sockets;
 
     // AEAD
     struct crypto_aead *tfm;
     char *checksums;
+
+    // Hashing
+    struct crypto_shash *hash_alg;
+    struct shash_desc *hash_desc;
 
     // Counters for tracking memory usage
 #ifdef MEMORY_TRACKING
@@ -182,22 +181,16 @@ struct client_thread_params {
     struct socket *sock;
     struct sockaddr_in addr;
     struct rollbaccine_device *device;
-    struct socket_pair_list *socket_pair;
-    bool tls;
 };
 
 struct accepted_thread_params {
     struct socket *sock;
     struct rollbaccine_device *device;
-    struct socket_pair_list *socket_pair;
-    bool tls;
 };
 
 struct listen_thread_params {
     struct socket *sock;
     struct rollbaccine_device *device;
-    struct socket_pair_list *socket_pair;
-    bool tls;
 };
 
 void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
@@ -226,21 +219,56 @@ void network_end_io(struct bio * deep_clone);
 void broadcast_bio(struct work_struct * work);
 struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
+bool verify_msg(struct rollbaccine_device *device, void *msg, size_t msg_size, char *expected_hash, uint64_t msg_index);
+void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out);
 // Returns array of checksums and IVs for writes, NULL for reads
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 void kill_thread(struct socket * sock);
-void blocking_read(struct rollbaccine_device * device, struct socket_pair_list *socket_pair);
-#ifdef TLS_ON
-void on_tls_handshake_done(void *data, int status, key_serial_t peerid);
-#endif
-void blocking_id_handshake_and_read(struct rollbaccine_device *device, struct socket *sock, bool tls);
+void blocking_read(struct rollbaccine_device * device, struct socket *sock);
 int connect_to_server(void *args);
-int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port, bool tls);
+int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port);
 int listen_to_accepted_socket(void *args);
 int listen_for_connections(void *args);
-int start_server(struct rollbaccine_device *device, ushort port, bool tls);
+int start_server(struct rollbaccine_device *device, ushort port);
 int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
+
+// Helper functions to manage the "additional_hash_msg" struct.
+//
+// struct additional_hash_msg {
+//     uint64_t sender_id;
+//     uint64_t msg_index;
+//     char checksum_and_iv[?];
+//     char msg_hash[SHA256_SIZE];
+// };
+//
+// We can't actually have such a struct, because:
+// 1. We want to hash its contents as a continuous buffer in memory and store the hash digest in msg_hash
+// 2. Checksum_and_iv is variable size.
+inline void *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
+    size_t size = sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE;
+    return kmalloc(size, GFP_KERNEL);
+}
+
+inline void additional_hash_msg_set_sender_id(void *msg, uint64_t sender_id) { *(uint64_t *)msg = sender_id; }
+
+inline void additional_hash_msg_set_msg_index(void *msg, uint64_t msg_index) { *(uint64_t *)(msg + sizeof(uint64_t)) = msg_index; }
+
+inline void additional_hash_msg_set_checksum_and_iv(void *msg, char *checksum_and_iv, size_t checksum_and_iv_size) {
+    memcpy(msg + sizeof(uint64_t) + sizeof(uint64_t), checksum_and_iv, checksum_and_iv_size);
+}
+
+inline uint64_t additional_hash_msg_get_sender_id(void *msg) { return *(uint64_t *)msg; }
+
+inline uint64_t additional_hash_msg_get_msg_index(void *msg) { return *(uint64_t *)(msg + sizeof(uint64_t)); }
+
+inline char *additional_hash_msg_get_checksum_and_iv(void *msg) { return msg + sizeof(uint64_t) + sizeof(uint64_t); }
+
+inline char *additional_hash_msg_get_msg_hash(void *msg, size_t checksum_and_iv_size) { return msg + sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
+
+inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE; }
+
+inline size_t additional_hash_msg_size_no_hash(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
 
 inline bool has_checksum(unsigned char *checksum) {
     return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
@@ -692,11 +720,13 @@ void broadcast_bio(struct work_struct *work) {
     struct bio *clone = clone_bio_data->deep_clone;
     unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
     size_t checksum_and_iv_size = bio_checksum_and_iv_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
+    size_t remaining_checksum_and_iv_size;
     struct rollbaccine_device *device = clone_bio_data->device;
     struct msghdr msg_header;
     struct kvec vec;
-    struct socket_pair_list *curr, *next;
+    struct socket_list *curr, *next;
     struct metadata_msg metadata;
+    void *additional_hash_msg;
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
     cycles_t time = get_cycles_if_flag_on();
@@ -704,12 +734,16 @@ void broadcast_bio(struct work_struct *work) {
 
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
     metadata.bal = device->bal;
+    metadata.sender_id = device->id;
+    metadata.msg_index = ++device->last_msg_index;
     metadata.write_index = clone_bio_data->write_index;
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = clone->bi_opf;
     metadata.sector = clone->bi_iter.bi_sector;
     // Copy checksum and IV into metadata
     memcpy(metadata.checksum_and_iv, checksum_and_iv, checksum_and_iv_size);
+    // Create a hash of the message
+    hash_buffer(device, (char *)&metadata, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
     WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
@@ -723,14 +757,19 @@ void broadcast_bio(struct work_struct *work) {
     msg_header.msg_controllen = 0;
     msg_header.msg_flags = 0;
 
-    // Using mutex instead of spinlock because kernel_sendmsg sleeps for TLS and that triggers an error (sleep while holding spinlock)
-    mutex_lock(&device->connected_sockets_lock);
-    list_for_each_entry_safe(curr, next, &device->connected_socket_pairs, list) {
-        if (curr->tls_sock == NULL || curr->regular_sock == NULL) {
-            printk(KERN_ERR "Socket pair is missing a socket: TLS null %d, regular null %d", curr->tls_sock == NULL, curr->regular_sock == NULL);
-            continue;
-        }
+    // Create message for additional hash & IVs if they exceed what could be sent with the metadata
+    if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
+        remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
+        additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
+        additional_hash_msg_set_sender_id(additional_hash_msg, device->id);
+        additional_hash_msg_set_msg_index(additional_hash_msg, ++device->last_msg_index);
+        additional_hash_msg_set_checksum_and_iv(additional_hash_msg, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
+        hash_buffer(device, additional_hash_msg, additional_hash_msg_size_no_hash(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size));
+    }
 
+    // TODO: See if we can just use spinlock again? Using mutex instead of spinlock because kernel_sendmsg sleeps for TLS and that triggers an error (sleep while holding spinlock)
+    mutex_lock(&device->connected_sockets_lock);
+    list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
         print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
@@ -738,7 +777,7 @@ void broadcast_bio(struct work_struct *work) {
         // 1. Send metadata
         // Keep retrying send until the whole message is sent
         while (vec.iov_len > 0) {
-            sent = kernel_sendmsg(curr->tls_sock, &msg_header, &vec, 1, vec.iov_len);
+            sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
             if (sent <= 0) {
                 printk(KERN_ERR "Error broadcasting message header, aborting");
                 // TODO: Should remove the socket from the list and shut down the connection?
@@ -751,12 +790,12 @@ void broadcast_bio(struct work_struct *work) {
         print_and_update_latency("broadcast_bio: Send metadata", &time);
 
         // 2. Send hash & IVs if they exceed what could be sent with the metadata
-        if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
-            vec.iov_base = checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
-            vec.iov_len = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
+        if (additional_hash_msg != NULL) {
+            vec.iov_base = additional_hash_msg;
+            vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
             while (vec.iov_len > 0) {
                 // printk(KERN_INFO "Sending checksums and IVs, size: %lu", vec.iov_len);
-                sent = kernel_sendmsg(curr->tls_sock, &msg_header, &vec, 1, vec.iov_len);
+                sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
                 if (sent <= 0) {
                     printk(KERN_ERR "Error broadcasting checksums and IVs");
                     goto finish_sending_to_socket;
@@ -768,7 +807,7 @@ void broadcast_bio(struct work_struct *work) {
             print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
         }
 
-        // 3. Send bios on non-TLS. THe receiver will check anyway
+        // 3. Send bios
         bio_for_each_segment(bvec, clone, iter) {
             bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
 
@@ -776,7 +815,7 @@ void broadcast_bio(struct work_struct *work) {
             while (chunked_bvec.bv_len > 0) {
                 iov_iter_bvec(&msg_header.msg_iter, ITER_SOURCE, &chunked_bvec, 1, chunked_bvec.bv_len);
 
-                sent = sock_sendmsg(curr->regular_sock, &msg_header);
+                sent = sock_sendmsg(curr->sock, &msg_header);
                 if (sent <= 0) {
                     printk(KERN_ERR "Error broadcasting message pages");
                     // TODO: Should remove the socket from the list and shut down the connection?
@@ -794,6 +833,9 @@ void broadcast_bio(struct work_struct *work) {
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
     mutex_unlock(&device->connected_sockets_lock);
 
+    if (additional_hash_msg != NULL) {
+        kfree(additional_hash_msg);
+    }
     network_end_io(clone);
     print_and_update_latency("broadcast_bio: Broadcast bio", &total_time);
 }
@@ -974,6 +1016,37 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
 }
 
+bool verify_msg(struct rollbaccine_device *device, void *msg, size_t msg_size, char *expected_hash, uint64_t msg_index) {
+    char calculated_hash[SHA256_SIZE];
+    bool hash_matches;
+    bool msg_index_matches;
+
+    hash_buffer(device, msg, msg_size - SHA256_SIZE, calculated_hash);
+    hash_matches = memcmp(calculated_hash, expected_hash, SHA256_SIZE) == 0;
+    msg_index_matches = device->last_msg_index + 1 == msg_index;
+
+    if (!hash_matches) {
+        printk(KERN_ERR "Received message with incorrect hash, expected: %s, received: %s", expected_hash, calculated_hash);
+        return false;
+    }
+    if (!msg_index_matches) {
+        printk(KERN_ERR "Received message with incorrect index, expected: %llu, received: %llu", device->last_msg_index + 1, msg_index);
+        return false;
+    }
+    // Increment the last_msg_index
+    device->last_msg_index = msg_index;
+    return true;
+}
+
+void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out) {
+    cycles_t time = get_cycles_if_flag_on();
+    int ret = crypto_shash_digest(device->hash_desc, buffer, len, out);
+    if (ret) {
+        printk(KERN_ERR "Could not hash buffer");
+    }
+    print_and_update_latency("hash_buffer", &time);
+}
+
 unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
     int ret = 0;
     struct bio_vec bv;
@@ -984,6 +1057,10 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     DECLARE_CRYPTO_WAIT(wait);
     unsigned char *bio_checksum_and_iv;
     unsigned char *iv;
+    // TODO: Reenable when testing on machines with RDRAND
+    // long iv_long;
+    // bool rd_rand_success = false;
+    // size_t iv_copy_num_bytes_remaining;
     unsigned char *checksum;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
@@ -1030,7 +1107,17 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 iv = get_bio_iv(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
                 print_and_update_latency("enc_or_dec_bio: get bio checksum and iv", &time);
                 // Generate a new IV
-                // TODO: Maybe use RDRAND?
+                // TODO: Uncomment when testing on machines with RDRAND to see if this works
+                // iv_copy_num_bytes_remaining = AES_GCM_IV_SIZE;
+                // while (iv_copy_num_bytes_remaining > 0) {
+                //     rd_rand_success = rdrand_long(&iv_long);
+                //     if (!rd_rand_success) {
+                //         printk(KERN_ERR "Could not generate random number for IV");
+                //         goto free_and_return;
+                //     }
+                //     memcpy(iv + (AES_GCM_IV_SIZE - iv_copy_num_bytes_remaining), &iv_long, min(iv_copy_num_bytes_remaining, sizeof(long)));
+                //     iv_copy_num_bytes_remaining -= sizeof(long);
+                // }
                 get_random_bytes(iv, AES_GCM_IV_SIZE);
                 print_and_update_latency("enc_or_dec_bio: get_random_bytes", &time);
                 break;
@@ -1131,7 +1218,7 @@ void kill_thread(struct socket *sock) {
 }
 
 // Function used by all listening sockets to block and listen to messages
-void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *socket_pair) {
+void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     struct metadata_msg metadata;
     struct bio *received_bio;
     struct bio_data *bio_data;
@@ -1139,55 +1226,27 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
     struct msghdr msg_header;
     struct kvec vec;
     int sent, received, i, num_sectors;
-    size_t checksum_and_iv_size;
+    size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
+    void *additional_hash_msg;
     bool no_conflict;
     unsigned long flags;
-#ifdef TLS_ON
-    union {
-        struct cmsghdr cmsg;
-        u8 buf[CMSG_SPACE(sizeof(u8))];
-    } u;
-#endif
 
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
     msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
-#ifdef TLS_ON
-    msg_header.msg_control = &u;
-    msg_header.msg_controllen = sizeof(u);
-#else
     msg_header.msg_control = NULL;
     msg_header.msg_controllen = 0;
-#endif
 
     while (!device->shutting_down) {
         // 1. Receive metadata message
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
 
-        received = kernel_recvmsg(socket_pair->tls_sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+        received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
         if (received <= 0) {
             printk(KERN_ERR "Error reading metadata from socket");
             break;
         }
-
-#ifdef TLS_ON
-        // Handle the TLS control messages.
-        if (msg_header.msg_controllen != sizeof(u)) {
-            switch (tls_get_record_type(socket_pair->tls_sock->sk, &u.cmsg)) {
-                case 0:
-                    fallthrough;
-                case TLS_RECORD_TYPE_DATA:
-                    // printk(KERN_INFO "We got some TLS control msg but it's all good");
-                    break;
-                case TLS_RECORD_TYPE_ALERT:
-                    printk(KERN_ERR "TLS alert received. Uhoh.");
-                    break;
-                default:
-                    break;
-            }
-        }
-#endif
 
         // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH |
         // REQ_FUA));
@@ -1202,6 +1261,11 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
         received_bio = bio_alloc_bioset(device->dev->bdev, metadata.num_pages, metadata.bi_opf, GFP_NOIO, &device->bs);
         received_bio->bi_iter.bi_sector = metadata.sector;
         received_bio->bi_end_io = replica_disk_end_io;
+
+        // Verify the message
+        if (!verify_msg(device, &metadata, sizeof(struct metadata_msg), metadata.msg_hash, metadata.msg_index)) {
+            break;
+        }
 
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
@@ -1223,33 +1287,28 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
 
         // 2. Expect hash if it wasn't done sending
         if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
-            vec.iov_base = bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
-            vec.iov_len = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
+            remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
+            additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
+
+            vec.iov_base = additional_hash_msg;
+            vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
 
             // printk(KERN_INFO "Receiving checksums and IVs, size: %lu", vec.iov_len);
-            received = kernel_recvmsg(socket_pair->tls_sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+            received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
             if (received <= 0) {
                 printk(KERN_ERR "Error reading checksum and IV, %d", received);
                 break;
             }
 
-#ifdef TLS_ON
-            // Handle the TLS control messages.
-            if (msg_header.msg_controllen != sizeof(u)) {
-                switch (tls_get_record_type(socket_pair->tls_sock->sk, &u.cmsg)) {
-                    case 0:
-                        fallthrough;
-                    case TLS_RECORD_TYPE_DATA:
-                        // printk(KERN_INFO "We got some TLS control msg but it's all good");
-                        break;
-                    case TLS_RECORD_TYPE_ALERT:
-                        printk(KERN_ERR "TLS alert received. Uhoh.");
-                        break;
-                    default:
-                        break;
-                }
+            // Verify the message
+            if (!verify_msg(device, additional_hash_msg, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size), additional_hash_msg_get_msg_index(additional_hash_msg))) {
+                break;
             }
-#endif
+
+            // Copy the checksums over
+            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg_get_checksum_and_iv(additional_hash_msg), remaining_checksum_and_iv_size);
+            // Free the message
+            kfree(additional_hash_msg);
         }
 
         // 3. Receive pages of bio (over the regular socket now, not TLS)
@@ -1267,7 +1326,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
             vec.iov_base = page_address(page);
             vec.iov_len = PAGE_SIZE;
 
-            received = kernel_recvmsg(socket_pair->regular_sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+            received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
             if (received <= 0) {
                 printk(KERN_ERR "Error reading from socket");
                 break;
@@ -1280,6 +1339,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
         // 5. If the message is an fsync, reply.
+        // Note: We don't need to append a msg index here, because fsyncs grow monotonically per follower per ballot
         if (metadata.type == ROLLBACCINE_FSYNC) {
             metadata.type = FOLLOWER_ACK;
             metadata.bal.id = device->bal.id;
@@ -1287,18 +1347,9 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
             vec.iov_base = &metadata;
             vec.iov_len = sizeof(struct metadata_msg);
 
-#ifdef TLS_ON
-            // Clear TLS message headers (not populated by us) before responding
-            msg_header.msg_name = 0;
-            msg_header.msg_namelen = 0;
-            msg_header.msg_control = NULL;
-            msg_header.msg_controllen = 0;
-            msg_header.msg_flags = 0;
-#endif
-
             // Keep retrying send until the whole message is sent
             while (vec.iov_len > 0) {
-                sent = kernel_sendmsg(socket_pair->tls_sock, &msg_header, &vec, 1, vec.iov_len);
+                sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
                 if (sent <= 0) {
                     printk(KERN_ERR "Error replying to fsync, aborting");
                     break;
@@ -1326,123 +1377,16 @@ void blocking_read(struct rollbaccine_device *device, struct socket_pair_list *s
     }
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
-    kernel_sock_shutdown(socket_pair->tls_sock, SHUT_RDWR);
-    kernel_sock_shutdown(socket_pair->regular_sock, SHUT_RDWR);
+    kernel_sock_shutdown(sock, SHUT_RDWR);
     // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut
     // it down.
     //     sock_release(sock);
 }
 
-#ifdef TLS_ON
-void on_tls_handshake_done(void *data, int status, key_serial_t peerid) {
-    struct completion *tls_handshake_completed = data;
-
-    if (status != 0) {
-        printk(KERN_ERR "TLS handshake failed with status %d", status);
-    }
-
-    complete(tls_handshake_completed);
-}
-#endif
-
-void blocking_id_handshake_and_read(struct rollbaccine_device *device, struct socket *sock, bool tls) {
-    uint64_t received_id;
-    struct socket_pair_list *new_connected_socket_pair;
-    struct msghdr msg_header;
-    struct kvec vec;
-    int received, sent;
-    bool socket_pair_exists = false;
-    bool socket_pair_connected = false;
-    union {
-        struct cmsghdr cmsg;
-        u8 buf[CMSG_SPACE(sizeof(u8))];
-    } u;
-
-    // 1. Send your own id
-    msg_header.msg_name = NULL;
-    msg_header.msg_namelen = 0;
-    msg_header.msg_control = NULL;
-    msg_header.msg_controllen = 0;
-    msg_header.msg_flags = 0;
-
-    vec.iov_base = &device->id;
-    vec.iov_len = sizeof(uint64_t);
-
-    // Keep retrying send until the whole message is sent
-    printk(KERN_INFO "Sending ID: %llu, tls: %d", device->id, tls);
-    while (vec.iov_len > 0) {
-        sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
-        if (sent <= 0) {
-            printk(KERN_ERR "Error sending ID, aborting");
-            return;
-        } else {
-            vec.iov_base += sent;
-            vec.iov_len -= sent;
-        }
-    }
-
-    // 2. Receive the other machine's id
-    msg_header.msg_name = 0;
-    msg_header.msg_namelen = 0;
-    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
-    msg_header.msg_control = &u;
-    msg_header.msg_controllen = sizeof(u);
-
-    vec.iov_base = &received_id;
-    vec.iov_len = sizeof(uint64_t);
-
-    printk(KERN_INFO "Receiving ID, tls: %d", tls);
-    received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
-    if (received <= 0) {
-        printk(KERN_ERR "Error reading ID from socket, aborting");
-        return;
-    }
-    printk(KERN_INFO "Received ID: %llu, tls: %d", received_id, tls);
-
-    // 3. Add to list of connected sockets. Create a new one if the entry doesn't exist
-    mutex_lock(&device->connected_sockets_lock);
-    list_for_each_entry(new_connected_socket_pair, &device->connected_socket_pairs, list) {
-        if (new_connected_socket_pair->id == received_id) {
-            socket_pair_exists = true;
-            printk(KERN_INFO "Found socket pair with id %llu", received_id);
-            break;
-        }
-    }
-    if (!socket_pair_exists) {
-        new_connected_socket_pair = kmalloc(sizeof(struct socket_pair_list), GFP_KERNEL);
-        printk(KERN_INFO "Creating new socket pair with id %llu", received_id);
-        if (new_connected_socket_pair == NULL) {
-            printk(KERN_ERR "Error creating socket_pair_list");
-        }
-        new_connected_socket_pair->id = received_id;
-        list_add(&new_connected_socket_pair->list, &device->connected_socket_pairs);
-    }
-    if (tls) {
-        new_connected_socket_pair->tls_sock = sock;
-    } else {
-        new_connected_socket_pair->regular_sock = sock;
-    }
-    socket_pair_connected = new_connected_socket_pair->tls_sock != NULL && new_connected_socket_pair->regular_sock != NULL;
-    mutex_unlock(&device->connected_sockets_lock);
-    printk(KERN_INFO "Added to connected pairs");
-
-    // 4. Begin blocking read if both sockets are connected
-    if (socket_pair_connected) {
-        printk(KERN_INFO "Both TLS and regular sockets connected, beginning blocking read for id %llu", received_id);
-        blocking_read(device, new_connected_socket_pair);
-    }
-    printk(KERN_INFO "Waiting for other socket to connect, exiting blocking id handshake and read for id %llu", received_id);
-}
-
 int connect_to_server(void *args) {
     struct client_thread_params *thread_params = (struct client_thread_params *)args;
+    struct socket_list *sock_list;
     int error = -1;
-#ifdef TLS_ON
-    struct tls_handshake_args tls_args;
-    struct completion tls_handshake_completed;
-    struct file *sock_file;
-    unsigned long timeout_remainder;
-#endif
 
     // Retry connecting to server until it succeeds
     printk(KERN_INFO "Attempting to connect for the first time");
@@ -1459,44 +1403,24 @@ int connect_to_server(void *args) {
     }
     printk(KERN_INFO "Connected to server");
 
-    if (thread_params->tls) {
-#ifdef TLS_ON
-        printk(KERN_INFO "Client starting TLS handshake");
-        sock_file = sock_alloc_file(thread_params->sock, O_NONBLOCK, NULL);
-        if (IS_ERR(sock_file)) {
-            printk(KERN_ERR "Error creating file from socket");
-        }
-        // TODO: Free the sock_file. Has the same problem with freeing as sock_release()
-        init_completion(&tls_handshake_completed);
-        tls_args.ta_sock = thread_params->sock;
-        tls_args.ta_done = on_tls_handshake_done;
-        tls_args.ta_data = &tls_handshake_completed;
-        error = tls_client_hello_x509(&tls_args, GFP_KERNEL);
-        if (error < 0) {
-            printk(KERN_ERR "Client error starting TLS handshake: %d", error);
-            return 0;
-        } else {
-            // Wait until TLS handshake is done
-            printk(KERN_INFO "Client waiting for TLS handshake to complete");
-            timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
-            if (!timeout_remainder) {
-                printk(KERN_ERR "Client TLS handshake timed out");
-                return 0;
-            } else {
-                printk(KERN_INFO "Client TLS handshake completed");
-            }
-        }
-#endif
+    sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
+    if (sock_list == NULL) {
+        printk(KERN_ERR "Error creating sock_list");
+        goto cleanup;
     }
+    sock_list->sock = thread_params->sock;
+    mutex_lock(&thread_params->device->connected_sockets_lock);
+    list_add(&sock_list->list, &thread_params->device->connected_sockets);
+    mutex_unlock(&thread_params->device->connected_sockets_lock);
 
-    blocking_id_handshake_and_read(thread_params->device, thread_params->sock, thread_params->tls);
+    blocking_read(thread_params->device, thread_params->sock);
 
 cleanup:
     kfree(thread_params);
     return 0;
 }
 
-int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port, bool tls) {
+int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port) {
     struct socket_list *sock_list;
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
@@ -1508,7 +1432,6 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
         return -1;
     }
     thread_params->device = device;
-    thread_params->tls = tls;
 
     error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
     if (error < 0) {
@@ -1548,42 +1471,7 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
 int listen_to_accepted_socket(void *args) {
     struct accepted_thread_params *thread_params = (struct accepted_thread_params *)args;
     
-    if (thread_params->tls) {
-#ifdef TLS_ON
-        struct tls_handshake_args tls_args;
-        struct completion tls_handshake_completed;
-        struct file *sock_file;
-        unsigned long timeout_remainder;
-        int error;
-
-        printk(KERN_INFO "Server starting TLS handshake");
-        sock_file = sock_alloc_file(thread_params->sock, O_NONBLOCK, NULL);
-        if (IS_ERR(sock_file)) {
-            printk(KERN_ERR "Error creating file from socket");
-        }
-        // TODO: Free the sock_file. Has the same problem with freeing as sock_release()
-        init_completion(&tls_handshake_completed);
-        tls_args.ta_sock = thread_params->sock;
-        tls_args.ta_done = on_tls_handshake_done;
-        tls_args.ta_data = &tls_handshake_completed;
-        error = tls_server_hello_x509(&tls_args, GFP_KERNEL);
-        if (error < 0) {
-            printk(KERN_ERR "Server error starting TLS handshake: %d", error);
-            return 0;
-        } else {
-            // Wait until TLS handshake is done
-            timeout_remainder = wait_for_completion_timeout(&tls_handshake_completed, ROLLBACCINE_TLS_TIMEOUT);
-            if (!timeout_remainder) {
-                printk(KERN_ERR "Server TLS handshake timed out");
-                return 0;
-            } else {
-                printk(KERN_INFO "Server TLS handshake completed");
-            }
-        }
-#endif
-    }
-
-    blocking_id_handshake_and_read(thread_params->device, thread_params->sock, thread_params->tls);
+    blocking_read(thread_params->device, thread_params->sock);
 
     kfree(thread_params);
     return 0;
@@ -1595,7 +1483,7 @@ int listen_for_connections(void *args) {
     struct rollbaccine_device *device = thread_params->device;
     struct socket *new_sock;
     struct accepted_thread_params *new_thread_params;
-    struct socket_list *new_server_socket_list;
+    struct socket_list *new_connected_socket_list, *new_server_socket_list;
     struct task_struct *accepted_thread;
     int error;
 
@@ -1614,9 +1502,19 @@ int listen_for_connections(void *args) {
             printk(KERN_ERR "Error creating accepted thread params");
             break;
         }
-        new_thread_params->tls = thread_params->tls;
         new_thread_params->sock = new_sock;
         new_thread_params->device = device;
+
+        // Add to list of connected sockets
+        new_connected_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
+        if (new_connected_socket_list == NULL) {
+            printk(KERN_ERR "Error creating socket_list");
+            break;
+        }
+        new_connected_socket_list->sock = new_sock;
+        mutex_lock(&device->connected_sockets_lock);
+        list_add(&new_connected_socket_list->list, &device->connected_sockets);
+        mutex_unlock(&device->connected_sockets_lock);
 
         // Add to list of server sockets
         new_server_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
@@ -1644,7 +1542,7 @@ int listen_for_connections(void *args) {
 }
 
 // Returns error code if it fails
-int start_server(struct rollbaccine_device *device, ushort port, bool tls) {
+int start_server(struct rollbaccine_device *device, ushort port) {
     struct listen_thread_params *thread_params;
     struct socket_list *sock_list;
     struct sockaddr_in addr;
@@ -1660,7 +1558,6 @@ int start_server(struct rollbaccine_device *device, ushort port, bool tls) {
         return -1;
     }
     thread_params->device = device;
-    thread_params->tls = tls;
 
     // Create struct to add the socket to the list of sockets
     sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
@@ -1815,6 +1712,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->bal.id = 0;
     device->bal.num = 0;
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
+    device->last_msg_index = 0;
     spin_lock_init(&device->index_lock);
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
@@ -1841,16 +1739,11 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         printk(KERN_ERR "Error parsing port");
         return error;
     }
-    printk(KERN_INFO "Starting server at ports. TLS: %u, regular: %u", port, port+1);
+    printk(KERN_INFO "Starting server at port: %u", port);
 
-    INIT_LIST_HEAD(&device->connected_socket_pairs);
+    INIT_LIST_HEAD(&device->connected_sockets);
     INIT_LIST_HEAD(&device->server_sockets);
-    error = start_server(device, port, true);
-    if (error < 0) {
-        printk(KERN_ERR "Error starting server");
-        return error;
-    }
-    error = start_server(device, port+1, false);
+    error = start_server(device, port);
     if (error < 0) {
         printk(KERN_ERR "Error starting server");
         return error;
@@ -1864,9 +1757,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
             printk(KERN_ERR "Error parsing port");
             return error;
         }
-        printk(KERN_INFO "Starting thread to connect to servers at ports. TLS: %u, regular: %u", port, port+1);
-        start_client_to_server(device, argv[i], port, true);
-        start_client_to_server(device, argv[i], port+1, false);
+        printk(KERN_INFO "Starting thread to connect to servers at port: %u", port);
+        start_client_to_server(device, argv[i], port);
     }
 
     // Set up AEAD
@@ -1891,6 +1783,21 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
     projected_bytes_used += checksum_and_iv_size;
+
+    // Set up hashing
+    device->hash_alg = crypto_alloc_shash("hmac(sha256)", 0, 0);
+    crypto_shash_setkey(device->hash_alg, argv[6], KEY_SIZE);
+    if (IS_ERR(device->hash_alg)) {
+        printk(KERN_ERR "Error allocating hash");
+        return PTR_ERR(device->hash_alg);
+    }
+
+    device->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->hash_alg), GFP_KERNEL);
+    if (device->hash_desc == NULL) {
+        printk(KERN_ERR "Error allocating hash desc");
+        return -ENOMEM;
+    }
+    device->hash_desc->tfm = device->hash_alg;
 
 #ifdef MEMORY_TRACKING
     atomic_set(&device->num_bio_data_not_freed, 0);
@@ -1922,7 +1829,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
 static void rollbaccine_destructor(struct dm_target *ti) {
     struct socket_list *curr, *next;
-    struct socket_pair_list *curr_pair, *next_pair;
     struct rollbaccine_device *device = ti->private;
     if (device == NULL) return;
 
@@ -1945,13 +1851,15 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     }
 
     // Free socket list (sockets should already be freed)
-    list_for_each_entry_safe(curr_pair, next_pair, &device->connected_socket_pairs, list) {
-        list_del(&curr_pair->list);
-        kfree(curr_pair);
+    list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
+        list_del(&curr->list);
+        kfree(curr);
     }
 
     kvfree(device->checksums);
     crypto_free_aead(device->tfm);
+    crypto_free_shash(device->hash_alg);
+    kfree(device->hash_desc);
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
     destroy_workqueue(device->broadcast_queue);
     destroy_workqueue(device->submit_bio_queue);

@@ -17,5 +17,4 @@ done
 az group delete \
     --name $NAME-group \
     --yes --no-wait
-rm *.pem
 rm vms.json
