@@ -21,6 +21,7 @@
 #include <linux/tcp.h>
 #include <linux/timex.h>
 #include <linux/vmalloc.h>
+#include <linux/rwlock.h>
 #include <net/sock.h>
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
@@ -38,7 +39,6 @@
 #define SHA256_SIZE 32
 #define MODULE_NAME "rollbaccine"
 
-// #define MULTITHREADED_NETWORK
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 // #define LATENCY_TRACKING
 
@@ -56,9 +56,12 @@ struct ballot {
 } __attribute__((packed));
 
 struct metadata_msg {
+    char msg_hash[SHA256_SIZE];
+
     enum MsgType type;
     struct ballot bal;
     uint64_t sender_id;
+    uint64_t sender_thread;
     uint64_t msg_index;
     uint64_t write_index;
     uint64_t num_pages;
@@ -68,12 +71,36 @@ struct metadata_msg {
     sector_t sector;
     // Hash and IV for each write
     char checksum_and_iv[ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE];
-    char msg_hash[SHA256_SIZE];
 } __attribute__((packed));
+
+// Flexible array since we don't know how many extra checksums we will include. Be very careful when using sizeof()
+struct additional_hash_msg {
+    char msg_hash[SHA256_SIZE];
+    uint64_t sender_id;
+    uint64_t sender_thread;
+    uint64_t msg_index;
+    char checksum_and_iv[];
+};
 
 // Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
 struct socket_list {
     struct socket *sock;
+    struct list_head list;
+};
+
+// Used to return a pair from handshake_ids()
+struct multithreaded_handshake_pair {
+    uint64_t sender_id;
+    uint64_t sender_thread;
+} __attribute__((packed));
+
+// A list of connections to different senders, where each sender is connected through 1 socket per CPU for multithreaded TCP
+struct multithreaded_socket_list {
+    struct socket __percpu **socks; // one socket per_cpu
+    uint64_t __percpu *last_sent_msg_index; // the index of the last message sent on each networking thread
+    uint64_t __percpu *waiting_for_msg_index; // the index of the last message received on each networking thread
+    uint64_t __percpu *sender_thread; // unique number for each networking thread. Otherwise an attacker could replay writes across network threads. Defaults to U64_MAX
+    uint64_t sender_id;
     struct list_head list;
 };
 
@@ -99,7 +126,6 @@ struct rollbaccine_device {
     struct ballot bal;
     int write_index;
     // TODO: Track last msg index per unique sender (since the primary may change)
-    uint64_t last_msg_index;     // Doesn't need to be atomic because only the broadcast thread will modify this
     spinlock_t index_lock;  // Must be obtained for any operation modifying write_index and queues ordered by those indices
 
     // Logic for fsyncs blocking on replication
@@ -121,8 +147,9 @@ struct rollbaccine_device {
     // Sockets, tracked so we can kill them on exit.
     struct list_head server_sockets;
     struct list_head client_sockets;
-    // Connected sockets. Should be a subset of the sockets above. Handy for broadcasting
-    // TODO: Need to figure out network handshake so we know who we're talking to.
+    // Connected sockets. Should be a subset of the sockets above, stored as a multithreaded_socket_list. Handy for broadcasting
+    // TODO: Change usages and initialization
+    // TODO: Sending thread should block on another signal (like finish init) instead of connected threads
     struct mutex connected_sockets_lock;
     struct list_head connected_sockets;
 
@@ -188,6 +215,9 @@ struct client_thread_params {
 struct accepted_thread_params {
     struct socket *sock;
     struct rollbaccine_device *device;
+    struct multithreaded_socket_list *multithreaded_socket_list;
+    uint64_t sender_id;
+    uint64_t sender_thread;
 };
 
 struct listen_thread_params {
@@ -221,56 +251,33 @@ void network_end_io(struct bio * deep_clone);
 void broadcast_bio(struct work_struct * work);
 struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
-bool verify_msg(struct rollbaccine_device *device, void *msg, size_t msg_size, char *expected_hash, uint64_t msg_index);
-void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out);
+bool verify_msg(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, void *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_thread, uint64_t msg_index);
+void hash_buffer(struct rollbaccine_device *device, void *buffer, size_t len, void *out);
 // Returns array of checksums and IVs for writes, NULL for reads
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 void kill_thread(struct socket * sock);
-void blocking_read(struct rollbaccine_device * device, struct socket *sock);
+void blocking_read(struct rollbaccine_device * device, struct socket *sock, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_id, uint64_t sender_thread);
+struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock);
+void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, uint64_t thread_id);
+struct multithreaded_handshake_pair receive_handshake_id(struct rollbaccine_device *device, struct socket *sock);
+bool is_sender_thread_unique(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_thread);
 int connect_to_server(void *args);
+struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock);
 int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port);
 int listen_to_accepted_socket(void *args);
+int next_available_thread_id(struct multithreaded_socket_list *multithreaded_socket_list);
 int listen_for_connections(void *args);
 int start_server(struct rollbaccine_device *device, ushort port);
 int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
 
-// Helper functions to manage the "additional_hash_msg" struct.
-//
-// struct additional_hash_msg {
-//     uint64_t sender_id;
-//     uint64_t msg_index;
-//     char checksum_and_iv[?];
-//     char msg_hash[SHA256_SIZE];
-// };
-//
-// We can't actually have such a struct, because:
-// 1. We want to hash its contents as a continuous buffer in memory and store the hash digest in msg_hash
-// 2. Checksum_and_iv is variable size.
-inline void *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
-    size_t size = sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE;
-    return kmalloc(size, GFP_KERNEL);
+inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
+    return kmalloc(sizeof(struct additional_hash_msg) + checksum_and_iv_size, GFP_KERNEL);
 }
 
-inline void additional_hash_msg_set_sender_id(void *msg, uint64_t sender_id) { *(uint64_t *)msg = sender_id; }
+inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg) + checksum_and_iv_size; }
 
-inline void additional_hash_msg_set_msg_index(void *msg, uint64_t msg_index) { *(uint64_t *)(msg + sizeof(uint64_t)) = msg_index; }
-
-inline void additional_hash_msg_set_checksum_and_iv(void *msg, char *checksum_and_iv, size_t checksum_and_iv_size) {
-    memcpy(msg + sizeof(uint64_t) + sizeof(uint64_t), checksum_and_iv, checksum_and_iv_size);
-}
-
-inline uint64_t additional_hash_msg_get_sender_id(void *msg) { return *(uint64_t *)msg; }
-
-inline uint64_t additional_hash_msg_get_msg_index(void *msg) { return *(uint64_t *)(msg + sizeof(uint64_t)); }
-
-inline char *additional_hash_msg_get_checksum_and_iv(void *msg) { return msg + sizeof(uint64_t) + sizeof(uint64_t); }
-
-inline char *additional_hash_msg_get_msg_hash(void *msg, size_t checksum_and_iv_size) { return msg + sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
-
-inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE; }
-
-inline size_t additional_hash_msg_size_no_hash(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
+inline size_t additional_hash_msg_size_no_hash(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg); }
 
 inline bool has_checksum(unsigned char *checksum) {
     return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
@@ -726,7 +733,7 @@ void broadcast_bio(struct work_struct *work) {
     struct kvec vec;
     struct socket_list *curr, *next;
     struct metadata_msg metadata;
-    void *additional_hash_msg;
+    struct additional_hash_msg *additional_hash_msg;
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
     cycles_t time = get_cycles_if_flag_on();
@@ -735,7 +742,8 @@ void broadcast_bio(struct work_struct *work) {
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
     metadata.bal = device->bal;
     metadata.sender_id = device->id;
-    metadata.msg_index = ++device->last_msg_index;
+    // TODO: Change to per-thread index
+    // metadata.msg_index = ++device->last_msg_index;
     metadata.write_index = clone_bio_data->write_index;
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = clone->bi_opf;
@@ -761,10 +769,12 @@ void broadcast_bio(struct work_struct *work) {
     if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
         remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
         additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
-        additional_hash_msg_set_sender_id(additional_hash_msg, device->id);
-        additional_hash_msg_set_msg_index(additional_hash_msg, ++device->last_msg_index);
-        additional_hash_msg_set_checksum_and_iv(additional_hash_msg, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
-        hash_buffer(device, additional_hash_msg, additional_hash_msg_size_no_hash(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size));
+        additional_hash_msg->sender_id = device->id;
+        additional_hash_msg->sender_thread = smp_processor_id();
+        // TODO: Change parameter type and get the right index
+        // additional_hash_msg->msg_index = this_cpu_inc_return();
+        memcpy(additional_hash_msg->checksum_and_iv, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
+        hash_buffer(device, additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg->msg_hash);
     }
 
     // TODO: See if we can just use spinlock again? Using mutex instead of spinlock because kernel_sendmsg sleeps for TLS and that triggers an error (sleep while holding spinlock)
@@ -1018,29 +1028,29 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
 }
 
-bool verify_msg(struct rollbaccine_device *device, void *msg, size_t msg_size, char *expected_hash, uint64_t msg_index) {
+bool verify_msg(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, void *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_thread, uint64_t msg_index) {
     char calculated_hash[SHA256_SIZE];
     bool hash_matches;
+    bool sender_matches;
+    bool thread_matches;
     bool msg_index_matches;
 
-    hash_buffer(device, msg, msg_size - SHA256_SIZE, calculated_hash);
+    hash_buffer(device, msg, msg_size, calculated_hash);
     hash_matches = memcmp(calculated_hash, expected_hash, SHA256_SIZE) == 0;
-    msg_index_matches = device->last_msg_index + 1 == msg_index;
+    sender_matches = multithreaded_socket_list->sender_id == sender_id;
+    thread_matches = this_cpu_read(*multithreaded_socket_list->sender_thread) == sender_thread;
+    msg_index_matches = this_cpu_read(*multithreaded_socket_list->waiting_for_msg_index) == msg_index;
 
-    if (!hash_matches) {
-        printk(KERN_ERR "Received message with incorrect hash, expected: %s, received: %s", expected_hash, calculated_hash);
+    if (!hash_matches || !sender_matches || !thread_matches || !msg_index_matches) {
+        printk(KERN_ERR "Received incorrect message, expected hash: %s, hash: %s, expected sender: %llu, sender: %llu, expected thread: %llu, thread: %llu, expected msg index: %llu, msg index: %llu", expected_hash, calculated_hash, multithreaded_socket_list->sender_id, sender_id, this_cpu_read(*multithreaded_socket_list->sender_thread), sender_thread, this_cpu_read(*multithreaded_socket_list->waiting_for_msg_index) + 1, msg_index);
         return false;
     }
-    if (!msg_index_matches) {
-        printk(KERN_ERR "Received message with incorrect index, expected: %llu, received: %llu", device->last_msg_index + 1, msg_index);
-        return false;
-    }
-    // Increment the last_msg_index
-    device->last_msg_index = msg_index;
+    // Increment the message index
+    this_cpu_inc(*multithreaded_socket_list->waiting_for_msg_index);
     return true;
 }
 
-void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out) {
+void hash_buffer(struct rollbaccine_device *device, void *buffer, size_t len, void *out) {
     cycles_t time = get_cycles_if_flag_on();
     int ret = crypto_shash_digest(device->hash_desc, buffer, len, out);
     if (ret) {
@@ -1220,7 +1230,7 @@ void kill_thread(struct socket *sock) {
 }
 
 // Function used by all listening sockets to block and listen to messages
-void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
+void blocking_read(struct rollbaccine_device *device, struct socket *sock, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_id, uint64_t sender_thread) {
     struct metadata_msg metadata;
     struct bio *received_bio;
     struct bio_data *bio_data;
@@ -1229,7 +1239,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     struct kvec vec;
     int sent, received, i, num_sectors;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
-    void *additional_hash_msg;
+    struct additional_hash_msg *additional_hash_msg;
     bool no_conflict;
     unsigned long flags;
 
@@ -1253,6 +1263,11 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH |
         // REQ_FUA));
 
+        // Verify the message
+        if (!verify_msg(device, multithreaded_socket_list, &metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash, metadata.sender_id, metadata.sender_thread, metadata.msg_index)) {
+            break;
+        }
+
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
             // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
@@ -1264,14 +1279,10 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         received_bio->bi_iter.bi_sector = metadata.sector;
         received_bio->bi_end_io = replica_disk_end_io;
 
-        // Verify the message
-        if (!verify_msg(device, &metadata, sizeof(struct metadata_msg), metadata.msg_hash, metadata.msg_index)) {
-            break;
-        }
-
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
+        // TODO: Swap with circular buffer
         device->write_index = metadata.write_index;
         bio_data->bio_src = received_bio;
         bio_data->start_sector = metadata.sector;
@@ -1303,12 +1314,12 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
             }
 
             // Verify the message
-            if (!verify_msg(device, additional_hash_msg, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size), additional_hash_msg_get_msg_index(additional_hash_msg))) {
+            if (!verify_msg(device, multithreaded_socket_list, additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_thread, additional_hash_msg->msg_index)) {
                 break;
             }
 
             // Copy the checksums over
-            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg_get_checksum_and_iv(additional_hash_msg), remaining_checksum_and_iv_size);
+            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg->checksum_and_iv, remaining_checksum_and_iv_size);
             // Free the message
             kfree(additional_hash_msg);
         }
@@ -1341,10 +1352,14 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
         // 5. If the message is an fsync, reply.
-        // Note: We don't need to append a msg index here, because fsyncs grow monotonically per follower per ballot
         if (metadata.type == ROLLBACCINE_FSYNC) {
             metadata.type = FOLLOWER_ACK;
             metadata.bal.id = device->bal.id;
+            metadata.sender_id = device->id;
+            metadata.sender_thread = smp_processor_id();
+            metadata.msg_index = this_cpu_inc_return(*multithreaded_socket_list->last_sent_msg_index);
+
+            hash_buffer(device, (char *)&metadata, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
 
             vec.iov_base = &metadata;
             vec.iov_len = sizeof(struct metadata_msg);
@@ -1385,9 +1400,116 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     //     sock_release(sock);
 }
 
+struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock) {
+    struct multithreaded_socket_list *multithreaded_socket_list;
+    int cpu_id;
+
+    mutex_lock(&device->connected_sockets_lock);
+    list_for_each_entry(multithreaded_socket_list, &device->connected_sockets, list) {
+        if (multithreaded_socket_list->sender_id == sender_id) {
+            // Already exists, nothing to do
+            goto unlock_and_return;
+        }
+    }
+
+    // Malloc if list doesn't exist
+    multithreaded_socket_list = kmalloc(sizeof(struct multithreaded_socket_list), GFP_KERNEL);
+    if (!multithreaded_socket_list) {
+        printk(KERN_ERR "Error creating multithreaded_socket_list");
+        goto unlock_and_return;
+    }
+    multithreaded_socket_list->sender_id = sender_id;
+    multithreaded_socket_list->socks = alloc_percpu(struct socket *);
+    multithreaded_socket_list->last_sent_msg_index = alloc_percpu(uint64_t);
+    multithreaded_socket_list->waiting_for_msg_index = alloc_percpu(uint64_t);
+    multithreaded_socket_list->sender_thread = alloc_percpu(uint64_t);
+    // Set the sender thread to U64_MAX so we know it's not set and can check for conflicts later
+    for_each_online_cpu(cpu_id) {
+        *per_cpu_ptr(multithreaded_socket_list->sender_thread, cpu_id) = U64_MAX;
+    }
+    list_add(&multithreaded_socket_list->list, &device->connected_sockets);
+
+unlock_and_return:
+    mutex_unlock(&device->connected_sockets_lock);
+    return multithreaded_socket_list;
+}
+
+void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, uint64_t thread_id) {
+    struct multithreaded_handshake_pair handshake_pair = {device->id, thread_id};
+    struct msghdr msg_header;
+    struct kvec vec;
+    int sent;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    vec.iov_base = &handshake_pair;
+    vec.iov_len = sizeof(struct multithreaded_handshake_pair);
+
+    // Keep retrying send until the whole message is sent
+    printk(KERN_INFO "Sending handshake ID: %llu, CPU: %llu", device->id, thread_id);
+    while (vec.iov_len > 0) {
+        sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
+        if (sent <= 0) {
+            printk(KERN_ERR "Error sending handshake, aborting");
+            return;
+        } else {
+            vec.iov_base += sent;
+            vec.iov_len -= sent;
+        }
+    }
+}
+
+struct multithreaded_handshake_pair receive_handshake_id(struct rollbaccine_device *device, struct socket *sock) {
+    struct multithreaded_handshake_pair received_handshake_pair;
+    struct msghdr msg_header;
+    struct kvec vec;
+    int received;
+
+    msg_header.msg_name = 0;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+
+    vec.iov_base = &received_handshake_pair;
+    vec.iov_len = sizeof(struct multithreaded_handshake_pair);
+
+    printk(KERN_INFO "Receiving handshake on ID: %llu, CPU: %d", device->id, smp_processor_id());
+    received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+    if (received <= 0) {
+        printk(KERN_ERR "Error receiving handshake, aborting");
+        return received_handshake_pair;
+    }
+    printk(KERN_INFO "Handshake complete on ID: %llu, CPU: %d. Talking to ID: %llu, CPU: %llu", device->id, smp_processor_id(), received_handshake_pair.sender_id, received_handshake_pair.sender_thread);
+
+    return received_handshake_pair;
+}
+
+bool is_sender_thread_unique(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_thread) {
+    int cpu_id;
+    bool is_unique = true;
+
+    mutex_lock(&device->connected_sockets_lock);
+    for_each_online_cpu(cpu_id) {
+        if (*per_cpu_ptr(multithreaded_socket_list->sender_thread, cpu_id) == sender_thread) {
+            is_unique = false;
+            goto finish;
+        }
+    }
+
+finish:
+    mutex_unlock(&device->connected_sockets_lock);
+    return is_unique;
+}
+
 int connect_to_server(void *args) {
     struct client_thread_params *thread_params = (struct client_thread_params *)args;
-    struct socket_list *sock_list;
+    struct multithreaded_socket_list *multithreaded_socket_list;
+    struct multithreaded_handshake_pair handshake_pair;
     int error = -1;
 
     // Retry connecting to server until it succeeds
@@ -1404,18 +1526,21 @@ int connect_to_server(void *args) {
         goto cleanup;
     }
     printk(KERN_INFO "Connected to server");
-
-    sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-    if (sock_list == NULL) {
-        printk(KERN_ERR "Error creating sock_list");
+    
+    // handshake to get id
+    send_handshake_id(thread_params->device, thread_params->sock, smp_processor_id());
+    handshake_pair = receive_handshake_id(thread_params->device, thread_params->sock);
+    multithreaded_socket_list = create_connected_socket_list_if_null(thread_params->device, handshake_pair.sender_id, thread_params->sock);
+    // Add socket to list. Each CPU uses a different spot so no locking needed
+    this_cpu_write(*multithreaded_socket_list->socks, thread_params->sock);
+    // Check that each socket has a unique ID
+    if (!is_sender_thread_unique(thread_params->device, multithreaded_socket_list, handshake_pair.sender_thread)) {
+        printk(KERN_ERR "Error: Sender thread %llu was reused, replay attack", handshake_pair.sender_thread);
         goto cleanup;
     }
-    sock_list->sock = thread_params->sock;
-    mutex_lock(&thread_params->device->connected_sockets_lock);
-    list_add(&sock_list->list, &thread_params->device->connected_sockets);
-    mutex_unlock(&thread_params->device->connected_sockets_lock);
+    this_cpu_write(*multithreaded_socket_list->sender_thread, handshake_pair.sender_thread);
 
-    blocking_read(thread_params->device, thread_params->sock);
+    blocking_read(thread_params->device, thread_params->sock, multithreaded_socket_list, handshake_pair.sender_id, handshake_pair.sender_thread);
 
 cleanup:
     kfree(thread_params);
@@ -1426,45 +1551,49 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
     struct socket_list *sock_list;
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
+    int cpu_id;
     int error;
 
-    thread_params = kmalloc(sizeof(struct client_thread_params), GFP_KERNEL);
-    if (thread_params == NULL) {
-        printk(KERN_ERR "Error creating client thread params");
-        return -1;
-    }
-    thread_params->device = device;
+    // Start a thread on each CPU
+    for_each_online_cpu(cpu_id) {
+        thread_params = kmalloc(sizeof(struct client_thread_params), GFP_KERNEL);
+        if (thread_params == NULL) {
+            printk(KERN_ERR "Error creating client thread params");
+            return -1;
+        }
+        thread_params->device = device;
 
-    error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
-    if (error < 0) {
-        printk(KERN_ERR "Error creating client socket");
-        return error;
-    }
+        error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
+        if (error < 0) {
+            printk(KERN_ERR "Error creating client socket");
+            return error;
+        }
 
-    // Set sockaddr_in
-    memset(&thread_params->addr, 0, sizeof(thread_params->addr));
-    thread_params->addr.sin_family = AF_INET;
-    // Instead of using inet_addr(), which we don't have access to, use in4_pton() to convert IP address from string
-    if (in4_pton(addr, strlen(addr) + 1, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
-        printk(KERN_ERR "Error converting IP address");
-        return -1;
-    }
-    thread_params->addr.sin_port = htons(port);
+        // Set sockaddr_in
+        memset(&thread_params->addr, 0, sizeof(thread_params->addr));
+        thread_params->addr.sin_family = AF_INET;
+        // Instead of using inet_addr(), which we don't have access to, use in4_pton() to convert IP address from string
+        if (in4_pton(addr, strlen(addr) + 1, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
+            printk(KERN_ERR "Error converting IP address");
+            return -1;
+        }
+        thread_params->addr.sin_port = htons(port);
 
-    // Add this socket to the list so we can close it later in order to shut the thread down
-    sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-    if (sock_list == NULL) {
-        printk(KERN_ERR "Error creating sock_list");
-        return -1;
-    }
-    sock_list->sock = thread_params->sock;
-    list_add(&sock_list->list, &device->client_sockets);
+        // Add this socket to the list so we can close it later in order to shut the thread down
+        sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
+        if (sock_list == NULL) {
+            printk(KERN_ERR "Error creating sock_list");
+            return -1;
+        }
+        sock_list->sock = thread_params->sock;
+        list_add(&sock_list->list, &device->client_sockets);
 
-    // start a thread for this connection
-    connect_thread = kthread_run(connect_to_server, thread_params, "connect to server");
-    if (IS_ERR(connect_thread)) {
-        printk(KERN_ERR "Error creating connect to server thread.");
-        return -1;
+        // start a thread for this connection
+        connect_thread = kthread_run_on_cpu(connect_to_server, thread_params, cpu_id, "connect to server");
+        if (IS_ERR(connect_thread)) {
+            printk(KERN_ERR "Error creating connect to server thread.");
+            return -1;
+        }
     }
 
     return 0;
@@ -1473,10 +1602,25 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
 int listen_to_accepted_socket(void *args) {
     struct accepted_thread_params *thread_params = (struct accepted_thread_params *)args;
     
-    blocking_read(thread_params->device, thread_params->sock);
+    // Complete the handshake
+    send_handshake_id(thread_params->device, thread_params->sock, smp_processor_id());
+    // Add socket to list. Each CPU uses a different spot so no locking needed
+    this_cpu_write(*thread_params->multithreaded_socket_list->socks, thread_params->sock);
+
+    blocking_read(thread_params->device, thread_params->sock, thread_params->multithreaded_socket_list, thread_params->sender_id, thread_params->sender_thread);
 
     kfree(thread_params);
     return 0;
+}
+
+int next_available_thread_id(struct multithreaded_socket_list *multithreaded_socket_list) {
+    int cpu_id;
+    for_each_online_cpu(cpu_id) {
+        if (*per_cpu_ptr(multithreaded_socket_list->sender_thread, cpu_id) == U64_MAX) {
+            return cpu_id;
+        }
+    }
+    return -1;
 }
 
 // Thread that listens to connecting clients
@@ -1485,9 +1629,10 @@ int listen_for_connections(void *args) {
     struct rollbaccine_device *device = thread_params->device;
     struct socket *new_sock;
     struct accepted_thread_params *new_thread_params;
-    struct socket_list *new_connected_socket_list, *new_server_socket_list;
+    struct socket_list *new_server_socket_list;
+    struct multithreaded_handshake_pair handshake_pair;
     struct task_struct *accepted_thread;
-    int error;
+    int receiver_thread, error;
 
     while (!device->shutting_down) {
         // Blocks until a connection is accepted
@@ -1507,17 +1652,6 @@ int listen_for_connections(void *args) {
         new_thread_params->sock = new_sock;
         new_thread_params->device = device;
 
-        // Add to list of connected sockets
-        new_connected_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-        if (new_connected_socket_list == NULL) {
-            printk(KERN_ERR "Error creating socket_list");
-            break;
-        }
-        new_connected_socket_list->sock = new_sock;
-        mutex_lock(&device->connected_sockets_lock);
-        list_add(&new_connected_socket_list->list, &device->connected_sockets);
-        mutex_unlock(&device->connected_sockets_lock);
-
         // Add to list of server sockets
         new_server_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
         if (new_server_socket_list == NULL) {
@@ -1528,7 +1662,26 @@ int listen_for_connections(void *args) {
         // Note: No locks needed here, because only the listener thread writes this list
         list_add(&new_server_socket_list->list, &device->server_sockets);
 
-        accepted_thread = kthread_run(listen_to_accepted_socket, new_thread_params, "listen to accepted socket");
+        // Decide which thread to launch the new connection on based on handshake results. 
+        // Note: This is done on the main thread (instead of a new thread) because we have to first determine which CPU to launch the new thread on.
+        handshake_pair = receive_handshake_id(thread_params->device, new_sock);
+        new_thread_params->sender_id = handshake_pair.sender_id;
+        new_thread_params->sender_thread = handshake_pair.sender_thread;
+        new_thread_params->multithreaded_socket_list = create_connected_socket_list_if_null(thread_params->device, handshake_pair.sender_id, new_sock);
+        if (!is_sender_thread_unique(thread_params->device, new_thread_params->multithreaded_socket_list, handshake_pair.sender_thread)) {
+            printk(KERN_ERR "Error: Sender thread %llu was reused, replay attack", handshake_pair.sender_thread);
+            continue;
+        }
+        // Decide which CPU to listen to the socket on
+        receiver_thread = next_available_thread_id(new_thread_params->multithreaded_socket_list);
+        if (receiver_thread == -1) {
+            printk(KERN_ERR "Error: No available thread to accept connection.");
+            continue;
+        }
+        // Set the sender thread for that CPU
+        *per_cpu_ptr(new_thread_params->multithreaded_socket_list->sender_thread, receiver_thread) = handshake_pair.sender_thread;
+
+        accepted_thread = kthread_run_on_cpu(listen_to_accepted_socket, new_thread_params, receiver_thread, "listen to accepted socket");
         if (IS_ERR(accepted_thread)) {
             printk(KERN_ERR "Error creating accepted thread.");
             break;
@@ -1719,7 +1872,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->bal.id = 0;
     device->bal.num = 0;
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
-    device->last_msg_index = 0;
     spin_lock_init(&device->index_lock);
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
@@ -1836,6 +1988,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
 static void rollbaccine_destructor(struct dm_target *ti) {
     struct socket_list *curr, *next;
+    struct multithreaded_socket_list *curr_multi, *next_multi;
     struct rollbaccine_device *device = ti->private;
     if (device == NULL) return;
 
@@ -1858,9 +2011,13 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     }
 
     // Free socket list (sockets should already be freed)
-    list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
-        list_del(&curr->list);
-        kfree(curr);
+    list_for_each_entry_safe(curr_multi, next_multi, &device->connected_sockets, list) {
+        free_percpu(curr_multi->socks);
+        free_percpu(curr_multi->last_sent_msg_index);
+        free_percpu(curr_multi->waiting_for_msg_index);
+        free_percpu(curr_multi->sender_thread);
+        list_del(&curr_multi->list);
+        kfree(curr_multi);
     }
 
     kvfree(device->checksums);
