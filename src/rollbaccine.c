@@ -163,6 +163,7 @@ struct rollbaccine_device {
 
     // Hashing
     struct crypto_shash *hash_alg;
+    struct mutex __percpu *hash_mutex;
     struct shash_desc __percpu **hash_desc;
 
     // Counters for tracking memory usage
@@ -1070,10 +1071,12 @@ bool verify_msg(struct rollbaccine_device *device, struct multithreaded_socket_l
 
 void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out) {
     cycles_t time = get_cycles_if_flag_on();
-    // Don't allow this CPU to preempt while hashing in case it tries to hash 2 things concurrently
-    preempt_disable();
+    struct mutex *hash_mutex = this_cpu_ptr(device->hash_mutex);
+
+    // Use a per-cpu mutex (not lock, since it might schedule) while hashing in case it tries to hash 2 things concurrently
+    mutex_lock(hash_mutex);
     int ret = crypto_shash_digest(this_cpu_read(*device->hash_desc), buffer, len, out);
-    preempt_enable();
+    mutex_unlock(hash_mutex);
     if (ret) {
         printk(KERN_ERR "Could not hash buffer");
     }
@@ -2038,8 +2041,11 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return PTR_ERR(device->hash_alg);
     }
     // Give each CPU a separate hash_desc so they can hash in parallel
+    device->hash_mutex = alloc_percpu(struct mutex);
     device->hash_desc = alloc_percpu(struct shash_desc*);
     for_each_online_cpu(cpu_id) {
+        mutex_init(per_cpu_ptr(device->hash_mutex, cpu_id));
+
         per_cpu_hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->hash_alg), GFP_KERNEL);
         if (per_cpu_hash_desc == NULL) {
             printk(KERN_ERR "Error allocating hash desc");
@@ -2083,7 +2089,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 static void rollbaccine_destructor(struct dm_target *ti) {
     struct socket_list *curr, *next;
     struct multithreaded_socket_list *curr_multi, *next_multi;
-    struct shash_desc *per_cpu_hash_desc;
     struct rollbaccine_device *device = ti->private;
     int cpu_id;
     if (device == NULL) return;
@@ -2118,9 +2123,9 @@ static void rollbaccine_destructor(struct dm_target *ti) {
 
     // Free hash_desc
     for_each_online_cpu(cpu_id) {
-        per_cpu_hash_desc = *per_cpu_ptr(device->hash_desc, cpu_id);
-        kfree(per_cpu_hash_desc);
+        kfree(*per_cpu_ptr(device->hash_desc, cpu_id));
     }
+    free_percpu(device->hash_mutex);
     free_percpu(device->hash_desc);
 
     kvfree(device->checksums);
