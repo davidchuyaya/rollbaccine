@@ -340,7 +340,11 @@ inline cycles_t get_cycles_if_flag_on(void) {
 void print_and_update_latency(char *text, cycles_t *prev_time) {
 #ifdef LATENCY_TRACKING
     cycles_t curr_time = get_cycles_if_flag_on();
-    printk(KERN_INFO "%s: %llu cycles", text, curr_time - *prev_time);
+    cycles_t diff = curr_time - *prev_time;
+    // Anything with a fewer number of cycles is not important enough to print
+    if (diff > 10000) {
+        printk(KERN_INFO "%s: %llu cycles", text, diff);
+    }
     *prev_time = get_cycles_if_flag_on();
 #endif
 }
@@ -359,6 +363,8 @@ void submit_bio_task(struct work_struct *work) {
     else {
         submit_bio_noacct(bio_data->bio_src);
     }
+
+    this_cpu_inc(num_ops_on_cpu);
 }
 
 void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data) {
@@ -930,8 +936,6 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bio_set_dev(bio, device->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 
-    this_cpu_inc(num_ops_on_cpu);
-
     // Copy bio if it's a write
     if (device->is_leader) {
         is_cloned = true;
@@ -1005,6 +1009,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                         update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
                     }
                     submit_bio_noacct(bio_data->shallow_clone);
+                    this_cpu_inc(num_ops_on_cpu);
                     print_and_update_latency("rollbaccine_map: submit", &time);
                 }
 
@@ -1109,7 +1114,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 printk(KERN_ERR "Could not allocate checksum and iv for bio");
                 goto free_and_return;
             }
-            print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
+            print_and_update_latency("enc_or_dec_bio: ENCRYPT alloc_bio_checksum_and_iv", &time);
             break;
         case ROLLBACCINE_DECRYPT:
             break;
@@ -1120,7 +1125,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 printk(KERN_ERR "Could not allocate page for verification");
                 return NULL;
             }
-            print_and_update_latency("enc_or_dec_bio: page_cache_alloc", &time);
+            print_and_update_latency("enc_or_dec_bio: VERIFY page_cache_alloc", &time);
             break;
     }
 
@@ -1133,7 +1138,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
             case ROLLBACCINE_ENCRYPT:
                 checksum = get_bio_checksum(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
                 iv = get_bio_iv(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
-                print_and_update_latency("enc_or_dec_bio: get bio checksum and iv", &time);
+                print_and_update_latency("enc_or_dec_bio: ENCRYPT get bio checksum and iv", &time);
                 // Generate a new IV
                 // TODO: Uncomment when testing on machines with RDRAND to see if this works
                 // iv_copy_num_bytes_remaining = AES_GCM_IV_SIZE;
@@ -1147,7 +1152,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 //     iv_copy_num_bytes_remaining -= sizeof(long);
                 // }
                 get_random_bytes(iv, AES_GCM_IV_SIZE);
-                print_and_update_latency("enc_or_dec_bio: get_random_bytes", &time);
+                print_and_update_latency("enc_or_dec_bio: ENCRYPT get_random_bytes", &time);
                 break;
             case ROLLBACCINE_DECRYPT:
                 checksum = global_checksum(bio_data->device, curr_sector);
@@ -1248,6 +1253,7 @@ void kill_thread(struct socket *sock) {
 void insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data) {
     unsigned long flags;
     int index_offset, head_offset;
+    cycles_t total_time = get_cycles_if_flag_on();
 
     read_lock_irqsave(&device->pending_bio_ring_lock, flags);
     index_offset = bio_data->write_index - device->pending_bio_ring_start_index;
@@ -1270,15 +1276,18 @@ void insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_
     atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
     atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, index_offset);
 #endif
+    print_and_update_latency("insert_into_pending_bio_ring", &total_time);
 }
 
 void submit_pending_bio_ring_prefix(struct rollbaccine_device *device) {
     struct bio_data *curr_bio_data;
     bool no_conflict;
     unsigned long flags;
+    cycles_t time = get_cycles_if_flag_on();
+    cycles_t total_time = get_cycles_if_flag_on();
 
     write_lock_irqsave(&device->pending_bio_ring_lock, flags);
-
+    print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
     // Pop as much of the bio prefix off the pending bio ring as possible
     while ((curr_bio_data = device->pending_bio_ring[device->pending_bio_ring_head]) != NULL) {
         spin_lock_irqsave(&device->index_lock, flags);
@@ -1308,8 +1317,10 @@ void submit_pending_bio_ring_prefix(struct rollbaccine_device *device) {
         if (device->pending_bio_ring_head >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
             device->pending_bio_ring_head = 0;
         }
+        print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
     }
     write_unlock_irqrestore(&device->pending_bio_ring_lock, flags);
+    print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
 }
 
 // Function used by all listening sockets to block and listen to messages
