@@ -264,7 +264,8 @@ void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, ch
 // Returns array of checksums and IVs for writes, NULL for reads
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 void kill_thread(struct socket * sock);
-void insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data);
+// Returns true if writes in the pending_bio_ring can now be processed
+bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data);
 void submit_pending_bio_ring_prefix(struct rollbaccine_device *device);
 void blocking_read(struct rollbaccine_device * device, struct socket *sock, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_id, uint64_t sender_thread);
 struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock);
@@ -1253,14 +1254,16 @@ void kill_thread(struct socket *sock) {
     }
 }
 
-void insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data) {
+bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data) {
     unsigned long flags;
     int index_offset, head_offset;
+    bool inserted_at_head_of_ring;
     cycles_t total_time = get_cycles_if_flag_on();
 
     read_lock_irqsave(&device->pending_bio_ring_lock, flags);
     index_offset = bio_data->write_index - device->pending_bio_ring_start_index;
     head_offset = index_offset + device->pending_bio_ring_head;
+    inserted_at_head_of_ring = (index_offset == 0);
 
     // Wrap around the buffer if we've gone past the end
     if (head_offset >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
@@ -1280,6 +1283,8 @@ void insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_
     atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, index_offset);
 #endif
     print_and_update_latency("insert_into_pending_bio_ring", &total_time);
+
+    return inserted_at_head_of_ring;
 }
 
 void submit_pending_bio_ring_prefix(struct rollbaccine_device *device) {
@@ -1472,9 +1477,10 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock, struc
             // printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
         }
 
-        // 6. Submit bio, if there are no conflicts. Otherwise blocks and waits for a finished bio to unblock it.
-        insert_into_pending_bio_ring(device, bio_data);
-        submit_pending_bio_ring_prefix(device);
+        // 6. Add bio to pending_bio_ring and submits a prefix from the ring if the next write has arrived
+        if (insert_into_pending_bio_ring(device, bio_data)) {
+            submit_pending_bio_ring_prefix(device);
+        }
     }
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
