@@ -21,6 +21,7 @@
 #include <linux/tcp.h>
 #include <linux/timex.h>
 #include <linux/vmalloc.h>
+#include <linux/rwlock.h>
 #include <net/sock.h>
 
 #define ROLLBACCINE_MAX_CONNECTIONS 10
@@ -35,10 +36,10 @@
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
+#define ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER 100000 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define MODULE_NAME "rollbaccine"
 
-// #define MULTITHREADED_NETWORK
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 // #define LATENCY_TRACKING
 
@@ -56,9 +57,12 @@ struct ballot {
 } __attribute__((packed));
 
 struct metadata_msg {
+    char msg_hash[SHA256_SIZE];
+
     enum MsgType type;
     struct ballot bal;
     uint64_t sender_id;
+    uint64_t sender_thread;
     uint64_t msg_index;
     uint64_t write_index;
     uint64_t num_pages;
@@ -68,12 +72,36 @@ struct metadata_msg {
     sector_t sector;
     // Hash and IV for each write
     char checksum_and_iv[ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE];
-    char msg_hash[SHA256_SIZE];
 } __attribute__((packed));
+
+// Flexible array since we don't know how many extra checksums we will include. Be very careful when using sizeof()
+struct additional_hash_msg {
+    char msg_hash[SHA256_SIZE];
+    uint64_t sender_id;
+    uint64_t sender_thread;
+    uint64_t msg_index;
+    char checksum_and_iv[];
+};
 
 // Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
 struct socket_list {
     struct socket *sock;
+    struct list_head list;
+};
+
+// Used to return a pair from handshake_ids()
+struct multithreaded_handshake_pair {
+    uint64_t sender_id;
+    uint64_t sender_thread;
+} __attribute__((packed));
+
+// A list of connections to different senders, where each sender is connected through 1 socket per CPU for multithreaded TCP
+struct multithreaded_socket_list {
+    struct socket __percpu **socks; // one socket per_cpu
+    uint64_t __percpu *last_sent_msg_index; // the index of the last message sent on each networking thread
+    uint64_t __percpu *waiting_for_msg_index; // the index of the last message received on each networking thread
+    uint64_t __percpu *sender_thread; // unique number for each networking thread. Otherwise an attacker could replay writes across network threads. Defaults to U64_MAX
+    uint64_t sender_id;
     struct list_head list;
 };
 
@@ -97,10 +125,15 @@ struct rollbaccine_device {
     uint64_t id;
 
     struct ballot bal;
-    int write_index;
     // TODO: Track last msg index per unique sender (since the primary may change)
-    uint64_t last_msg_index;     // Doesn't need to be atomic because only the broadcast thread will modify this
-    spinlock_t index_lock;  // Must be obtained for any operation modifying write_index and queues ordered by those indices
+    int write_index;
+    spinlock_t index_lock;  // Must be obtained for any operation modifying write_index
+
+    // TODO: Support with RB tree once the ring is full
+    rwlock_t pending_bio_ring_lock; // Obtain write lock when modifying the start index or ring head, obtain read lock when inserting elements (since each thread is guaranteed to insert into a different place)
+    struct bio_data **pending_bio_ring; // Ring buffer of bios received but not yet write-able (because some prefix has not arrived)
+    int pending_bio_ring_start_index;
+    int pending_bio_ring_head;
 
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
@@ -113,17 +146,19 @@ struct rollbaccine_device {
     struct rb_root outstanding_ops;  // Tree of all outstanding operations, sorted by the sectors they write to
     struct list_head pending_ops;    // List of all operations that conflict with outstanding operations (or other pending operations)
 
-    // Communication between main threads and the networking thread
-    struct workqueue_struct *broadcast_queue;
     // Workqueue to submit pending bios because bio_endio can't submit work (because it might sleep)
     struct workqueue_struct *submit_bio_queue;
+    // Workqueue to execute encryption, broadcasting, etc for leaders so writes aren't restricted to a few specific cores
+    struct workqueue_struct *leader_write_queue;
+    // To ensure that at most 1 message is being broadcasted by each thread
+    struct mutex __percpu *broadcast_mutex;
 
     // Sockets, tracked so we can kill them on exit.
     struct list_head server_sockets;
     struct list_head client_sockets;
-    // Connected sockets. Should be a subset of the sockets above. Handy for broadcasting
-    // TODO: Need to figure out network handshake so we know who we're talking to.
-    struct mutex connected_sockets_lock;
+    // Connected sockets. Should be a subset of the sockets above, stored as a multithreaded_socket_list. Handy for broadcasting
+    // TODO: Sending thread should block on another signal (like finish init) instead of connected threads
+    struct percpu_rw_semaphore connected_sockets_sem;
     struct list_head connected_sockets;
 
     // AEAD
@@ -132,7 +167,8 @@ struct rollbaccine_device {
 
     // Hashing
     struct crypto_shash *hash_alg;
-    struct shash_desc *hash_desc;
+    struct mutex __percpu *hash_mutex;
+    struct shash_desc __percpu **hash_desc;
 
     // Counters for tracking memory usage
 #ifdef MEMORY_TRACKING
@@ -145,6 +181,7 @@ struct rollbaccine_device {
     int num_bio_sector_ranges;
     int num_fsyncs_pending_replication;
     atomic_t num_checksum_and_ivs;
+    atomic_t num_bios_in_pending_bio_ring;
     // These counters tell us the maximum amount of memory we need to prealloc
     atomic_t max_outstanding_num_bio_pages;
     atomic_t max_outstanding_num_bio_data;
@@ -154,8 +191,12 @@ struct rollbaccine_device {
     int max_outstanding_num_bio_sector_ranges;
     int max_outstanding_fsyncs_pending_replication;
     int max_num_pages_in_memory;
+    atomic_t max_bios_in_pending_bio_ring;
+    atomic_t max_distance_between_bios_in_pending_bio_ring;
 #endif
 };
+
+DEFINE_PER_CPU(int, num_ops_on_cpu);
 
 // Associated data for each bio, shared between clones
 struct bio_data {
@@ -186,6 +227,9 @@ struct client_thread_params {
 struct accepted_thread_params {
     struct socket *sock;
     struct rollbaccine_device *device;
+    struct multithreaded_socket_list *multithreaded_socket_list;
+    uint64_t sender_id;
+    uint64_t sender_thread;
 };
 
 struct listen_thread_params {
@@ -216,59 +260,42 @@ void leader_write_disk_end_io(struct bio * shallow_clone);
 void leader_read_disk_end_io(struct bio * shallow_clone);
 void replica_disk_end_io(struct bio * received_bio);
 void network_end_io(struct bio * deep_clone);
-void broadcast_bio(struct work_struct * work);
+void broadcast_bio(struct bio_data* bio_data);
 struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
-bool verify_msg(struct rollbaccine_device *device, void *msg, size_t msg_size, char *expected_hash, uint64_t msg_index);
+void leader_process_write(struct work_struct *work);
+bool verify_msg(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, char *msg, size_t msg_size,
+                                                                    char *expected_hash, uint64_t sender_id, uint64_t sender_thread, uint64_t msg_index);
 void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out);
 // Returns array of checksums and IVs for writes, NULL for reads
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 void kill_thread(struct socket * sock);
-void blocking_read(struct rollbaccine_device * device, struct socket *sock);
+// Returns true if writes in the pending_bio_ring can now be processed
+bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data);
+void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock);
+void ack_fsync(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock, uint64_t fsync_index);
+void blocking_read(struct rollbaccine_device * device, struct socket *sock, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_id, uint64_t sender_thread);
+struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock);
+void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, uint64_t thread_id);
+struct multithreaded_handshake_pair receive_handshake_id(struct rollbaccine_device *device, struct socket *sock);
+bool is_sender_thread_unique(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_thread);
 int connect_to_server(void *args);
+struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock);
 int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port);
 int listen_to_accepted_socket(void *args);
+int next_available_thread_id(struct multithreaded_socket_list *multithreaded_socket_list);
 int listen_for_connections(void *args);
 int start_server(struct rollbaccine_device *device, ushort port);
 int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
 
-// Helper functions to manage the "additional_hash_msg" struct.
-//
-// struct additional_hash_msg {
-//     uint64_t sender_id;
-//     uint64_t msg_index;
-//     char checksum_and_iv[?];
-//     char msg_hash[SHA256_SIZE];
-// };
-//
-// We can't actually have such a struct, because:
-// 1. We want to hash its contents as a continuous buffer in memory and store the hash digest in msg_hash
-// 2. Checksum_and_iv is variable size.
-inline void *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
-    size_t size = sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE;
-    return kmalloc(size, GFP_KERNEL);
+inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
+    return kmalloc(sizeof(struct additional_hash_msg) + checksum_and_iv_size, GFP_KERNEL);
 }
 
-inline void additional_hash_msg_set_sender_id(void *msg, uint64_t sender_id) { *(uint64_t *)msg = sender_id; }
+inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg) + checksum_and_iv_size; }
 
-inline void additional_hash_msg_set_msg_index(void *msg, uint64_t msg_index) { *(uint64_t *)(msg + sizeof(uint64_t)) = msg_index; }
-
-inline void additional_hash_msg_set_checksum_and_iv(void *msg, char *checksum_and_iv, size_t checksum_and_iv_size) {
-    memcpy(msg + sizeof(uint64_t) + sizeof(uint64_t), checksum_and_iv, checksum_and_iv_size);
-}
-
-inline uint64_t additional_hash_msg_get_sender_id(void *msg) { return *(uint64_t *)msg; }
-
-inline uint64_t additional_hash_msg_get_msg_index(void *msg) { return *(uint64_t *)(msg + sizeof(uint64_t)); }
-
-inline char *additional_hash_msg_get_checksum_and_iv(void *msg) { return msg + sizeof(uint64_t) + sizeof(uint64_t); }
-
-inline char *additional_hash_msg_get_msg_hash(void *msg, size_t checksum_and_iv_size) { return msg + sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
-
-inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE; }
-
-inline size_t additional_hash_msg_size_no_hash(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
+inline size_t additional_hash_msg_size_no_hash(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg); }
 
 inline bool has_checksum(unsigned char *checksum) {
     return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
@@ -286,8 +313,16 @@ inline size_t bio_checksum_and_iv_size(int num_sectors) {
     return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
 }
 
-inline unsigned char *alloc_bio_checksum_and_iv(int num_sectors) {
-    return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
+inline unsigned char *alloc_bio_checksum_and_iv(struct rollbaccine_device *device, int num_sectors) {
+    if (num_sectors != 0) {
+#ifdef MEMORY_TRACKING
+        atomic_inc(&device->num_checksum_and_ivs);
+#endif
+        return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
+    }
+    else {
+        return NULL;
+    }
 }
 
 inline unsigned char *get_bio_checksum(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
@@ -317,7 +352,11 @@ inline cycles_t get_cycles_if_flag_on(void) {
 void print_and_update_latency(char *text, cycles_t *prev_time) {
 #ifdef LATENCY_TRACKING
     cycles_t curr_time = get_cycles_if_flag_on();
-    printk(KERN_INFO "%s: %llu cycles", text, curr_time - *prev_time);
+    cycles_t diff = curr_time - *prev_time;
+    // Anything with a fewer number of cycles is not important enough to print
+    if (diff > 10000) {
+        printk(KERN_INFO "%s: %llu cycles", text, diff);
+    }
     *prev_time = get_cycles_if_flag_on();
 #endif
 }
@@ -336,6 +375,8 @@ void submit_bio_task(struct work_struct *work) {
     else {
         submit_bio_noacct(bio_data->bio_src);
     }
+
+    this_cpu_inc(num_ops_on_cpu);
 }
 
 void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data) {
@@ -483,6 +524,8 @@ void atomic_max(atomic_t *old, int new) {
 }
 
 void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed) {
+    // TODO: Don't restrict memory for now
+    return;
     unsigned long flags;
     if (num_pages_needed > device->max_memory_pages) {
         printk_ratelimited(KERN_ERR "Write requires more memory than max pages allocated: %d, automatically allowing write through", num_pages_needed);
@@ -496,6 +539,8 @@ void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages
 }
 
 void release_memory(struct rollbaccine_device *device, int num_pages_released) {
+    // TODO: Don't restrict memory for now
+    return;
     unsigned long flags;
     if (num_pages_released > 0) {
         spin_lock_irqsave(&device->memory_wait_queue.lock, flags);
@@ -537,16 +582,9 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
     unsigned long flags;
 
     spin_lock_irqsave(&device->replica_fsync_lock, flags);
-    // Special case for f = 1, n = 2, since there's only 1 follower, so we don't need to iterate.
-    // Also, we don't need to compare maxes (the latest message should always have a larger fsync index).
-    // TODO: Once we move away from a single network model, we'll need to compare maxes
-    if (device->f == 1 && device->n == 2) {
-        device->max_replica_fsync_index = follower_fsync_index;
-        max_index_changed = true;
-    }
-    // Special case for f = 1, n = 3.
+    // Special case for f = 1, n <= 3.
     // What the quorum agrees on = max of what any 1 follower has (plus the leader's fsync index, which must be higher).
-    else if (device->f == 1 && device->n == 3) {
+    if (device->f == 1 && device->n <= 3) {
         if (device->max_replica_fsync_index < follower_fsync_index) {
             device->max_replica_fsync_index = follower_fsync_index;
             max_index_changed = true;
@@ -712,9 +750,8 @@ void network_end_io(struct bio *deep_clone) {
     try_free_clones(deep_clone);
 }
 
-void broadcast_bio(struct work_struct *work) {
+void broadcast_bio(struct bio_data *clone_bio_data) {
     int sent;
-    struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
     struct bio *clone = clone_bio_data->deep_clone;
     unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
     size_t checksum_and_iv_size = bio_checksum_and_iv_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
@@ -722,26 +759,31 @@ void broadcast_bio(struct work_struct *work) {
     struct rollbaccine_device *device = clone_bio_data->device;
     struct msghdr msg_header;
     struct kvec vec;
-    struct socket_list *curr, *next;
+    struct multithreaded_socket_list *multithreaded_socket_list, *next_multithreaded_socket_list;
     struct metadata_msg metadata;
-    void *additional_hash_msg;
+    struct additional_hash_msg *additional_hash_msg;
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
+    struct socket *sock;
+    struct mutex *broadcast_mutex;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
+
+    // Pin this to a specific CPU
+    set_cpus_allowed_ptr(current, cpumask_of(smp_processor_id()));
+    broadcast_mutex = this_cpu_ptr(device->broadcast_mutex);
 
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
     metadata.bal = device->bal;
     metadata.sender_id = device->id;
-    metadata.msg_index = ++device->last_msg_index;
+    metadata.sender_thread = smp_processor_id();
     metadata.write_index = clone_bio_data->write_index;
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = clone->bi_opf;
     metadata.sector = clone->bi_iter.bi_sector;
     // Copy checksum and IV into metadata
     memcpy(metadata.checksum_and_iv, checksum_and_iv, checksum_and_iv_size);
-    // Create a hash of the message
-    hash_buffer(device, (char *)&metadata, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+    
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
     WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
@@ -759,15 +801,21 @@ void broadcast_bio(struct work_struct *work) {
     if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
         remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
         additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
-        additional_hash_msg_set_sender_id(additional_hash_msg, device->id);
-        additional_hash_msg_set_msg_index(additional_hash_msg, ++device->last_msg_index);
-        additional_hash_msg_set_checksum_and_iv(additional_hash_msg, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
-        hash_buffer(device, additional_hash_msg, additional_hash_msg_size_no_hash(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size));
+        additional_hash_msg->sender_id = device->id;
+        additional_hash_msg->sender_thread = smp_processor_id();
+        memcpy(additional_hash_msg->checksum_and_iv, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
     }
 
-    // TODO: See if we can just use spinlock again? Using mutex instead of spinlock because kernel_sendmsg sleeps for TLS and that triggers an error (sleep while holding spinlock)
-    mutex_lock(&device->connected_sockets_lock);
-    list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
+    // First lock to prevent the same core from broadcasting multiple messages concurrently
+    mutex_lock(broadcast_mutex);
+    // Second lock to make sure the list of connected sockets hasn't changed
+    percpu_down_read(&device->connected_sockets_sem);
+    list_for_each_entry_safe(multithreaded_socket_list, next_multithreaded_socket_list, &device->connected_sockets, list) {
+        sock = this_cpu_read(*multithreaded_socket_list->socks);
+        // Create a hash of the message after incrementing msg_index
+        metadata.msg_index = this_cpu_inc_return(*multithreaded_socket_list->last_sent_msg_index) - 1;
+        hash_buffer(device, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
         print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
@@ -775,9 +823,9 @@ void broadcast_bio(struct work_struct *work) {
         // 1. Send metadata
         // Keep retrying send until the whole message is sent
         while (vec.iov_len > 0) {
-            sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
+            sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
             if (sent <= 0) {
-                printk(KERN_ERR "Error broadcasting message header, aborting");
+                printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
                 // TODO: Should remove the socket from the list and shut down the connection?
                 goto finish_sending_to_socket;
             } else {
@@ -789,11 +837,14 @@ void broadcast_bio(struct work_struct *work) {
 
         // 2. Send hash & IVs if they exceed what could be sent with the metadata
         if (additional_hash_msg != NULL) {
+            additional_hash_msg->msg_index = this_cpu_inc_return(*multithreaded_socket_list->last_sent_msg_index) - 1;
+            hash_buffer(device, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg->msg_hash);
+
             vec.iov_base = additional_hash_msg;
             vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
             while (vec.iov_len > 0) {
                 // printk(KERN_INFO "Sending checksums and IVs, size: %lu", vec.iov_len);
-                sent = kernel_sendmsg(curr->sock, &msg_header, &vec, 1, vec.iov_len);
+                sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
                 if (sent <= 0) {
                     printk(KERN_ERR "Error broadcasting checksums and IVs");
                     goto finish_sending_to_socket;
@@ -813,7 +864,7 @@ void broadcast_bio(struct work_struct *work) {
             while (chunked_bvec.bv_len > 0) {
                 iov_iter_bvec(&msg_header.msg_iter, ITER_SOURCE, &chunked_bvec, 1, chunked_bvec.bv_len);
 
-                sent = sock_sendmsg(curr->sock, &msg_header);
+                sent = sock_sendmsg(sock, &msg_header);
                 if (sent <= 0) {
                     printk(KERN_ERR "Error broadcasting message pages");
                     // TODO: Should remove the socket from the list and shut down the connection?
@@ -829,7 +880,8 @@ void broadcast_bio(struct work_struct *work) {
     finish_sending_to_socket:
     }
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
-    mutex_unlock(&device->connected_sockets_lock);
+    percpu_up_read(&device->connected_sockets_sem);
+    mutex_unlock(broadcast_mutex);
 
     if (additional_hash_msg != NULL) {
         kfree(additional_hash_msg);
@@ -892,13 +944,88 @@ struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_sr
     return clone;
 }
 
+void leader_process_write(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, broadcast_work);
+    struct rollbaccine_device *device = bio_data->device;
+    struct bio *bio = bio_data->bio_src;
+    bool doesnt_conflict_with_other_writes = true;
+    cycles_t time = get_cycles_if_flag_on();
+    unsigned long flags;
+
+    // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
+    block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
+
+    bio_data->is_fsync = requires_fsync(bio);
+    // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
+    // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
+
+    // Encrypt
+    bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
+    print_and_update_latency("leader_process_write: encryption", &time);
+
+    // Create the network clone
+    bio_data->deep_clone = deep_bio_clone(device, bio);
+    if (!bio_data->deep_clone) {
+        printk(KERN_ERR "Could not create deep clone");
+        return;
+    }
+
+    // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
+    bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
+    if (!bio_data->shallow_clone) {
+        printk(KERN_ERR "Could not create shallow clone");
+        return;
+    }
+    // Set end_io so once this write completes, queued writes can be unblocked
+    bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
+
+    // Set shared data between clones
+    atomic_set(&bio_data->ref_counter, 2);
+    bio_data->deep_clone->bi_private = bio_data;
+    bio_data->shallow_clone->bi_private = bio_data;
+
+    // Increment indices, place ops on queue, submit cloned ops to disk
+    spin_lock_irqsave(&device->index_lock, flags);
+    print_and_update_latency("leader_process_write: encryption -> obtained index lock", &time);
+    // Increment write index
+    bio_data->write_index = ++device->write_index;
+    doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true);
+    if (!doesnt_conflict_with_other_writes) {
+        add_to_pending_ops_tail(device, bio_data);
+    }
+    // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
+    if (bio_data->is_fsync) {
+        // Add original bio to fsyncs blocked on replication
+        bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
+        spin_lock(&device->replica_fsync_lock);
+        print_and_update_latency("leader_process_write: index lock -> obtained replica fsync lock", &time);
+        bio_list_add(&device->fsyncs_pending_replication, bio);
+#ifdef MEMORY_TRACKING
+        device->num_fsyncs_pending_replication += 1;
+#endif
+        spin_unlock(&device->replica_fsync_lock);
+    }
+    spin_unlock_irqrestore(&device->index_lock, flags);
+
+    // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
+    if (doesnt_conflict_with_other_writes) {
+        if (bio_data->checksum_and_iv != NULL) {
+            update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
+        }
+        submit_bio_noacct(bio_data->shallow_clone);
+        this_cpu_inc(num_ops_on_cpu);
+        print_and_update_latency("leader_process_write: submit", &time);
+    }
+
+    broadcast_bio(bio_data);
+}
+
 static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bool is_cloned = false;
     bool doesnt_conflict_with_other_writes = true;
     struct rollbaccine_device *device = ti->private;
     struct bio_data *bio_data;
     cycles_t total_time = get_cycles_if_flag_on();
-    cycles_t time = get_cycles_if_flag_on();
     unsigned long flags;
 
     bio_set_dev(bio, device->dev->bdev);
@@ -916,72 +1043,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         
         switch (bio_data_dir(bio)) {
             case WRITE:
-                // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
-                block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
-
-                bio_data->is_fsync = requires_fsync(bio);
-                // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
-                // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
-
-                // Encrypt
-                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
-                print_and_update_latency("rollbaccine_map: encryption", &time);
-
-                // Create the network clone
-                bio_data->deep_clone = deep_bio_clone(device, bio);
-                if (!bio_data->deep_clone) {
-                    printk(KERN_ERR "Could not create deep clone");
-                    return DM_MAPIO_REMAPPED;
-                }
-
-                // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
-                bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
-                if (!bio_data->shallow_clone) {
-                    printk(KERN_ERR "Could not create shallow clone");
-                    return DM_MAPIO_REMAPPED;
-                }
-                // Set end_io so once this write completes, queued writes can be unblocked
-                bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
-
-                // Set shared data between clones
-                atomic_set(&bio_data->ref_counter, 2);
-                INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
-                bio_data->deep_clone->bi_private = bio_data;
-                bio_data->shallow_clone->bi_private = bio_data;
-
-                // Increment indices, place ops on queue, submit cloned ops to disk
-                spin_lock_irqsave(&device->index_lock, flags);
-                print_and_update_latency("rollbaccine_map: encryption -> obtained index lock", &time);
-                // Increment write index
-                bio_data->write_index = ++device->write_index;
-                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true);
-                if (!doesnt_conflict_with_other_writes) {
-                    add_to_pending_ops_tail(device, bio_data);
-                }
-                // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
-                if (bio_data->is_fsync) {
-                    // Add original bio to fsyncs blocked on replication
-                    bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
-                    spin_lock(&device->replica_fsync_lock);
-                    print_and_update_latency("rollbaccine_map: index lock -> obtained replica fsync lock", &time);
-                    bio_list_add(&device->fsyncs_pending_replication, bio);
-#ifdef MEMORY_TRACKING
-                    device->num_fsyncs_pending_replication += 1;
-#endif
-                    spin_unlock(&device->replica_fsync_lock);
-                }
-                queue_work(device->broadcast_queue, &bio_data->broadcast_work);
-                print_and_update_latency("rollbaccine_map: queued to broadcast", &time);
-                spin_unlock_irqrestore(&device->index_lock, flags);
-
-                // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
-                if (doesnt_conflict_with_other_writes) {
-                    if (bio_data->checksum_and_iv != NULL) {
-                        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
-                    }
-                    submit_bio_noacct(bio_data->shallow_clone);
-                    print_and_update_latency("rollbaccine_map: submit", &time);
-                }
+                // Send to workqueue so it'll do the CPU load balancing for us
+                INIT_WORK(&bio_data->broadcast_work, leader_process_write);
+                queue_work(device->leader_write_queue, &bio_data->broadcast_work);
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
@@ -1014,31 +1078,36 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
 }
 
-bool verify_msg(struct rollbaccine_device *device, void *msg, size_t msg_size, char *expected_hash, uint64_t msg_index) {
+bool verify_msg(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, char *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_thread, uint64_t msg_index) {
     char calculated_hash[SHA256_SIZE];
     bool hash_matches;
+    bool sender_matches;
+    bool thread_matches;
     bool msg_index_matches;
 
-    hash_buffer(device, msg, msg_size - SHA256_SIZE, calculated_hash);
+    hash_buffer(device, msg, msg_size, calculated_hash);
     hash_matches = memcmp(calculated_hash, expected_hash, SHA256_SIZE) == 0;
-    msg_index_matches = device->last_msg_index + 1 == msg_index;
+    sender_matches = multithreaded_socket_list->sender_id == sender_id;
+    thread_matches = this_cpu_read(*multithreaded_socket_list->sender_thread) == sender_thread;
+    msg_index_matches = this_cpu_read(*multithreaded_socket_list->waiting_for_msg_index) == msg_index;
 
-    if (!hash_matches) {
-        printk(KERN_ERR "Received message with incorrect hash, expected: %s, received: %s", expected_hash, calculated_hash);
+    if (!hash_matches || !sender_matches || !thread_matches || !msg_index_matches) {
+        printk(KERN_ERR "Received incorrect message, expected hash: %s, hash: %s, expected sender: %llu, sender: %llu, expected thread: %llu, thread: %llu, expected msg index: %llu, msg index: %llu", expected_hash, calculated_hash, multithreaded_socket_list->sender_id, sender_id, this_cpu_read(*multithreaded_socket_list->sender_thread), sender_thread, this_cpu_read(*multithreaded_socket_list->waiting_for_msg_index), msg_index);
         return false;
     }
-    if (!msg_index_matches) {
-        printk(KERN_ERR "Received message with incorrect index, expected: %llu, received: %llu", device->last_msg_index + 1, msg_index);
-        return false;
-    }
-    // Increment the last_msg_index
-    device->last_msg_index = msg_index;
+    // Increment the message index
+    this_cpu_inc(*multithreaded_socket_list->waiting_for_msg_index);
     return true;
 }
 
 void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out) {
     cycles_t time = get_cycles_if_flag_on();
-    int ret = crypto_shash_digest(device->hash_desc, buffer, len, out);
+    struct mutex *hash_mutex = this_cpu_ptr(device->hash_mutex);
+
+    // Use a per-cpu mutex (not lock, since it might schedule) while hashing in case it tries to hash 2 things concurrently
+    mutex_lock(hash_mutex);
+    int ret = crypto_shash_digest(this_cpu_read(*device->hash_desc), buffer, len, out);
+    mutex_unlock(hash_mutex);
     if (ret) {
         printk(KERN_ERR "Could not hash buffer");
     }
@@ -1071,15 +1140,12 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     switch (enc_or_dec) {
         case ROLLBACCINE_ENCRYPT:
             // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_sectors(bio_data->bio_src));
-    #ifdef MEMORY_TRACKING
-            atomic_inc(&bio_data->device->num_checksum_and_ivs);
-    #endif
+            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio_data->bio_src));
             if (!bio_checksum_and_iv) {
                 printk(KERN_ERR "Could not allocate checksum and iv for bio");
                 goto free_and_return;
             }
-            print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
+            print_and_update_latency("enc_or_dec_bio: ENCRYPT alloc_bio_checksum_and_iv", &time);
             break;
         case ROLLBACCINE_DECRYPT:
             break;
@@ -1090,7 +1156,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 printk(KERN_ERR "Could not allocate page for verification");
                 return NULL;
             }
-            print_and_update_latency("enc_or_dec_bio: page_cache_alloc", &time);
+            print_and_update_latency("enc_or_dec_bio: VERIFY page_cache_alloc", &time);
             break;
     }
 
@@ -1103,7 +1169,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
             case ROLLBACCINE_ENCRYPT:
                 checksum = get_bio_checksum(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
                 iv = get_bio_iv(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
-                print_and_update_latency("enc_or_dec_bio: get bio checksum and iv", &time);
+                print_and_update_latency("enc_or_dec_bio: ENCRYPT get bio checksum and iv", &time);
                 // Generate a new IV
                 // TODO: Uncomment when testing on machines with RDRAND to see if this works
                 // iv_copy_num_bytes_remaining = AES_GCM_IV_SIZE;
@@ -1117,7 +1183,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 //     iv_copy_num_bytes_remaining -= sizeof(long);
                 // }
                 get_random_bytes(iv, AES_GCM_IV_SIZE);
-                print_and_update_latency("enc_or_dec_bio: get_random_bytes", &time);
+                print_and_update_latency("enc_or_dec_bio: ENCRYPT get_random_bytes", &time);
                 break;
             case ROLLBACCINE_DECRYPT:
                 checksum = global_checksum(bio_data->device, curr_sector);
@@ -1183,7 +1249,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
 
         if (ret) {
             if (ret == -EBADMSG) {
-                printk(KERN_ERR "invalid integrity check");
+                printk_ratelimited(KERN_ERR "invalid integrity check");
             } else {
                 printk_ratelimited(KERN_ERR "encryption/decryption failed with error code %d", ret);
             }
@@ -1215,19 +1281,142 @@ void kill_thread(struct socket *sock) {
     }
 }
 
+bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data) {
+    unsigned long flags;
+    int index_offset, head_offset;
+    bool inserted_at_head_of_ring;
+    cycles_t total_time = get_cycles_if_flag_on();
+
+    read_lock_irqsave(&device->pending_bio_ring_lock, flags);
+    index_offset = bio_data->write_index - device->pending_bio_ring_start_index;
+    head_offset = index_offset + device->pending_bio_ring_head;
+    inserted_at_head_of_ring = (index_offset == 0);
+
+    // Wrap around the buffer if we've gone past the end
+    if (head_offset >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
+        head_offset -= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
+        if (head_offset > device->pending_bio_ring_head) {
+            printk_ratelimited(KERN_ERR "Pending bio ring full!");
+            // TODO: Resort to RB tree
+        }
+    }
+
+    device->pending_bio_ring[head_offset] = bio_data;
+    read_unlock_irqrestore(&device->pending_bio_ring_lock, flags);
+
+#ifdef MEMORY_TRACKING
+    int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
+    atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
+    atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, index_offset);
+#endif
+    print_and_update_latency("insert_into_pending_bio_ring", &total_time);
+
+    return inserted_at_head_of_ring;
+}
+
+void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock) {
+    struct bio_data *curr_bio_data;
+    bool no_conflict;
+    unsigned long flags;
+    int max_fsync_index = -1;
+    cycles_t time = get_cycles_if_flag_on();
+    cycles_t total_time = get_cycles_if_flag_on();
+
+    write_lock_irqsave(&device->pending_bio_ring_lock, flags);
+    print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
+    // Pop as much of the bio prefix off the pending bio ring as possible
+    while ((curr_bio_data = device->pending_bio_ring[device->pending_bio_ring_head]) != NULL) {
+        spin_lock_irqsave(&device->index_lock, flags);
+        no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
+        if (!no_conflict) {
+            add_to_pending_ops_tail(device, curr_bio_data);
+        }
+        // Increment global write index
+        device->write_index = curr_bio_data->write_index;
+        spin_unlock_irqrestore(&device->index_lock, flags);
+#ifdef MEMORY_TRACKING
+        atomic_dec(&device->num_bios_in_pending_bio_ring);
+#endif
+
+        // Submit the bio (to a queue) if we can. Don't submit directly since we're still holding a lock, and the submit might block on disk
+        if (no_conflict) {
+            if (curr_bio_data->checksum_and_iv != NULL) {
+                update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
+            }
+            queue_work(device->submit_bio_queue, &curr_bio_data->submit_bio_work);
+        }
+
+        // Increment max_fsync_index
+        if (curr_bio_data->is_fsync) {
+            max_fsync_index = curr_bio_data->write_index;
+        }
+
+        // Increment index and wrap around if necessary
+        device->pending_bio_ring[device->pending_bio_ring_head] = NULL;
+        device->pending_bio_ring_head++;
+        device->pending_bio_ring_start_index++;
+        if (device->pending_bio_ring_head >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
+            device->pending_bio_ring_head = 0;
+        }
+        print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
+    }
+    write_unlock_irqrestore(&device->pending_bio_ring_lock, flags);
+
+    // Ack the latest fsync
+    if (max_fsync_index != -1) {
+        ack_fsync(device, multithreaded_socket_list, sock, max_fsync_index);
+    }
+
+    print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
+}
+
+void ack_fsync(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock, uint64_t fsync_index) {
+    struct metadata_msg metadata;
+    struct msghdr msg_header;
+    struct kvec vec;
+    int sent;
+
+    metadata.type = FOLLOWER_ACK;
+    metadata.bal = device->bal;
+    metadata.sender_id = device->id;
+    metadata.sender_thread = smp_processor_id();
+    metadata.msg_index = this_cpu_inc_return(*multithreaded_socket_list->last_sent_msg_index) - 1;
+    metadata.write_index = fsync_index;
+    hash_buffer(device, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    // Keep retrying send until the whole message is sent
+    while (vec.iov_len > 0) {
+        sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
+        if (sent <= 0) {
+            printk(KERN_ERR "Error replying to fsync, aborting");
+            break;
+        } else {
+            vec.iov_base += sent;
+            vec.iov_len -= sent;
+        }
+    }
+}
+
 // Function used by all listening sockets to block and listen to messages
-void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
+void blocking_read(struct rollbaccine_device *device, struct socket *sock, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_id, uint64_t sender_thread) {
     struct metadata_msg metadata;
     struct bio *received_bio;
     struct bio_data *bio_data;
     struct page *page;
     struct msghdr msg_header;
     struct kvec vec;
-    int sent, received, i, num_sectors;
+    int received, i, num_sectors;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
-    void *additional_hash_msg;
-    bool no_conflict;
-    unsigned long flags;
+    struct additional_hash_msg *additional_hash_msg;
 
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
@@ -1249,10 +1438,15 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH |
         // REQ_FUA));
 
+        // Verify the message
+        if (!verify_msg(device, multithreaded_socket_list, (char*) &metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash, metadata.sender_id, metadata.sender_thread, metadata.msg_index)) {
+            break;
+        }
+
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
             // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
-            process_follower_fsync_index(device, metadata.bal.id, metadata.write_index);
+            process_follower_fsync_index(device, metadata.sender_id, metadata.write_index);
             continue;
         }
 
@@ -1260,27 +1454,20 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         received_bio->bi_iter.bi_sector = metadata.sector;
         received_bio->bi_end_io = replica_disk_end_io;
 
-        // Verify the message
-        if (!verify_msg(device, &metadata, sizeof(struct metadata_msg), metadata.msg_hash, metadata.msg_index)) {
-            break;
-        }
-
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
-        device->write_index = metadata.write_index;
         bio_data->bio_src = received_bio;
         bio_data->start_sector = metadata.sector;
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
+        bio_data->is_fsync = metadata.type == ROLLBACCINE_FSYNC;
+        INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
         received_bio->bi_private = bio_data;
 
         // Copy hash and IV
         num_sectors = metadata.num_pages * SECTORS_PER_PAGE;
         checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
-        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(num_sectors);
-#ifdef MEMORY_TRACKING
-        atomic_inc(&device->num_checksum_and_ivs);
-#endif
+        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(device, num_sectors);
         memcpy(bio_data->checksum_and_iv, metadata.checksum_and_iv, min(ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, checksum_and_iv_size));
 
         // 2. Expect hash if it wasn't done sending
@@ -1299,12 +1486,12 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
             }
 
             // Verify the message
-            if (!verify_msg(device, additional_hash_msg, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size), additional_hash_msg_get_msg_index(additional_hash_msg))) {
+            if (!verify_msg(device, multithreaded_socket_list, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_thread, additional_hash_msg->msg_index)) {
                 break;
             }
 
             // Copy the checksums over
-            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg_get_checksum_and_iv(additional_hash_msg), remaining_checksum_and_iv_size);
+            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg->checksum_and_iv, remaining_checksum_and_iv_size);
             // Free the message
             kfree(additional_hash_msg);
         }
@@ -1336,41 +1523,9 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         // 4. Verify against hash
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
-        // 5. If the message is an fsync, reply.
-        // Note: We don't need to append a msg index here, because fsyncs grow monotonically per follower per ballot
-        if (metadata.type == ROLLBACCINE_FSYNC) {
-            metadata.type = FOLLOWER_ACK;
-            metadata.bal.id = device->bal.id;
-
-            vec.iov_base = &metadata;
-            vec.iov_len = sizeof(struct metadata_msg);
-
-            // Keep retrying send until the whole message is sent
-            while (vec.iov_len > 0) {
-                sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
-                if (sent <= 0) {
-                    printk(KERN_ERR "Error replying to fsync, aborting");
-                    break;
-                } else {
-                    vec.iov_base += sent;
-                    vec.iov_len -= sent;
-                }
-            }
-            // printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
-        }
-
-        // 6. Submit bio, if there are no conflicts. Otherwise blocks and waits for a finished bio to unblock it.
-        spin_lock_irqsave(&device->index_lock, flags);
-        no_conflict = try_insert_into_outstanding_ops(device, bio_data, true);
-        if (!no_conflict) {
-            add_to_pending_ops_tail(device, bio_data);
-        }
-        spin_unlock_irqrestore(&device->index_lock, flags);
-        if (no_conflict) {
-            if (metadata.num_pages != 0) {
-                update_global_checksum_and_iv(device, bio_data->checksum_and_iv, metadata.sector, num_sectors);
-            }
-            submit_bio_noacct(received_bio);
+        // 5. Add bio to pending_bio_ring and submit a prefix from the ring if the next write has arrived
+        if (insert_into_pending_bio_ring(device, bio_data)) {
+            submit_pending_bio_ring_prefix(device, multithreaded_socket_list, sock);
         }
     }
 
@@ -1381,9 +1536,115 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     //     sock_release(sock);
 }
 
+struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock) {
+    struct multithreaded_socket_list *multithreaded_socket_list;
+    int cpu_id;
+
+    percpu_down_write(&device->connected_sockets_sem);
+    list_for_each_entry(multithreaded_socket_list, &device->connected_sockets, list) {
+        if (multithreaded_socket_list->sender_id == sender_id) {
+            // Already exists, nothing to do
+            goto unlock_and_return;
+        }
+    }
+
+    // Malloc if list doesn't exist
+    multithreaded_socket_list = kmalloc(sizeof(struct multithreaded_socket_list), GFP_KERNEL);
+    if (!multithreaded_socket_list) {
+        printk(KERN_ERR "Error creating multithreaded_socket_list");
+        goto unlock_and_return;
+    }
+    multithreaded_socket_list->sender_id = sender_id;
+    multithreaded_socket_list->socks = alloc_percpu(struct socket *);
+    multithreaded_socket_list->last_sent_msg_index = alloc_percpu(uint64_t);
+    multithreaded_socket_list->waiting_for_msg_index = alloc_percpu(uint64_t);
+    multithreaded_socket_list->sender_thread = alloc_percpu(uint64_t);
+    // Set the sender thread to U64_MAX so we know it's not set and can check for conflicts later
+    for_each_online_cpu(cpu_id) {
+        *per_cpu_ptr(multithreaded_socket_list->sender_thread, cpu_id) = U64_MAX;
+    }
+    list_add(&multithreaded_socket_list->list, &device->connected_sockets);
+
+unlock_and_return:
+    percpu_up_write(&device->connected_sockets_sem);
+    return multithreaded_socket_list;
+}
+
+void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, uint64_t thread_id) {
+    struct multithreaded_handshake_pair handshake_pair = {device->id, thread_id};
+    struct msghdr msg_header;
+    struct kvec vec;
+    int sent;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    vec.iov_base = &handshake_pair;
+    vec.iov_len = sizeof(struct multithreaded_handshake_pair);
+
+    // Keep retrying send until the whole message is sent
+    printk(KERN_INFO "Sending handshake ID: %llu, CPU: %llu", device->id, thread_id);
+    while (vec.iov_len > 0) {
+        sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
+        if (sent <= 0) {
+            printk(KERN_ERR "Error sending handshake, aborting");
+            return;
+        } else {
+            vec.iov_base += sent;
+            vec.iov_len -= sent;
+        }
+    }
+}
+
+struct multithreaded_handshake_pair receive_handshake_id(struct rollbaccine_device *device, struct socket *sock) {
+    struct multithreaded_handshake_pair received_handshake_pair;
+    struct msghdr msg_header;
+    struct kvec vec;
+    int received;
+
+    msg_header.msg_name = 0;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+
+    vec.iov_base = &received_handshake_pair;
+    vec.iov_len = sizeof(struct multithreaded_handshake_pair);
+
+    printk(KERN_INFO "Receiving handshake on ID: %llu, CPU: %d", device->id, smp_processor_id());
+    received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+    if (received <= 0) {
+        printk(KERN_ERR "Error receiving handshake, aborting");
+        return received_handshake_pair;
+    }
+    printk(KERN_INFO "Handshake complete on ID: %llu, CPU: %d. Talking to ID: %llu, CPU: %llu", device->id, smp_processor_id(), received_handshake_pair.sender_id, received_handshake_pair.sender_thread);
+
+    return received_handshake_pair;
+}
+
+bool is_sender_thread_unique(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_thread) {
+    int cpu_id;
+    bool is_unique = true;
+
+    percpu_down_read(&device->connected_sockets_sem);
+    for_each_online_cpu(cpu_id) {
+        if (*per_cpu_ptr(multithreaded_socket_list->sender_thread, cpu_id) == sender_thread) {
+            is_unique = false;
+            break;
+        }
+    }
+
+    percpu_up_read(&device->connected_sockets_sem);
+    return is_unique;
+}
+
 int connect_to_server(void *args) {
     struct client_thread_params *thread_params = (struct client_thread_params *)args;
-    struct socket_list *sock_list;
+    struct multithreaded_socket_list *multithreaded_socket_list;
+    struct multithreaded_handshake_pair handshake_pair;
     int error = -1;
 
     // Retry connecting to server until it succeeds
@@ -1400,18 +1661,21 @@ int connect_to_server(void *args) {
         goto cleanup;
     }
     printk(KERN_INFO "Connected to server");
-
-    sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-    if (sock_list == NULL) {
-        printk(KERN_ERR "Error creating sock_list");
+    
+    // handshake to get id
+    send_handshake_id(thread_params->device, thread_params->sock, smp_processor_id());
+    handshake_pair = receive_handshake_id(thread_params->device, thread_params->sock);
+    multithreaded_socket_list = create_connected_socket_list_if_null(thread_params->device, handshake_pair.sender_id, thread_params->sock);
+    // Add socket to list. Each CPU uses a different spot so no locking needed
+    this_cpu_write(*multithreaded_socket_list->socks, thread_params->sock);
+    // Check that each socket has a unique ID
+    if (!is_sender_thread_unique(thread_params->device, multithreaded_socket_list, handshake_pair.sender_thread)) {
+        printk(KERN_ERR "Error: Sender thread %llu was reused, replay attack", handshake_pair.sender_thread);
         goto cleanup;
     }
-    sock_list->sock = thread_params->sock;
-    mutex_lock(&thread_params->device->connected_sockets_lock);
-    list_add(&sock_list->list, &thread_params->device->connected_sockets);
-    mutex_unlock(&thread_params->device->connected_sockets_lock);
+    this_cpu_write(*multithreaded_socket_list->sender_thread, handshake_pair.sender_thread);
 
-    blocking_read(thread_params->device, thread_params->sock);
+    blocking_read(thread_params->device, thread_params->sock, multithreaded_socket_list, handshake_pair.sender_id, handshake_pair.sender_thread);
 
 cleanup:
     kfree(thread_params);
@@ -1422,45 +1686,49 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
     struct socket_list *sock_list;
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
+    int cpu_id;
     int error;
 
-    thread_params = kmalloc(sizeof(struct client_thread_params), GFP_KERNEL);
-    if (thread_params == NULL) {
-        printk(KERN_ERR "Error creating client thread params");
-        return -1;
-    }
-    thread_params->device = device;
+    // Start a thread on each CPU
+    for_each_online_cpu(cpu_id) {
+        thread_params = kmalloc(sizeof(struct client_thread_params), GFP_KERNEL);
+        if (thread_params == NULL) {
+            printk(KERN_ERR "Error creating client thread params");
+            return -1;
+        }
+        thread_params->device = device;
 
-    error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
-    if (error < 0) {
-        printk(KERN_ERR "Error creating client socket");
-        return error;
-    }
+        error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
+        if (error < 0) {
+            printk(KERN_ERR "Error creating client socket");
+            return error;
+        }
 
-    // Set sockaddr_in
-    memset(&thread_params->addr, 0, sizeof(thread_params->addr));
-    thread_params->addr.sin_family = AF_INET;
-    // Instead of using inet_addr(), which we don't have access to, use in4_pton() to convert IP address from string
-    if (in4_pton(addr, strlen(addr) + 1, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
-        printk(KERN_ERR "Error converting IP address");
-        return -1;
-    }
-    thread_params->addr.sin_port = htons(port);
+        // Set sockaddr_in
+        memset(&thread_params->addr, 0, sizeof(thread_params->addr));
+        thread_params->addr.sin_family = AF_INET;
+        // Instead of using inet_addr(), which we don't have access to, use in4_pton() to convert IP address from string
+        if (in4_pton(addr, strlen(addr) + 1, (u8 *)&thread_params->addr.sin_addr.s_addr, '\n', NULL) == 0) {
+            printk(KERN_ERR "Error converting IP address");
+            return -1;
+        }
+        thread_params->addr.sin_port = htons(port);
 
-    // Add this socket to the list so we can close it later in order to shut the thread down
-    sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-    if (sock_list == NULL) {
-        printk(KERN_ERR "Error creating sock_list");
-        return -1;
-    }
-    sock_list->sock = thread_params->sock;
-    list_add(&sock_list->list, &device->client_sockets);
+        // Add this socket to the list so we can close it later in order to shut the thread down
+        sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
+        if (sock_list == NULL) {
+            printk(KERN_ERR "Error creating sock_list");
+            return -1;
+        }
+        sock_list->sock = thread_params->sock;
+        list_add(&sock_list->list, &device->client_sockets);
 
-    // start a thread for this connection
-    connect_thread = kthread_run(connect_to_server, thread_params, "connect to server");
-    if (IS_ERR(connect_thread)) {
-        printk(KERN_ERR "Error creating connect to server thread.");
-        return -1;
+        // start a thread for this connection
+        connect_thread = kthread_run_on_cpu(connect_to_server, thread_params, cpu_id, "connect to server");
+        if (IS_ERR(connect_thread)) {
+            printk(KERN_ERR "Error creating connect to server thread.");
+            return -1;
+        }
     }
 
     return 0;
@@ -1469,10 +1737,25 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
 int listen_to_accepted_socket(void *args) {
     struct accepted_thread_params *thread_params = (struct accepted_thread_params *)args;
     
-    blocking_read(thread_params->device, thread_params->sock);
+    // Complete the handshake
+    send_handshake_id(thread_params->device, thread_params->sock, smp_processor_id());
+    // Add socket to list. Each CPU uses a different spot so no locking needed
+    this_cpu_write(*thread_params->multithreaded_socket_list->socks, thread_params->sock);
+
+    blocking_read(thread_params->device, thread_params->sock, thread_params->multithreaded_socket_list, thread_params->sender_id, thread_params->sender_thread);
 
     kfree(thread_params);
     return 0;
+}
+
+int next_available_thread_id(struct multithreaded_socket_list *multithreaded_socket_list) {
+    int cpu_id;
+    for_each_online_cpu(cpu_id) {
+        if (*per_cpu_ptr(multithreaded_socket_list->sender_thread, cpu_id) == U64_MAX) {
+            return cpu_id;
+        }
+    }
+    return -1;
 }
 
 // Thread that listens to connecting clients
@@ -1481,9 +1764,10 @@ int listen_for_connections(void *args) {
     struct rollbaccine_device *device = thread_params->device;
     struct socket *new_sock;
     struct accepted_thread_params *new_thread_params;
-    struct socket_list *new_connected_socket_list, *new_server_socket_list;
+    struct socket_list *new_server_socket_list;
+    struct multithreaded_handshake_pair handshake_pair;
     struct task_struct *accepted_thread;
-    int error;
+    int receiver_thread, error;
 
     while (!device->shutting_down) {
         // Blocks until a connection is accepted
@@ -1503,17 +1787,6 @@ int listen_for_connections(void *args) {
         new_thread_params->sock = new_sock;
         new_thread_params->device = device;
 
-        // Add to list of connected sockets
-        new_connected_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-        if (new_connected_socket_list == NULL) {
-            printk(KERN_ERR "Error creating socket_list");
-            break;
-        }
-        new_connected_socket_list->sock = new_sock;
-        mutex_lock(&device->connected_sockets_lock);
-        list_add(&new_connected_socket_list->list, &device->connected_sockets);
-        mutex_unlock(&device->connected_sockets_lock);
-
         // Add to list of server sockets
         new_server_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
         if (new_server_socket_list == NULL) {
@@ -1524,7 +1797,26 @@ int listen_for_connections(void *args) {
         // Note: No locks needed here, because only the listener thread writes this list
         list_add(&new_server_socket_list->list, &device->server_sockets);
 
-        accepted_thread = kthread_run(listen_to_accepted_socket, new_thread_params, "listen to accepted socket");
+        // Decide which thread to launch the new connection on based on handshake results. 
+        // Note: This is done on the main thread (instead of a new thread) because we have to first determine which CPU to launch the new thread on.
+        handshake_pair = receive_handshake_id(thread_params->device, new_sock);
+        new_thread_params->sender_id = handshake_pair.sender_id;
+        new_thread_params->sender_thread = handshake_pair.sender_thread;
+        new_thread_params->multithreaded_socket_list = create_connected_socket_list_if_null(thread_params->device, handshake_pair.sender_id, new_sock);
+        if (!is_sender_thread_unique(thread_params->device, new_thread_params->multithreaded_socket_list, handshake_pair.sender_thread)) {
+            printk(KERN_ERR "Error: Sender thread %llu was reused, replay attack", handshake_pair.sender_thread);
+            continue;
+        }
+        // Decide which CPU to listen to the socket on
+        receiver_thread = next_available_thread_id(new_thread_params->multithreaded_socket_list);
+        if (receiver_thread == -1) {
+            printk(KERN_ERR "Error: No available thread to accept connection.");
+            continue;
+        }
+        // Set the sender thread for that CPU
+        *per_cpu_ptr(new_thread_params->multithreaded_socket_list->sender_thread, receiver_thread) = handshake_pair.sender_thread;
+
+        accepted_thread = kthread_run_on_cpu(listen_to_accepted_socket, new_thread_params, receiver_thread, "listen to accepted socket");
         if (IS_ERR(accepted_thread)) {
             printk(KERN_ERR "Error creating accepted thread.");
             break;
@@ -1618,6 +1910,7 @@ int start_server(struct rollbaccine_device *device, ushort port) {
 static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigned int status_flags, char *result, unsigned int maxlen) {
     struct rollbaccine_device *device = ti->private;
     unsigned int sz = 0;  // Required by DMEMIT
+    int cpu_id;
 
     DMEMIT("\n");
 
@@ -1634,6 +1927,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
     DMEMIT("Num pages still in memory: %d\n", device->num_used_memory_pages);
     DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
+    DMEMIT("Num bios still in pending bio ring: %d\n", atomic_read(&device->num_bios_in_pending_bio_ring));
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
     DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
@@ -1642,6 +1936,12 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
+    DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
+    DMEMIT("Max distance between bios in pending bio ring: %d\n", atomic_read(&device->max_distance_between_bios_in_pending_bio_ring));
+
+    for_each_online_cpu(cpu_id) {
+        DMEMIT("Number of operations on CPU %d: %d\n", cpu_id, per_cpu(num_ops_on_cpu, cpu_id));
+    }
 }
 
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = max_memory_pages, 6 = key, 7= listen port. 8+ = server addr & ports
@@ -1649,10 +1949,10 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
     ushort port;
-    int error;
-    int i;
+    int error, i, cpu_id;
     unsigned long projected_bytes_used = 0;
     unsigned long checksum_and_iv_size;
+    struct shash_desc *per_cpu_hash_desc;
 
     device = kmalloc(sizeof(struct rollbaccine_device), GFP_KERNEL);
     if (device == NULL) {
@@ -1667,18 +1967,23 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->page_cache_size = 0;
 
     device->shutting_down = false;
-    mutex_init(&device->connected_sockets_lock);
+    percpu_init_rwsem(&device->connected_sockets_sem);
 
-    device->broadcast_queue = alloc_ordered_workqueue("broadcast queue", 0);
-    if (!device->broadcast_queue) {
-        printk(KERN_ERR "Cannot allocate broadcast queue");
-        return -ENOMEM;
-    }
-
-    device->submit_bio_queue = alloc_workqueue("submit bio queue", 0, 0);
+    device->submit_bio_queue = alloc_workqueue("submit bio queue", WQ_UNBOUND, 0);
     if (!device->submit_bio_queue) {
         printk(KERN_ERR "Cannot allocate submit bio queue");
         return -ENOMEM;
+    }
+
+    device->leader_write_queue = alloc_workqueue("leader write queue", WQ_UNBOUND, 0);
+    if (!device->leader_write_queue) {
+        printk(KERN_ERR "Cannot allocate leader write queue");
+        return -ENOMEM;
+    }
+
+    device->broadcast_mutex = alloc_percpu(struct mutex);
+    for_each_online_cpu(cpu_id) {
+        mutex_init(per_cpu_ptr(device->broadcast_mutex, cpu_id));
     }
 
     // Get the device from argv[0] and store it in device->dev
@@ -1710,8 +2015,17 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->bal.id = 0;
     device->bal.num = 0;
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
-    device->last_msg_index = 0;
     spin_lock_init(&device->index_lock);
+
+    rwlock_init(&device->pending_bio_ring_lock);
+    device->pending_bio_ring = vzalloc(sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
+    if (!device->pending_bio_ring) {
+        printk(KERN_ERR "Error allocating pending_bio_ring");
+        return -ENOMEM;
+    }
+    device->pending_bio_ring_start_index = ROLLBACCINE_INIT_WRITE_INDEX + 1;
+    device->pending_bio_ring_head = 0;
+    projected_bytes_used += sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     spin_lock_init(&device->replica_fsync_lock);
@@ -1789,13 +2103,20 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         printk(KERN_ERR "Error allocating hash");
         return PTR_ERR(device->hash_alg);
     }
+    // Give each CPU a separate hash_desc so they can hash in parallel
+    device->hash_mutex = alloc_percpu(struct mutex);
+    device->hash_desc = alloc_percpu(struct shash_desc*);
+    for_each_online_cpu(cpu_id) {
+        mutex_init(per_cpu_ptr(device->hash_mutex, cpu_id));
 
-    device->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->hash_alg), GFP_KERNEL);
-    if (device->hash_desc == NULL) {
-        printk(KERN_ERR "Error allocating hash desc");
-        return -ENOMEM;
+        per_cpu_hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->hash_alg), GFP_KERNEL);
+        if (per_cpu_hash_desc == NULL) {
+            printk(KERN_ERR "Error allocating hash desc");
+            return -ENOMEM;
+        }
+        per_cpu_hash_desc->tfm = device->hash_alg;
+        *per_cpu_ptr(device->hash_desc, cpu_id) = per_cpu_hash_desc;
     }
-    device->hash_desc->tfm = device->hash_alg;
 
 #ifdef MEMORY_TRACKING
     atomic_set(&device->num_bio_data_not_freed, 0);
@@ -1806,6 +2127,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->num_bio_sector_ranges = 0;
     device->num_fsyncs_pending_replication = 0;
     atomic_set(&device->num_checksum_and_ivs, 0);
+    atomic_set(&device->num_bios_in_pending_bio_ring, 0);
     atomic_set(&device->max_outstanding_num_bio_data, 0);
     atomic_set(&device->max_outstanding_num_bio_pages, 0);
     atomic_set(&device->max_outstanding_num_deep_clones, 0);
@@ -1813,6 +2135,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->max_outstanding_num_rb_nodes = 0;
     device->max_outstanding_num_bio_sector_ranges = 0;
     device->max_outstanding_fsyncs_pending_replication = 0;
+    atomic_set(&device->max_bios_in_pending_bio_ring, 0);
+    atomic_set(&device->max_distance_between_bios_in_pending_bio_ring, 0);
 #endif
 
     // Enable FUA and PREFLUSH flags
@@ -1827,7 +2151,9 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
 static void rollbaccine_destructor(struct dm_target *ti) {
     struct socket_list *curr, *next;
+    struct multithreaded_socket_list *curr_multi, *next_multi;
     struct rollbaccine_device *device = ti->private;
+    int cpu_id;
     if (device == NULL) return;
 
     // Warning: Changing this boolean should technically be atomic. I don't think it's a big deal tho, since by the time shutting_down is true, we don't care what the protocol does. *Ideally* it shuts
@@ -1849,17 +2175,29 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     }
 
     // Free socket list (sockets should already be freed)
-    list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
-        list_del(&curr->list);
-        kfree(curr);
+    list_for_each_entry_safe(curr_multi, next_multi, &device->connected_sockets, list) {
+        free_percpu(curr_multi->socks);
+        free_percpu(curr_multi->last_sent_msg_index);
+        free_percpu(curr_multi->waiting_for_msg_index);
+        free_percpu(curr_multi->sender_thread);
+        list_del(&curr_multi->list);
+        kfree(curr_multi);
     }
 
+    // Free hash_desc
+    for_each_online_cpu(cpu_id) {
+        kfree(*per_cpu_ptr(device->hash_desc, cpu_id));
+    }
+    free_percpu(device->hash_mutex);
+    free_percpu(device->hash_desc);
+
     kvfree(device->checksums);
+    free_percpu(device->broadcast_mutex);
     crypto_free_aead(device->tfm);
     crypto_free_shash(device->hash_alg);
-    kfree(device->hash_desc);
+    percpu_free_rwsem(&device->connected_sockets_sem);
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
-    destroy_workqueue(device->broadcast_queue);
+    destroy_workqueue(device->leader_write_queue);
     destroy_workqueue(device->submit_bio_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
