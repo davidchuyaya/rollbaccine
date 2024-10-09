@@ -272,7 +272,8 @@ unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 void kill_thread(struct socket * sock);
 // Returns true if writes in the pending_bio_ring can now be processed
 bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data);
-void submit_pending_bio_ring_prefix(struct rollbaccine_device *device);
+void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock);
+void ack_fsync(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock, uint64_t fsync_index);
 void blocking_read(struct rollbaccine_device * device, struct socket *sock, struct multithreaded_socket_list *multithreaded_socket_list, uint64_t sender_id, uint64_t sender_thread);
 struct multithreaded_socket_list *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id, struct socket *sock);
 void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, uint64_t thread_id);
@@ -312,8 +313,11 @@ inline size_t bio_checksum_and_iv_size(int num_sectors) {
     return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
 }
 
-inline unsigned char *alloc_bio_checksum_and_iv(int num_sectors) {
+inline unsigned char *alloc_bio_checksum_and_iv(struct rollbaccine_device *device, int num_sectors) {
     if (num_sectors != 0) {
+#ifdef MEMORY_TRACKING
+        atomic_inc(&device->num_checksum_and_ivs);
+#endif
         return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
     }
     else {
@@ -762,7 +766,6 @@ void broadcast_bio(struct bio_data *clone_bio_data) {
     struct bvec_iter iter;
     struct socket *sock;
     struct mutex *broadcast_mutex;
-    unsigned long flags;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
@@ -1137,10 +1140,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     switch (enc_or_dec) {
         case ROLLBACCINE_ENCRYPT:
             // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_sectors(bio_data->bio_src));
-    #ifdef MEMORY_TRACKING
-            atomic_inc(&bio_data->device->num_checksum_and_ivs);
-    #endif
+            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio_data->bio_src));
             if (!bio_checksum_and_iv) {
                 printk(KERN_ERR "Could not allocate checksum and iv for bio");
                 goto free_and_return;
@@ -1314,10 +1314,11 @@ bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_
     return inserted_at_head_of_ring;
 }
 
-void submit_pending_bio_ring_prefix(struct rollbaccine_device *device) {
+void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock) {
     struct bio_data *curr_bio_data;
     bool no_conflict;
     unsigned long flags;
+    int max_fsync_index = -1;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
@@ -1345,6 +1346,11 @@ void submit_pending_bio_ring_prefix(struct rollbaccine_device *device) {
             queue_work(device->submit_bio_queue, &curr_bio_data->submit_bio_work);
         }
 
+        // Increment max_fsync_index
+        if (curr_bio_data->is_fsync) {
+            max_fsync_index = curr_bio_data->write_index;
+        }
+
         // Increment index and wrap around if necessary
         device->pending_bio_ring[device->pending_bio_ring_head] = NULL;
         device->pending_bio_ring_head++;
@@ -1355,7 +1361,49 @@ void submit_pending_bio_ring_prefix(struct rollbaccine_device *device) {
         print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
     }
     write_unlock_irqrestore(&device->pending_bio_ring_lock, flags);
+
+    // Ack the latest fsync
+    if (max_fsync_index != -1) {
+        ack_fsync(device, multithreaded_socket_list, sock, max_fsync_index);
+    }
+
     print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
+}
+
+void ack_fsync(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock, uint64_t fsync_index) {
+    struct metadata_msg metadata;
+    struct msghdr msg_header;
+    struct kvec vec;
+    int sent;
+
+    metadata.type = FOLLOWER_ACK;
+    metadata.bal = device->bal;
+    metadata.sender_id = device->id;
+    metadata.sender_thread = smp_processor_id();
+    metadata.msg_index = this_cpu_inc_return(*multithreaded_socket_list->last_sent_msg_index) - 1;
+    metadata.write_index = fsync_index;
+    hash_buffer(device, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    // Keep retrying send until the whole message is sent
+    while (vec.iov_len > 0) {
+        sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
+        if (sent <= 0) {
+            printk(KERN_ERR "Error replying to fsync, aborting");
+            break;
+        } else {
+            vec.iov_base += sent;
+            vec.iov_len -= sent;
+        }
+    }
 }
 
 // Function used by all listening sockets to block and listen to messages
@@ -1366,7 +1414,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock, struc
     struct page *page;
     struct msghdr msg_header;
     struct kvec vec;
-    int sent, received, i, num_sectors;
+    int received, i, num_sectors;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
     struct additional_hash_msg *additional_hash_msg;
 
@@ -1398,7 +1446,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock, struc
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
             // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
-            process_follower_fsync_index(device, metadata.bal.id, metadata.write_index);
+            process_follower_fsync_index(device, metadata.sender_id, metadata.write_index);
             continue;
         }
 
@@ -1412,16 +1460,14 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock, struc
         bio_data->bio_src = received_bio;
         bio_data->start_sector = metadata.sector;
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
+        bio_data->is_fsync = metadata.type == ROLLBACCINE_FSYNC;
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
         received_bio->bi_private = bio_data;
 
         // Copy hash and IV
         num_sectors = metadata.num_pages * SECTORS_PER_PAGE;
         checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
-        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(num_sectors);
-#ifdef MEMORY_TRACKING
-        atomic_inc(&device->num_checksum_and_ivs);
-#endif
+        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(device, num_sectors);
         memcpy(bio_data->checksum_and_iv, metadata.checksum_and_iv, min(ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, checksum_and_iv_size));
 
         // 2. Expect hash if it wasn't done sending
@@ -1477,36 +1523,9 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock, struc
         // 4. Verify against hash
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
-        // 5. If the message is an fsync, reply.
-        if (metadata.type == ROLLBACCINE_FSYNC) {
-            metadata.type = FOLLOWER_ACK;
-            metadata.bal.id = device->bal.id;
-            metadata.sender_id = device->id;
-            metadata.sender_thread = smp_processor_id();
-            metadata.msg_index = this_cpu_inc_return(*multithreaded_socket_list->last_sent_msg_index) - 1;
-
-            hash_buffer(device, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
-
-            vec.iov_base = &metadata;
-            vec.iov_len = sizeof(struct metadata_msg);
-
-            // Keep retrying send until the whole message is sent
-            while (vec.iov_len > 0) {
-                sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
-                if (sent <= 0) {
-                    printk(KERN_ERR "Error replying to fsync, aborting");
-                    break;
-                } else {
-                    vec.iov_base += sent;
-                    vec.iov_len -= sent;
-                }
-            }
-            // printk(KERN_INFO "Acked fsync for write index: %llu", metadata.write_index);
-        }
-
-        // 6. Add bio to pending_bio_ring and submits a prefix from the ring if the next write has arrived
+        // 5. Add bio to pending_bio_ring and submit a prefix from the ring if the next write has arrived
         if (insert_into_pending_bio_ring(device, bio_data)) {
-            submit_pending_bio_ring_prefix(device);
+            submit_pending_bio_ring_prefix(device, multithreaded_socket_list, sock);
         }
     }
 
