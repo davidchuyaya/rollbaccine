@@ -138,6 +138,7 @@ struct rollbaccine_device {
     // AEAD
     struct crypto_aead *tfm;
     char *checksums;
+    struct page *verification_page;
 
     // Hashing
     struct mutex hash_mutex;
@@ -1042,7 +1043,6 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     uint64_t curr_sector;
     struct aead_request *req;
     struct scatterlist sg[4], sg_verify[4];
-    struct page *page_verify;
     DECLARE_CRYPTO_WAIT(wait);
     unsigned char *bio_checksum_and_iv;
     unsigned char *iv;
@@ -1059,27 +1059,14 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         return NULL;
     }
 
-    switch (enc_or_dec) {
-        case ROLLBACCINE_ENCRYPT:
-            // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio_data->bio_src));
-            if (!bio_checksum_and_iv) {
-                printk(KERN_ERR "Could not allocate checksum and iv for bio");
-                goto free_and_return;
-            }
-            print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
-            break;
-        case ROLLBACCINE_DECRYPT:
-            break;
-        case ROLLBACCINE_VERIFY:
-        // Allocate a free page to store decrypted data into. We'll discard this page since we're just verifying
-            page_verify = page_cache_alloc(bio_data->device);
-            if (!page_verify) {
-                printk(KERN_ERR "Could not allocate page for verification");
-                return NULL;
-            }
-            print_and_update_latency("enc_or_dec_bio: page_cache_alloc", &time);
-            break;
+    if (enc_or_dec == ROLLBACCINE_ENCRYPT) {
+        // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
+        bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio_data->bio_src));
+        if (!bio_checksum_and_iv) {
+            printk(KERN_ERR "Could not allocate checksum and iv for bio");
+            goto free_and_return;
+        }
+        print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
     }
 
     while (bio_data->bio_src->bi_iter.bi_size) {
@@ -1123,7 +1110,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 sg_init_table(sg_verify, 4);
                 sg_set_buf(&sg_verify[0], &curr_sector, sizeof(uint64_t));
                 sg_set_buf(&sg_verify[1], iv, AES_GCM_IV_SIZE);
-                sg_set_page(&sg_verify[2], page_verify, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
+                sg_set_page(&sg_verify[2], bio_data->device->verification_page, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
                 sg_set_buf(&sg_verify[3], checksum, AES_GCM_AUTH_SIZE);
                 break;
         }
@@ -1185,9 +1172,6 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
 
     free_and_return:
     aead_request_free(req);
-    if (enc_or_dec == ROLLBACCINE_VERIFY) {
-        page_cache_free(bio_data->device, page_verify);
-    }
     // Reset bio to start after iterating for encryption
     bio_data->bio_src->bi_iter.bi_sector = bio_data->start_sector;
     bio_data->bio_src->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
@@ -1749,6 +1733,11 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
 
     // Set up AEAD
+    device->verification_page = alloc_page(GFP_KERNEL);
+    if (device->verification_page == NULL) {
+        printk(KERN_ERR "Error allocating verification page");
+        return -ENOMEM;
+    }
     device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
     if (IS_ERR(device->tfm)) {
         printk(KERN_ERR "Error allocating AEAD");
@@ -1844,6 +1833,7 @@ static void rollbaccine_destructor(struct dm_target *ti) {
         kfree(curr);
     }
 
+    __free_page(device->verification_page);
     kvfree(device->checksums);
     crypto_free_aead(device->tfm);
     crypto_free_shash(device->hash_alg);
