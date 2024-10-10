@@ -156,6 +156,7 @@ struct rollbaccine_device {
     int num_bio_sector_ranges;
     int num_fsyncs_pending_replication;
     atomic_t num_checksum_and_ivs;
+    atomic_t num_bios_on_broadcast_queue;
     // These counters tell us the maximum amount of memory we need to prealloc
     atomic_t max_outstanding_num_bio_pages;
     atomic_t max_outstanding_num_bio_data;
@@ -165,6 +166,7 @@ struct rollbaccine_device {
     int max_outstanding_num_bio_sector_ranges;
     int max_outstanding_fsyncs_pending_replication;
     int max_num_pages_in_memory;
+    atomic_t max_bios_on_broadcast_queue;
 #endif
 };
 
@@ -302,7 +304,6 @@ inline cycles_t get_cycles_if_flag_on(void) {
 void print_and_update_latency(char *text, cycles_t *prev_time) {
 #ifdef LATENCY_TRACKING
     cycles_t curr_time = get_cycles_if_flag_on();
-    printk(KERN_INFO "%s: %llu cycles", text, curr_time - *prev_time);
     cycles_t diff = curr_time - *prev_time;
     // Anything with a fewer number of cycles is not important enough to print
     if (diff > 10000) {
@@ -823,6 +824,9 @@ void broadcast_bio(struct work_struct *work) {
         kfree(additional_hash_msg);
     }
     network_end_io(clone);
+#ifdef MEMORY_TRACKING
+    atomic_dec(&device->num_bios_on_broadcast_queue);
+#endif
     print_and_update_latency("broadcast_bio: Broadcast bio", &total_time);
 }
 
@@ -961,6 +965,11 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 queue_work(device->broadcast_queue, &bio_data->broadcast_work);
                 print_and_update_latency("rollbaccine_map: queued to broadcast", &time);
                 spin_unlock_irqrestore(&device->index_lock, flags);
+
+#ifdef MEMORY_TRACKING
+                atomic_inc(&device->num_bios_on_broadcast_queue);
+                atomic_max(&device->max_bios_on_broadcast_queue, atomic_read(&device->num_bios_on_broadcast_queue));
+#endif
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
                 if (doesnt_conflict_with_other_writes) {
@@ -1606,6 +1615,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
     DMEMIT("Num pages still in memory: %d\n", device->num_used_memory_pages);
     DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
+    DMEMIT("Num bios on broadcast queue: %d\n", atomic_read(&device->num_bios_on_broadcast_queue));
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
     DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
@@ -1614,6 +1624,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
+    DMEMIT("Max bios on broadcast queue: %d\n", atomic_read(&device->max_bios_on_broadcast_queue));
 }
 
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = max_memory_pages, 6 = key, 7= listen port. 8+ = server addr & ports
@@ -1785,6 +1796,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->num_bio_sector_ranges = 0;
     device->num_fsyncs_pending_replication = 0;
     atomic_set(&device->num_checksum_and_ivs, 0);
+    atomic_set(&device->num_bios_on_broadcast_queue, 0);
     atomic_set(&device->max_outstanding_num_bio_data, 0);
     atomic_set(&device->max_outstanding_num_bio_pages, 0);
     atomic_set(&device->max_outstanding_num_deep_clones, 0);
@@ -1792,6 +1804,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->max_outstanding_num_rb_nodes = 0;
     device->max_outstanding_num_bio_sector_ranges = 0;
     device->max_outstanding_fsyncs_pending_replication = 0;
+    atomic_set(&device->max_bios_on_broadcast_queue, 0);
 #endif
 
     // Enable FUA and PREFLUSH flags
