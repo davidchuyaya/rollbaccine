@@ -109,7 +109,7 @@ struct rollbaccine_device {
     struct dm_dev *dev;
     struct bio_set bs;
     struct kmem_cache *bio_data_cache;
-    spinlock_t page_cache_lock;
+    struct mutex page_cache_lock;
     struct page *page_cache;
     int page_cache_size;
 
@@ -127,17 +127,17 @@ struct rollbaccine_device {
     struct ballot bal;
     // TODO: Track last msg index per unique sender (since the primary may change)
     int write_index;
-    spinlock_t index_lock;  // Must be obtained for any operation modifying write_index
+    struct mutex index_lock;  // Must be obtained for any operation modifying write_index
 
     // TODO: Support with RB tree once the ring is full
-    rwlock_t pending_bio_ring_lock; // Obtain write lock when modifying the start index or ring head, obtain read lock when inserting elements (since each thread is guaranteed to insert into a different place)
+    struct rw_semaphore pending_bio_ring_lock; // Obtain write lock when modifying the start index or ring head, obtain read lock when inserting elements (since each thread is guaranteed to insert into a different place)
     struct bio_data **pending_bio_ring; // Ring buffer of bios received but not yet write-able (because some prefix has not arrived)
     int pending_bio_ring_start_index;
     int pending_bio_ring_head;
 
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
-    spinlock_t replica_fsync_lock;
+    struct mutex replica_fsync_lock;
     int *replica_fsync_indices;  // Len = n
     int max_replica_fsync_index;
     struct bio_list fsyncs_pending_replication;  // List of all fsyncs waiting for replication. Ordered by write index.
@@ -427,9 +427,8 @@ bool try_insert_into_outstanding_ops(struct rollbaccine_device *device, struct b
 void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, struct bio *bio) {
     struct bio_data *bio_data = bio->bi_private;
     struct bio_data *other_bio_data;
-    unsigned long flags;
 
-    spin_lock_irqsave(&device->index_lock, flags);
+    mutex_lock(&device->index_lock);
 #ifdef MEMORY_TRACKING
     device->num_rb_nodes -= 1;
     device->max_outstanding_num_rb_nodes = umax(device->max_outstanding_num_rb_nodes, device->num_rb_nodes + 1);
@@ -450,13 +449,12 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
         device->num_bio_sector_ranges -= 1;
 #endif
     }
-    spin_unlock_irqrestore(&device->index_lock, flags);
+    mutex_unlock(&device->index_lock);
 }
 
 // Put the freed page back in the cache for reuse
 void page_cache_free(struct rollbaccine_device *device, struct page *page_to_free) {
-    unsigned long flags;
-    spin_lock_irqsave(&device->page_cache_lock, flags);
+    mutex_lock(&device->page_cache_lock);
     if (device->page_cache_size == 0) {
         device->page_cache = page_to_free;
     } else {
@@ -465,30 +463,28 @@ void page_cache_free(struct rollbaccine_device *device, struct page *page_to_fre
         device->page_cache = page_to_free;
     }
     device->page_cache_size++;
-    spin_unlock_irqrestore(&device->page_cache_lock, flags);
+    mutex_unlock(&device->page_cache_lock);
 }
 
 void page_cache_destroy(struct rollbaccine_device *device) {
     struct page *tmp;
-    unsigned long flags;
 
-    spin_lock_irqsave(&device->page_cache_lock, flags);
+    mutex_lock(&device->page_cache_lock);
     while (device->page_cache_size > 0) {
         tmp = device->page_cache;
         device->page_cache = (struct page *)page_private(device->page_cache);
         __free_page(tmp);
         device->page_cache_size--;
     }
-    spin_unlock_irqrestore(&device->page_cache_lock, flags);
+    mutex_unlock(&device->page_cache_lock);
 }
 
 // Get a previously allocated page or allocate a new one if necessary. Store pointers to next pages in page_private, like in drbd.
 struct page *page_cache_alloc(struct rollbaccine_device *device) {
     struct page *new_page;
     bool need_new_page = false;
-    unsigned long flags;
 
-    spin_lock_irqsave(&device->page_cache_lock, flags);
+    mutex_lock(&device->page_cache_lock);
     if (device->page_cache_size == 0) {
         need_new_page = true;
     } else if (device->page_cache_size == 1) {
@@ -502,7 +498,7 @@ struct page *page_cache_alloc(struct rollbaccine_device *device) {
         device->page_cache = (struct page *)page_private(device->page_cache);
         device->page_cache_size--;
     }
-    spin_unlock_irqrestore(&device->page_cache_lock, flags);
+    mutex_unlock(&device->page_cache_lock);
 
     if (need_new_page) {
         new_page = alloc_page(GFP_KERNEL);
@@ -579,9 +575,8 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
     bool max_index_changed = false;
     struct bio *bio;
     int bio_write_index;
-    unsigned long flags;
 
-    spin_lock_irqsave(&device->replica_fsync_lock, flags);
+    mutex_lock(&device->replica_fsync_lock);
     // Special case for f = 1, n <= 3.
     // What the quorum agrees on = max of what any 1 follower has (plus the leader's fsync index, which must be higher).
     if (device->f == 1 && device->n <= 3) {
@@ -636,7 +631,7 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
             }
         }
     }
-    spin_unlock_irqrestore(&device->replica_fsync_lock, flags);
+    mutex_unlock(&device->replica_fsync_lock);
 }
 
 // TODO: Replace with op_is_sync() to handle REQ_SYNC?
@@ -950,7 +945,6 @@ void leader_process_write(struct work_struct *work) {
     struct bio *bio = bio_data->bio_src;
     bool doesnt_conflict_with_other_writes = true;
     cycles_t time = get_cycles_if_flag_on();
-    unsigned long flags;
 
     // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
     block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
@@ -985,7 +979,7 @@ void leader_process_write(struct work_struct *work) {
     bio_data->shallow_clone->bi_private = bio_data;
 
     // Increment indices, place ops on queue, submit cloned ops to disk
-    spin_lock_irqsave(&device->index_lock, flags);
+    mutex_lock(&device->index_lock);
     print_and_update_latency("leader_process_write: encryption -> obtained index lock", &time);
     // Increment write index
     bio_data->write_index = ++device->write_index;
@@ -997,15 +991,15 @@ void leader_process_write(struct work_struct *work) {
     if (bio_data->is_fsync) {
         // Add original bio to fsyncs blocked on replication
         bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
-        spin_lock(&device->replica_fsync_lock);
+        mutex_lock(&device->replica_fsync_lock);
         print_and_update_latency("leader_process_write: index lock -> obtained replica fsync lock", &time);
         bio_list_add(&device->fsyncs_pending_replication, bio);
 #ifdef MEMORY_TRACKING
         device->num_fsyncs_pending_replication += 1;
 #endif
-        spin_unlock(&device->replica_fsync_lock);
+        mutex_unlock(&device->replica_fsync_lock);
     }
-    spin_unlock_irqrestore(&device->index_lock, flags);
+    mutex_unlock(&device->index_lock);
 
     // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
     if (doesnt_conflict_with_other_writes) {
@@ -1026,7 +1020,6 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     struct rollbaccine_device *device = ti->private;
     struct bio_data *bio_data;
     cycles_t total_time = get_cycles_if_flag_on();
-    unsigned long flags;
 
     bio_set_dev(bio, device->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
@@ -1059,12 +1052,12 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 bio_data->shallow_clone->bi_private = bio_data;
 
                 // Block read if it conflicts with any other outstanding operations
-                spin_lock_irqsave(&device->index_lock, flags);
+                mutex_lock(&device->index_lock);
                 doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true); // Note: It actually doesn't matter for correctness whether reads check the pending list or not
                 if (!doesnt_conflict_with_other_writes) {
                     add_to_pending_ops_tail(device, bio_data);
                 }
-                spin_unlock_irqrestore(&device->index_lock, flags);
+                mutex_unlock(&device->index_lock);
 
                 if (doesnt_conflict_with_other_writes) {
                     submit_bio_noacct(bio_data->shallow_clone);
@@ -1282,12 +1275,11 @@ void kill_thread(struct socket *sock) {
 }
 
 bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data) {
-    unsigned long flags;
     int index_offset, head_offset;
     bool inserted_at_head_of_ring;
     cycles_t total_time = get_cycles_if_flag_on();
 
-    read_lock_irqsave(&device->pending_bio_ring_lock, flags);
+    down_read(&device->pending_bio_ring_lock);
     index_offset = bio_data->write_index - device->pending_bio_ring_start_index;
     head_offset = index_offset + device->pending_bio_ring_head;
     inserted_at_head_of_ring = (index_offset == 0);
@@ -1302,7 +1294,7 @@ bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_
     }
 
     device->pending_bio_ring[head_offset] = bio_data;
-    read_unlock_irqrestore(&device->pending_bio_ring_lock, flags);
+    up_read(&device->pending_bio_ring_lock);
 
 #ifdef MEMORY_TRACKING
     int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
@@ -1317,23 +1309,22 @@ bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_
 void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, struct socket *sock) {
     struct bio_data *curr_bio_data;
     bool no_conflict;
-    unsigned long flags;
     int max_fsync_index = -1;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
-    write_lock_irqsave(&device->pending_bio_ring_lock, flags);
+    down_write(&device->pending_bio_ring_lock);
     print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
     // Pop as much of the bio prefix off the pending bio ring as possible
     while ((curr_bio_data = device->pending_bio_ring[device->pending_bio_ring_head]) != NULL) {
-        spin_lock_irqsave(&device->index_lock, flags);
+        mutex_lock(&device->index_lock);
         no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
         if (!no_conflict) {
             add_to_pending_ops_tail(device, curr_bio_data);
         }
         // Increment global write index
         device->write_index = curr_bio_data->write_index;
-        spin_unlock_irqrestore(&device->index_lock, flags);
+        mutex_unlock(&device->index_lock);
 #ifdef MEMORY_TRACKING
         atomic_dec(&device->num_bios_in_pending_bio_ring);
 #endif
@@ -1360,7 +1351,7 @@ void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct mu
         }
         print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
     }
-    write_unlock_irqrestore(&device->pending_bio_ring_lock, flags);
+    up_write(&device->pending_bio_ring_lock);
 
     // Ack the latest fsync
     if (max_fsync_index != -1) {
@@ -1962,7 +1953,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     bioset_init(&device->bs, 0, 0, BIOSET_NEED_BVECS);
     device->bio_data_cache = kmem_cache_create("bio_data", sizeof(struct bio_data), 0, 0, NULL);
-    spin_lock_init(&device->page_cache_lock);
+    mutex_init(&device->page_cache_lock);
     device->page_cache = NULL;
     device->page_cache_size = 0;
 
@@ -2015,9 +2006,9 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->bal.id = 0;
     device->bal.num = 0;
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
-    spin_lock_init(&device->index_lock);
+    mutex_init(&device->index_lock);
 
-    rwlock_init(&device->pending_bio_ring_lock);
+    init_rwsem(&device->pending_bio_ring_lock);
     device->pending_bio_ring = vzalloc(sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
     if (!device->pending_bio_ring) {
         printk(KERN_ERR "Error allocating pending_bio_ring");
@@ -2028,7 +2019,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     projected_bytes_used += sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
-    spin_lock_init(&device->replica_fsync_lock);
+    mutex_init(&device->replica_fsync_lock);
     device->replica_fsync_indices = kzalloc(sizeof(int) * device->n, GFP_KERNEL);
     bio_list_init(&device->fsyncs_pending_replication);
 
