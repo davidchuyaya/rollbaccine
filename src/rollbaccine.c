@@ -152,6 +152,9 @@ struct rollbaccine_device {
     struct workqueue_struct *leader_write_queue;
     // To ensure that at most 1 message is being broadcasted by each thread
     struct mutex __percpu *broadcast_mutex;
+    struct workqueue_struct *leader_write_disk_end_io_queue;
+    struct workqueue_struct *leader_read_disk_end_io_queue;
+    struct workqueue_struct *replica_disk_end_io_queue;
 
     // Sockets, tracked so we can kill them on exit.
     struct list_head server_sockets;
@@ -256,6 +259,9 @@ bool requires_fsync(struct bio * bio);
 unsigned int remove_fsync_flags(unsigned int bio_opf);
 void free_pages_end_io(struct bio * received_bio);
 void try_free_clones(struct bio * clone);
+void leader_write_disk_end_io_task(struct work_struct *work);
+void leader_read_disk_end_io_task(struct work_struct *work);
+void replica_disk_end_io_task(struct work_struct *work);
 void leader_write_disk_end_io(struct bio * shallow_clone);
 void leader_read_disk_end_io(struct bio * shallow_clone);
 void replica_disk_end_io(struct bio * received_bio);
@@ -695,14 +701,14 @@ void try_free_clones(struct bio *clone) {
     }
 }
 
-void leader_read_disk_end_io(struct bio *shallow_clone) {
-    struct bio_data *bio_data = shallow_clone->bi_private;
+void leader_read_disk_end_io_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     struct rollbaccine_device *device = bio_data->device;
 
     // Decrypt
     enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT);
     // Unblock pending writes
-    remove_from_outstanding_ops_and_unblock(device, shallow_clone);
+    remove_from_outstanding_ops_and_unblock(device, bio_data->shallow_clone);
     // Return to user
     bio_endio(bio_data->bio_src);
 
@@ -713,30 +719,48 @@ void leader_read_disk_end_io(struct bio *shallow_clone) {
     int num_bio_data = atomic_dec_return(&device->num_bio_data_not_freed);
     atomic_max(&device->max_outstanding_num_bio_data, num_bio_data + 1);
 #endif
-    bio_put(shallow_clone);
+    bio_put(bio_data->shallow_clone);
     if (bio_data->checksum_and_iv != NULL) {
         kfree(bio_data->checksum_and_iv);
     }
     kmem_cache_free(device->bio_data_cache, bio_data);
 }
 
-void leader_write_disk_end_io(struct bio *shallow_clone) {
+void leader_read_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
+    INIT_WORK(&bio_data->submit_bio_work, leader_read_disk_end_io_task);
+    queue_work(bio_data->device->leader_read_disk_end_io_queue, &bio_data->submit_bio_work);
+}
+
+void leader_write_disk_end_io_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
-    remove_from_outstanding_ops_and_unblock(bio_data->device, shallow_clone);
+    remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
     // Return to the user. If this is an fsync, wait for replication
     if (!bio_data->is_fsync) {
         ack_bio_to_user_without_executing(bio_data->bio_src);
     }
     // Unlike replica_disk_end_io, the clone is sharing data with the clone used for networking, so we have to check if we can free
-    try_free_clones(shallow_clone);
+    try_free_clones(bio_data->shallow_clone);
+}
+
+void leader_write_disk_end_io(struct bio *shallow_clone) {
+    struct bio_data *bio_data = shallow_clone->bi_private;
+    INIT_WORK(&bio_data->submit_bio_work, leader_write_disk_end_io_task);
+    queue_work(bio_data->device->leader_write_disk_end_io_queue, &bio_data->submit_bio_work);
+}
+
+void replica_disk_end_io_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
+    // printk(KERN_INFO "Replica clone ended, freeing");
+    remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->bio_src);
+    free_pages_end_io(bio_data->bio_src);
 }
 
 void replica_disk_end_io(struct bio *received_bio) {
     struct bio_data *bio_data = received_bio->bi_private;
-    // printk(KERN_INFO "Replica clone ended, freeing");
-    remove_from_outstanding_ops_and_unblock(bio_data->device, received_bio);
-    free_pages_end_io(received_bio);
+    INIT_WORK(&bio_data->submit_bio_work, replica_disk_end_io_task);
+    queue_work(bio_data->device->replica_disk_end_io_queue, &bio_data->submit_bio_work);
 }
 
 void network_end_io(struct bio *deep_clone) {
@@ -1972,6 +1996,24 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
 
+    device->leader_write_disk_end_io_queue = alloc_workqueue("leader write disk end io queue", 0, 0);
+    if (!device->leader_write_disk_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate leader write disk end io queue");
+        return -ENOMEM;
+    }
+
+    device->leader_read_disk_end_io_queue = alloc_workqueue("leader read disk end io queue", 0, 0);
+    if (!device->leader_read_disk_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate leader read disk end io queue");
+        return -ENOMEM;
+    }
+
+    device->replica_disk_end_io_queue = alloc_workqueue("replica disk end io queue", 0, 0);
+    if (!device->replica_disk_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate replica disk end io queue");
+        return -ENOMEM;
+    }
+
     device->broadcast_mutex = alloc_percpu(struct mutex);
     for_each_online_cpu(cpu_id) {
         mutex_init(per_cpu_ptr(device->broadcast_mutex, cpu_id));
@@ -2190,6 +2232,9 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
     destroy_workqueue(device->leader_write_queue);
     destroy_workqueue(device->submit_bio_queue);
+    destroy_workqueue(device->leader_write_disk_end_io_queue);
+    destroy_workqueue(device->leader_read_disk_end_io_queue);
+    destroy_workqueue(device->replica_disk_end_io_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
