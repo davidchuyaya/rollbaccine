@@ -56,6 +56,7 @@ struct ballot {
 } __attribute__((packed));
 
 struct metadata_msg {
+    char msg_hash[SHA256_SIZE];
     enum MsgType type;
     struct ballot bal;
     uint64_t sender_id;
@@ -68,8 +69,15 @@ struct metadata_msg {
     sector_t sector;
     // Hash and IV for each write
     char checksum_and_iv[ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE];
-    char msg_hash[SHA256_SIZE];
 } __attribute__((packed));
+
+// Flexible array since we don't know how many extra checksums we will include. Be very careful when using sizeof()
+struct additional_hash_msg {
+    char msg_hash[SHA256_SIZE];
+    uint64_t sender_id;
+    uint64_t msg_index;
+    char checksum_and_iv[];
+};
 
 // Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
 struct socket_list {
@@ -99,7 +107,8 @@ struct rollbaccine_device {
     struct ballot bal;
     int write_index;
     // TODO: Track last msg index per unique sender (since the primary may change)
-    uint64_t last_msg_index;     // Doesn't need to be atomic because only the broadcast thread will modify this
+    uint64_t last_sent_msg_index;     // Doesn't need to be atomic because only the broadcast thread will modify this
+    uint64_t next_incoming_msg_index;
     spinlock_t index_lock;  // Must be obtained for any operation modifying write_index and queues ordered by those indices
 
     // Logic for fsyncs blocking on replication
@@ -129,8 +138,10 @@ struct rollbaccine_device {
     // AEAD
     struct crypto_aead *tfm;
     char *checksums;
+    struct page *verification_page;
 
     // Hashing
+    struct mutex hash_mutex;
     struct crypto_shash *hash_alg;
     struct shash_desc *hash_desc;
 
@@ -145,6 +156,7 @@ struct rollbaccine_device {
     int num_bio_sector_ranges;
     int num_fsyncs_pending_replication;
     atomic_t num_checksum_and_ivs;
+    atomic_t num_bios_on_broadcast_queue;
     // These counters tell us the maximum amount of memory we need to prealloc
     atomic_t max_outstanding_num_bio_pages;
     atomic_t max_outstanding_num_bio_data;
@@ -154,6 +166,7 @@ struct rollbaccine_device {
     int max_outstanding_num_bio_sector_ranges;
     int max_outstanding_fsyncs_pending_replication;
     int max_num_pages_in_memory;
+    atomic_t max_bios_on_broadcast_queue;
 #endif
 };
 
@@ -233,42 +246,9 @@ int start_server(struct rollbaccine_device *device, ushort port);
 int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
 
-// Helper functions to manage the "additional_hash_msg" struct.
-//
-// struct additional_hash_msg {
-//     uint64_t sender_id;
-//     uint64_t msg_index;
-//     char checksum_and_iv[?];
-//     char msg_hash[SHA256_SIZE];
-// };
-//
-// We can't actually have such a struct, because:
-// 1. We want to hash its contents as a continuous buffer in memory and store the hash digest in msg_hash
-// 2. Checksum_and_iv is variable size.
-inline void *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
-    size_t size = sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE;
-    return kmalloc(size, GFP_KERNEL);
-}
+inline void *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) { return kmalloc(sizeof(struct additional_hash_msg) + checksum_and_iv_size, GFP_KERNEL); }
 
-inline void additional_hash_msg_set_sender_id(void *msg, uint64_t sender_id) { *(uint64_t *)msg = sender_id; }
-
-inline void additional_hash_msg_set_msg_index(void *msg, uint64_t msg_index) { *(uint64_t *)(msg + sizeof(uint64_t)) = msg_index; }
-
-inline void additional_hash_msg_set_checksum_and_iv(void *msg, char *checksum_and_iv, size_t checksum_and_iv_size) {
-    memcpy(msg + sizeof(uint64_t) + sizeof(uint64_t), checksum_and_iv, checksum_and_iv_size);
-}
-
-inline uint64_t additional_hash_msg_get_sender_id(void *msg) { return *(uint64_t *)msg; }
-
-inline uint64_t additional_hash_msg_get_msg_index(void *msg) { return *(uint64_t *)(msg + sizeof(uint64_t)); }
-
-inline char *additional_hash_msg_get_checksum_and_iv(void *msg) { return msg + sizeof(uint64_t) + sizeof(uint64_t); }
-
-inline char *additional_hash_msg_get_msg_hash(void *msg, size_t checksum_and_iv_size) { return msg + sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
-
-inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size + SHA256_SIZE; }
-
-inline size_t additional_hash_msg_size_no_hash(size_t checksum_and_iv_size) { return sizeof(uint64_t) + sizeof(uint64_t) + checksum_and_iv_size; }
+inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg) + checksum_and_iv_size; }
 
 inline bool has_checksum(unsigned char *checksum) {
     return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
@@ -286,8 +266,15 @@ inline size_t bio_checksum_and_iv_size(int num_sectors) {
     return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
 }
 
-inline unsigned char *alloc_bio_checksum_and_iv(int num_sectors) {
-    return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
+inline unsigned char *alloc_bio_checksum_and_iv(struct rollbaccine_device *device, int num_sectors) {
+    if (num_sectors != 0) {
+#ifdef MEMORY_TRACKING
+        atomic_inc(&device->num_checksum_and_ivs);
+#endif
+        return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
+    } else {
+        return NULL;
+    }
 }
 
 inline unsigned char *get_bio_checksum(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
@@ -317,7 +304,11 @@ inline cycles_t get_cycles_if_flag_on(void) {
 void print_and_update_latency(char *text, cycles_t *prev_time) {
 #ifdef LATENCY_TRACKING
     cycles_t curr_time = get_cycles_if_flag_on();
-    printk(KERN_INFO "%s: %llu cycles", text, curr_time - *prev_time);
+    cycles_t diff = curr_time - *prev_time;
+    // Anything with a fewer number of cycles is not important enough to print
+    if (diff > 10000) {
+        printk(KERN_INFO "%s: %llu cycles", text, diff);
+    }
     *prev_time = get_cycles_if_flag_on();
 #endif
 }
@@ -539,7 +530,6 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
     spin_lock_irqsave(&device->replica_fsync_lock, flags);
     // Special case for f = 1, n = 2, since there's only 1 follower, so we don't need to iterate.
     // Also, we don't need to compare maxes (the latest message should always have a larger fsync index).
-    // TODO: Once we move away from a single network model, we'll need to compare maxes
     if (device->f == 1 && device->n == 2) {
         device->max_replica_fsync_index = follower_fsync_index;
         max_index_changed = true;
@@ -724,7 +714,7 @@ void broadcast_bio(struct work_struct *work) {
     struct kvec vec;
     struct socket_list *curr, *next;
     struct metadata_msg metadata;
-    void *additional_hash_msg;
+    struct additional_hash_msg *additional_hash_msg;
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
     cycles_t time = get_cycles_if_flag_on();
@@ -733,7 +723,7 @@ void broadcast_bio(struct work_struct *work) {
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
     metadata.bal = device->bal;
     metadata.sender_id = device->id;
-    metadata.msg_index = ++device->last_msg_index;
+    metadata.msg_index = ++device->last_sent_msg_index;
     metadata.write_index = clone_bio_data->write_index;
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = clone->bi_opf;
@@ -741,7 +731,7 @@ void broadcast_bio(struct work_struct *work) {
     // Copy checksum and IV into metadata
     memcpy(metadata.checksum_and_iv, checksum_and_iv, checksum_and_iv_size);
     // Create a hash of the message
-    hash_buffer(device, (char *)&metadata, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+    hash_buffer(device, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
     WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
@@ -759,13 +749,12 @@ void broadcast_bio(struct work_struct *work) {
     if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
         remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
         additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
-        additional_hash_msg_set_sender_id(additional_hash_msg, device->id);
-        additional_hash_msg_set_msg_index(additional_hash_msg, ++device->last_msg_index);
-        additional_hash_msg_set_checksum_and_iv(additional_hash_msg, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
-        hash_buffer(device, additional_hash_msg, additional_hash_msg_size_no_hash(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size));
+        additional_hash_msg->sender_id = device->id;
+        additional_hash_msg->msg_index = ++device->last_sent_msg_index;
+        memcpy(additional_hash_msg->checksum_and_iv, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
+        hash_buffer(device, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
     }
 
-    // TODO: See if we can just use spinlock again? Using mutex instead of spinlock because kernel_sendmsg sleeps for TLS and that triggers an error (sleep while holding spinlock)
     mutex_lock(&device->connected_sockets_lock);
     list_for_each_entry_safe(curr, next, &device->connected_sockets, list) {
         vec.iov_base = &metadata;
@@ -835,6 +824,9 @@ void broadcast_bio(struct work_struct *work) {
         kfree(additional_hash_msg);
     }
     network_end_io(clone);
+#ifdef MEMORY_TRACKING
+    atomic_dec(&device->num_bios_on_broadcast_queue);
+#endif
     print_and_update_latency("broadcast_bio: Broadcast bio", &total_time);
 }
 
@@ -974,6 +966,11 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 print_and_update_latency("rollbaccine_map: queued to broadcast", &time);
                 spin_unlock_irqrestore(&device->index_lock, flags);
 
+#ifdef MEMORY_TRACKING
+                atomic_inc(&device->num_bios_on_broadcast_queue);
+                atomic_max(&device->max_bios_on_broadcast_queue, atomic_read(&device->num_bios_on_broadcast_queue));
+#endif
+
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
                 if (doesnt_conflict_with_other_writes) {
                     if (bio_data->checksum_and_iv != NULL) {
@@ -1019,39 +1016,42 @@ bool verify_msg(struct rollbaccine_device *device, void *msg, size_t msg_size, c
     bool hash_matches;
     bool msg_index_matches;
 
-    hash_buffer(device, msg, msg_size - SHA256_SIZE, calculated_hash);
+    hash_buffer(device, msg, msg_size, calculated_hash);
     hash_matches = memcmp(calculated_hash, expected_hash, SHA256_SIZE) == 0;
-    msg_index_matches = device->last_msg_index + 1 == msg_index;
+    msg_index_matches = device->next_incoming_msg_index == msg_index;
 
     if (!hash_matches) {
         printk(KERN_ERR "Received message with incorrect hash, expected: %s, received: %s", expected_hash, calculated_hash);
         return false;
     }
     if (!msg_index_matches) {
-        printk(KERN_ERR "Received message with incorrect index, expected: %llu, received: %llu", device->last_msg_index + 1, msg_index);
+        printk(KERN_ERR "Received message with incorrect index, expected: %llu, received: %llu", device->next_incoming_msg_index, msg_index);
         return false;
     }
-    // Increment the last_msg_index
-    device->last_msg_index = msg_index;
+    // Increment the next expected message index
+    device->next_incoming_msg_index += 1;
     return true;
 }
 
 void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out) {
     cycles_t time = get_cycles_if_flag_on();
+    // Use a mutex (not lock, since it might schedule) while hashing in case it tries to hash 2 things concurrently
+    mutex_lock(&device->hash_mutex);
     int ret = crypto_shash_digest(device->hash_desc, buffer, len, out);
+    mutex_unlock(&device->hash_mutex);
     if (ret) {
         printk(KERN_ERR "Could not hash buffer");
     }
     print_and_update_latency("hash_buffer", &time);
 }
 
+// TODO: Alloc a page globally and just reuse since only 1 thread will attempt to verify at any time
 unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
     int ret = 0;
     struct bio_vec bv;
     uint64_t curr_sector;
     struct aead_request *req;
     struct scatterlist sg[4], sg_verify[4];
-    struct page *page_verify;
     DECLARE_CRYPTO_WAIT(wait);
     unsigned char *bio_checksum_and_iv;
     unsigned char *iv;
@@ -1068,30 +1068,14 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         return NULL;
     }
 
-    switch (enc_or_dec) {
-        case ROLLBACCINE_ENCRYPT:
-            // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_sectors(bio_data->bio_src));
-    #ifdef MEMORY_TRACKING
-            atomic_inc(&bio_data->device->num_checksum_and_ivs);
-    #endif
-            if (!bio_checksum_and_iv) {
-                printk(KERN_ERR "Could not allocate checksum and iv for bio");
-                goto free_and_return;
-            }
-            print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
-            break;
-        case ROLLBACCINE_DECRYPT:
-            break;
-        case ROLLBACCINE_VERIFY:
-        // Allocate a free page to store decrypted data into. We'll discard this page since we're just verifying
-            page_verify = page_cache_alloc(bio_data->device);
-            if (!page_verify) {
-                printk(KERN_ERR "Could not allocate page for verification");
-                return NULL;
-            }
-            print_and_update_latency("enc_or_dec_bio: page_cache_alloc", &time);
-            break;
+    if (enc_or_dec == ROLLBACCINE_ENCRYPT) {
+        // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
+        bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio_data->bio_src));
+        if (!bio_checksum_and_iv) {
+            printk(KERN_ERR "Could not allocate checksum and iv for bio");
+            goto free_and_return;
+        }
+        print_and_update_latency("enc_or_dec_bio: alloc_bio_checksum_and_iv", &time);
     }
 
     while (bio_data->bio_src->bi_iter.bi_size) {
@@ -1135,7 +1119,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
                 sg_init_table(sg_verify, 4);
                 sg_set_buf(&sg_verify[0], &curr_sector, sizeof(uint64_t));
                 sg_set_buf(&sg_verify[1], iv, AES_GCM_IV_SIZE);
-                sg_set_page(&sg_verify[2], page_verify, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
+                sg_set_page(&sg_verify[2], bio_data->device->verification_page, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
                 sg_set_buf(&sg_verify[3], checksum, AES_GCM_AUTH_SIZE);
                 break;
         }
@@ -1197,9 +1181,6 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
 
     free_and_return:
     aead_request_free(req);
-    if (enc_or_dec == ROLLBACCINE_VERIFY) {
-        page_cache_free(bio_data->device, page_verify);
-    }
     // Reset bio to start after iterating for encryption
     bio_data->bio_src->bi_iter.bi_sector = bio_data->start_sector;
     bio_data->bio_src->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
@@ -1225,7 +1206,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
     struct kvec vec;
     int sent, received, i, num_sectors;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
-    void *additional_hash_msg;
+    struct additional_hash_msg *additional_hash_msg;
     bool no_conflict;
     unsigned long flags;
 
@@ -1249,10 +1230,15 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH |
         // REQ_FUA));
 
+        // Verify the message
+        if (!verify_msg(device, (char*) &metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash, metadata.msg_index)) {
+            break;
+        }
+
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
             // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
-            process_follower_fsync_index(device, metadata.bal.id, metadata.write_index);
+            process_follower_fsync_index(device, metadata.sender_id, metadata.write_index);
             continue;
         }
 
@@ -1260,15 +1246,9 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         received_bio->bi_iter.bi_sector = metadata.sector;
         received_bio->bi_end_io = replica_disk_end_io;
 
-        // Verify the message
-        if (!verify_msg(device, &metadata, sizeof(struct metadata_msg), metadata.msg_hash, metadata.msg_index)) {
-            break;
-        }
-
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
-        device->write_index = metadata.write_index;
         bio_data->bio_src = received_bio;
         bio_data->start_sector = metadata.sector;
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
@@ -1277,10 +1257,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         // Copy hash and IV
         num_sectors = metadata.num_pages * SECTORS_PER_PAGE;
         checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
-        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(num_sectors);
-#ifdef MEMORY_TRACKING
-        atomic_inc(&device->num_checksum_and_ivs);
-#endif
+        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(device, num_sectors);
         memcpy(bio_data->checksum_and_iv, metadata.checksum_and_iv, min(ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, checksum_and_iv_size));
 
         // 2. Expect hash if it wasn't done sending
@@ -1299,12 +1276,12 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
             }
 
             // Verify the message
-            if (!verify_msg(device, additional_hash_msg, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg_get_msg_hash(additional_hash_msg, remaining_checksum_and_iv_size), additional_hash_msg_get_msg_index(additional_hash_msg))) {
+            if (!verify_msg(device, (char*) additional_hash_msg + SHA256_SIZE, sizeof(struct additional_hash_msg) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->msg_index)) {
                 break;
             }
 
             // Copy the checksums over
-            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg_get_checksum_and_iv(additional_hash_msg), remaining_checksum_and_iv_size);
+            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg->checksum_and_iv, remaining_checksum_and_iv_size);
             // Free the message
             kfree(additional_hash_msg);
         }
@@ -1336,11 +1313,15 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock) {
         // 4. Verify against hash
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
+        device->write_index = metadata.write_index;
+
         // 5. If the message is an fsync, reply.
-        // Note: We don't need to append a msg index here, because fsyncs grow monotonically per follower per ballot
         if (metadata.type == ROLLBACCINE_FSYNC) {
             metadata.type = FOLLOWER_ACK;
-            metadata.bal.id = device->bal.id;
+            metadata.sender_id = device->id;
+            metadata.msg_index = ++device->last_sent_msg_index;
+            metadata.bal = device->bal;
+            hash_buffer(device, (char*) &metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
 
             vec.iov_base = &metadata;
             vec.iov_len = sizeof(struct metadata_msg);
@@ -1634,6 +1615,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
     DMEMIT("Num pages still in memory: %d\n", device->num_used_memory_pages);
     DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
+    DMEMIT("Num bios on broadcast queue: %d\n", atomic_read(&device->num_bios_on_broadcast_queue));
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
     DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
@@ -1642,6 +1624,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
+    DMEMIT("Max bios on broadcast queue: %d\n", atomic_read(&device->max_bios_on_broadcast_queue));
 }
 
 // Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = max_memory_pages, 6 = key, 7= listen port. 8+ = server addr & ports
@@ -1710,7 +1693,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->bal.id = 0;
     device->bal.num = 0;
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
-    device->last_msg_index = 0;
+    device->last_sent_msg_index = 0;
+    device->next_incoming_msg_index = 1;
     spin_lock_init(&device->index_lock);
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
@@ -1760,6 +1744,11 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
 
     // Set up AEAD
+    device->verification_page = alloc_page(GFP_KERNEL);
+    if (device->verification_page == NULL) {
+        printk(KERN_ERR "Error allocating verification page");
+        return -ENOMEM;
+    }
     device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
     if (IS_ERR(device->tfm)) {
         printk(KERN_ERR "Error allocating AEAD");
@@ -1783,6 +1772,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     projected_bytes_used += checksum_and_iv_size;
 
     // Set up hashing
+    mutex_init(&device->hash_mutex);
     device->hash_alg = crypto_alloc_shash("hmac(sha256)", 0, 0);
     crypto_shash_setkey(device->hash_alg, argv[6], KEY_SIZE);
     if (IS_ERR(device->hash_alg)) {
@@ -1806,6 +1796,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->num_bio_sector_ranges = 0;
     device->num_fsyncs_pending_replication = 0;
     atomic_set(&device->num_checksum_and_ivs, 0);
+    atomic_set(&device->num_bios_on_broadcast_queue, 0);
     atomic_set(&device->max_outstanding_num_bio_data, 0);
     atomic_set(&device->max_outstanding_num_bio_pages, 0);
     atomic_set(&device->max_outstanding_num_deep_clones, 0);
@@ -1813,6 +1804,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->max_outstanding_num_rb_nodes = 0;
     device->max_outstanding_num_bio_sector_ranges = 0;
     device->max_outstanding_fsyncs_pending_replication = 0;
+    atomic_set(&device->max_bios_on_broadcast_queue, 0);
 #endif
 
     // Enable FUA and PREFLUSH flags
@@ -1854,6 +1846,7 @@ static void rollbaccine_destructor(struct dm_target *ti) {
         kfree(curr);
     }
 
+    __free_page(device->verification_page);
     kvfree(device->checksums);
     crypto_free_aead(device->tfm);
     crypto_free_shash(device->hash_alg);
