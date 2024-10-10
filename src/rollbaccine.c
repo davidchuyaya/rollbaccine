@@ -1439,6 +1439,32 @@ void blocking_read(struct rollbaccine_device *device, struct socket *sock, struc
     msg_header.msg_control = NULL;
     msg_header.msg_controllen = 0;
 
+    // TODO: Remove
+    // Temporarily simulate a client that accepts all incoming messages and does nothing, to focus on the primary's performance
+    page = page_cache_alloc(device);
+    while (!device->shutting_down) {
+        // 1. Receive metadata message
+        vec.iov_base = &metadata;
+        vec.iov_len = sizeof(struct metadata_msg);
+
+        received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+        if (received <= 0) {
+            printk(KERN_ERR "Error reading metadata from socket");
+            break;
+        }
+
+        vec.iov_base = page_address(page);
+        vec.iov_len = PAGE_SIZE;
+
+        received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+        if (received <= 0) {
+            printk(KERN_ERR "Error reading from socket");
+            break;
+        }
+    }
+
+    // TODO: Remove
+
     while (!device->shutting_down) {
         // 1. Receive metadata message
         vec.iov_base = &metadata;
