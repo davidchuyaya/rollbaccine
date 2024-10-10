@@ -998,14 +998,14 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 bio_data->deep_clone = deep_bio_clone(device, bio);
                 if (!bio_data->deep_clone) {
                     printk(KERN_ERR "Could not create deep clone");
-                    return;
+                    return DM_MAPIO_REMAPPED;
                 }
 
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
                 bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
                 if (!bio_data->shallow_clone) {
                     printk(KERN_ERR "Could not create shallow clone");
-                    return;
+                    return DM_MAPIO_REMAPPED;
                 }
                 // Set end_io so once this write completes, queued writes can be unblocked
                 bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
