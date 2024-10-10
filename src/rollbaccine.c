@@ -148,8 +148,6 @@ struct rollbaccine_device {
 
     // Workqueue to submit pending bios because bio_endio can't submit work (because it might sleep)
     struct workqueue_struct *submit_bio_queue;
-    // Workqueue to execute encryption, broadcasting, etc for leaders so writes aren't restricted to a few specific cores
-    struct workqueue_struct *leader_write_queue;
     // To ensure that at most 1 message is being broadcasted by each thread
     struct mutex __percpu *broadcast_mutex;
     struct workqueue_struct *leader_write_disk_end_io_queue;
@@ -269,7 +267,6 @@ void network_end_io(struct bio * deep_clone);
 void broadcast_bio(struct bio_data* bio_data);
 struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
-void leader_process_write(struct work_struct *work);
 bool verify_msg(struct rollbaccine_device *device, struct multithreaded_socket_list *multithreaded_socket_list, char *msg, size_t msg_size,
                                                                     char *expected_hash, uint64_t sender_id, uint64_t sender_thread, uint64_t msg_index);
 void hash_buffer(struct rollbaccine_device *device, char *buffer, size_t len, char *out);
@@ -963,86 +960,12 @@ struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_sr
     return clone;
 }
 
-void leader_process_write(struct work_struct *work) {
-    struct bio_data *bio_data = container_of(work, struct bio_data, broadcast_work);
-    struct rollbaccine_device *device = bio_data->device;
-    struct bio *bio = bio_data->bio_src;
-    bool doesnt_conflict_with_other_writes = true;
-    cycles_t time = get_cycles_if_flag_on();
-
-    // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
-    block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
-
-    bio_data->is_fsync = requires_fsync(bio);
-    // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
-    // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
-
-    // Encrypt
-    bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
-    print_and_update_latency("leader_process_write: encryption", &time);
-
-    // Create the network clone
-    bio_data->deep_clone = deep_bio_clone(device, bio);
-    if (!bio_data->deep_clone) {
-        printk(KERN_ERR "Could not create deep clone");
-        return;
-    }
-
-    // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
-    bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
-    if (!bio_data->shallow_clone) {
-        printk(KERN_ERR "Could not create shallow clone");
-        return;
-    }
-    // Set end_io so once this write completes, queued writes can be unblocked
-    bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
-
-    // Set shared data between clones
-    atomic_set(&bio_data->ref_counter, 2);
-    bio_data->deep_clone->bi_private = bio_data;
-    bio_data->shallow_clone->bi_private = bio_data;
-
-    // Increment indices, place ops on queue, submit cloned ops to disk
-    mutex_lock(&device->index_lock);
-    print_and_update_latency("leader_process_write: encryption -> obtained index lock", &time);
-    // Increment write index
-    bio_data->write_index = ++device->write_index;
-    doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true);
-    if (!doesnt_conflict_with_other_writes) {
-        add_to_pending_ops_tail(device, bio_data);
-    }
-    // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
-    if (bio_data->is_fsync) {
-        // Add original bio to fsyncs blocked on replication
-        bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
-        mutex_lock(&device->replica_fsync_lock);
-        print_and_update_latency("leader_process_write: index lock -> obtained replica fsync lock", &time);
-        bio_list_add(&device->fsyncs_pending_replication, bio);
-#ifdef MEMORY_TRACKING
-        device->num_fsyncs_pending_replication += 1;
-#endif
-        mutex_unlock(&device->replica_fsync_lock);
-    }
-    mutex_unlock(&device->index_lock);
-
-    // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
-    if (doesnt_conflict_with_other_writes) {
-        if (bio_data->checksum_and_iv != NULL) {
-            update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
-        }
-        submit_bio_noacct(bio_data->shallow_clone);
-        this_cpu_inc(num_ops_on_cpu);
-        print_and_update_latency("leader_process_write: submit", &time);
-    }
-
-    broadcast_bio(bio_data);
-}
-
 static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bool is_cloned = false;
     bool doesnt_conflict_with_other_writes = true;
     struct rollbaccine_device *device = ti->private;
     struct bio_data *bio_data;
+    cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
     bio_set_dev(bio, device->dev->bdev);
@@ -1060,9 +983,72 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         
         switch (bio_data_dir(bio)) {
             case WRITE:
-                // Send to workqueue so it'll do the CPU load balancing for us
-                INIT_WORK(&bio_data->broadcast_work, leader_process_write);
-                queue_work(device->leader_write_queue, &bio_data->broadcast_work);
+                // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
+                block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
+
+                bio_data->is_fsync = requires_fsync(bio);
+                // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
+                // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
+
+                // Encrypt
+                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
+                print_and_update_latency("leader_process_write: encryption", &time);
+
+                // Create the network clone
+                bio_data->deep_clone = deep_bio_clone(device, bio);
+                if (!bio_data->deep_clone) {
+                    printk(KERN_ERR "Could not create deep clone");
+                    return;
+                }
+
+                // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
+                bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
+                if (!bio_data->shallow_clone) {
+                    printk(KERN_ERR "Could not create shallow clone");
+                    return;
+                }
+                // Set end_io so once this write completes, queued writes can be unblocked
+                bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
+
+                // Set shared data between clones
+                atomic_set(&bio_data->ref_counter, 2);
+                bio_data->deep_clone->bi_private = bio_data;
+                bio_data->shallow_clone->bi_private = bio_data;
+
+                // Increment indices, place ops on queue, submit cloned ops to disk
+                mutex_lock(&device->index_lock);
+                print_and_update_latency("leader_process_write: encryption -> obtained index lock", &time);
+                // Increment write index
+                bio_data->write_index = ++device->write_index;
+                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true);
+                if (!doesnt_conflict_with_other_writes) {
+                    add_to_pending_ops_tail(device, bio_data);
+                }
+                // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
+                if (bio_data->is_fsync) {
+                    // Add original bio to fsyncs blocked on replication
+                    bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
+                    mutex_lock(&device->replica_fsync_lock);
+                    print_and_update_latency("leader_process_write: index lock -> obtained replica fsync lock", &time);
+                    bio_list_add(&device->fsyncs_pending_replication, bio);
+#ifdef MEMORY_TRACKING
+                    device->num_fsyncs_pending_replication += 1;
+#endif
+                    mutex_unlock(&device->replica_fsync_lock);
+                }
+                mutex_unlock(&device->index_lock);
+
+                // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
+                if (doesnt_conflict_with_other_writes) {
+                    if (bio_data->checksum_and_iv != NULL) {
+                        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
+                    }
+                    submit_bio_noacct(bio_data->shallow_clone);
+                    this_cpu_inc(num_ops_on_cpu);
+                    print_and_update_latency("leader_process_write: submit", &time);
+                }
+
+                broadcast_bio(bio_data);
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
@@ -2016,12 +2002,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
 
-    device->leader_write_queue = alloc_workqueue("leader write queue", WQ_UNBOUND, 0);
-    if (!device->leader_write_queue) {
-        printk(KERN_ERR "Cannot allocate leader write queue");
-        return -ENOMEM;
-    }
-
     device->leader_write_disk_end_io_queue = alloc_workqueue("leader write disk end io queue", 0, 0);
     if (!device->leader_write_disk_end_io_queue) {
         printk(KERN_ERR "Cannot allocate leader write disk end io queue");
@@ -2256,7 +2236,6 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     crypto_free_shash(device->hash_alg);
     percpu_free_rwsem(&device->connected_sockets_sem);
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
-    destroy_workqueue(device->leader_write_queue);
     destroy_workqueue(device->submit_bio_queue);
     destroy_workqueue(device->leader_write_disk_end_io_queue);
     destroy_workqueue(device->leader_read_disk_end_io_queue);
