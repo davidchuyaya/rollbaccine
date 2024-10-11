@@ -157,6 +157,7 @@ struct rollbaccine_device {
     struct rb_root outstanding_ops;  // Tree of all outstanding operations, sorted by the sectors they write to
     struct list_head pending_ops;    // List of all operations that conflict with outstanding operations (or other pending operations)
 
+    struct workqueue_struct *broadcast_bio_queue;
     // Workqueue to submit pending bios because bio_endio can't submit work (because it might sleep)
     struct workqueue_struct *submit_bio_queue;
     struct workqueue_struct *leader_write_disk_end_io_queue;
@@ -270,7 +271,7 @@ void leader_write_disk_end_io(struct bio * shallow_clone);
 void leader_read_disk_end_io(struct bio * shallow_clone);
 void replica_disk_end_io(struct bio * received_bio);
 void network_end_io(struct bio * deep_clone);
-void broadcast_bio(struct bio_data* bio_data);
+void broadcast_bio(struct work_struct *work);
 struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size,
@@ -771,7 +772,9 @@ void network_end_io(struct bio *deep_clone) {
     try_free_clones(deep_clone);
 }
 
-void broadcast_bio(struct bio_data *clone_bio_data) {
+void broadcast_bio(struct work_struct *work) {
+    struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
+    bool found_socket_without_sleeping = false;
     int sent, socket_id;
     struct bio *clone = clone_bio_data->deep_clone;
     unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
@@ -790,12 +793,11 @@ void broadcast_bio(struct bio_data *clone_bio_data) {
     cycles_t total_time = get_cycles_if_flag_on();
 
     // Round-robin choose the next socket
-    socket_id = atomic_inc_return(&device->next_socket_id) % NUM_NICS;
+    
 
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
     metadata.bal = device->bal;
     metadata.sender_id = device->id;
-    metadata.sender_socket_id = socket_id;
     metadata.write_index = clone_bio_data->write_index;
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = clone->bi_opf;
@@ -821,16 +823,27 @@ void broadcast_bio(struct bio_data *clone_bio_data) {
         remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
         additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
         additional_hash_msg->sender_id = device->id;
-        additional_hash_msg->sender_socket_id = socket_id;
         memcpy(additional_hash_msg->checksum_and_iv, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
     }
 
     // Second lock to make sure the list of connected sockets hasn't changed
     down_read(&device->connected_sockets_sem);
     list_for_each_entry_safe(multisocket, next_multisocket, &device->connected_sockets, list) {
+        // Decide which socket to use based on which one is not currently in use
+        for (socket_id = 0; socket_id < NUM_NICS; socket_id++) {
+            if (mutex_trylock(&multisocket->socket_data[socket_id].socket_mutex)) {
+                found_socket_without_sleeping = true;
+                break;
+            }
+        }
+        if (!found_socket_without_sleeping) {
+            // Just round robin queue on a socket
+            socket_id = atomic_inc_return(&device->next_socket_id) % NUM_NICS;
+            mutex_lock(&multisocket->socket_data[socket_id].socket_mutex);
+        }
         socket_data = &multisocket->socket_data[socket_id];
-        mutex_lock(&socket_data->socket_mutex);
-
+        
+        metadata.sender_socket_id = socket_id;
         // Create a hash of the message after incrementing msg_index
         metadata.msg_index = socket_data->last_sent_msg_index++;
         hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
@@ -856,6 +869,7 @@ void broadcast_bio(struct bio_data *clone_bio_data) {
 
         // 2. Send hash & IVs if they exceed what could be sent with the metadata
         if (additional_hash_msg != NULL) {
+            additional_hash_msg->sender_socket_id = socket_id;
             additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
             hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg->msg_hash);
 
@@ -1051,7 +1065,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                     print_and_update_latency("leader_process_write: submit", &time);
                 }
 
-                broadcast_bio(bio_data);
+                INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
+                queue_work(device->broadcast_bio_queue, &bio_data->broadcast_work);
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
@@ -1947,6 +1962,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num pages still in memory: %d\n", device->num_used_memory_pages);
     DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
     DMEMIT("Num bios still in pending bio ring: %d\n", atomic_read(&device->num_bios_in_pending_bio_ring));
+    DMEMIT("Num times broadcast queue blocked on sockets in use: %d\n", atomic_read(&device->next_socket_id));
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
     DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
@@ -1987,6 +2003,12 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->shutting_down = false;
     init_rwsem(&device->connected_sockets_sem);
     atomic_set(&device->next_socket_id, 0);
+
+    device->broadcast_bio_queue = alloc_workqueue("broadcast bio queue", 0, NUM_NICS);
+    if (!device->broadcast_bio_queue) {
+        printk(KERN_ERR "Cannot allocate broadcast bio queue");
+        return -ENOMEM;
+    }
 
     // TODO: Experiment with whether UNBOUND or bound is better. Probably bound
     device->submit_bio_queue = alloc_workqueue("submit bio queue", WQ_UNBOUND, 0);
