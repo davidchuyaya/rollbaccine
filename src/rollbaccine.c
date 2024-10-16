@@ -44,6 +44,13 @@
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 // #define LATENCY_TRACKING
 
+void mutex_lock_and_debug(struct mutex* lock, const char* func) {
+    printk(KERN_INFO "Locking mutex in %s\n", func);
+    mutex_lock(lock);
+}
+
+// #define mutex_lock(lock) mutex_lock_and_debug(lock, __func__)
+
 // Used to compare against checksums to see if they have been set yet (or if they're all 0)
 static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
 
@@ -1331,29 +1338,29 @@ int submit_pending_bio_ring_prefix(void *args) {
 
         should_ack_fsync = false;
 
-        // TODO: Should change to atomic
-        mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops. Obtain out here (instead of only when interacting with the rb tree) so this thread doesn't need to keep attempting to get it
+        
         print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
 
         // Store local version of head. Ok since this is the only thread modifying it
         curr_head = atomic_read(&device->pending_bio_ring_head);
         // Pop as much of the bio prefix off the pending bio ring as possible
         while ((curr_bio_data = device->pending_bio_ring[curr_head]) != NULL) {
+            mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
             no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
             if (!no_conflict) {
                 add_to_pending_ops_tail(device, curr_bio_data);
             }
-            else {
-                if (curr_bio_data->checksum_and_iv != NULL) {
-                    update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
-                }
-                submit_bio_noacct(curr_bio_data->bio_src);
-            }
             // Increment global write index
             device->write_index = curr_bio_data->write_index;
+            mutex_unlock(&device->index_lock);
 #ifdef MEMORY_TRACKING
             atomic_dec(&device->num_bios_in_pending_bio_ring);
 #endif
+
+            if (no_conflict) {
+                queue_work(device->submit_bio_queue, &curr_bio_data->submit_bio_work);
+            }
+
             // Record if we should ack the fsync
             should_ack_fsync |= curr_bio_data->is_fsync;
 
@@ -1366,7 +1373,7 @@ int submit_pending_bio_ring_prefix(void *args) {
             atomic_set(&device->pending_bio_ring_head, curr_head);
             print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
         }
-        mutex_unlock(&device->index_lock);
+        
 
         // Ack the latest fsync
         if (should_ack_fsync) {
