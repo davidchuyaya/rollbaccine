@@ -772,20 +772,21 @@ void replica_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     // printk(KERN_INFO "Replica clone ended, freeing");
     remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->bio_src);
-    free_pages_end_io(bio_data->bio_src);
+    // Note: Must do memory tracking before free_pages_end_io, since that frees bio_data
 #ifdef MEMORY_TRACKING
     int queue_size = atomic_dec_return(&bio_data->device->replica_disk_end_io_queue_size);
     atomic_max(&bio_data->device->max_replica_disk_end_io_queue_size, queue_size + 1);
 #endif
+    free_pages_end_io(bio_data->bio_src);
 }
 
 void replica_disk_end_io(struct bio *received_bio) {
     struct bio_data *bio_data = received_bio->bi_private;
-    INIT_WORK(&bio_data->submit_bio_work, replica_disk_end_io_task);
-    queue_work(bio_data->device->replica_disk_end_io_queue, &bio_data->submit_bio_work);
 #ifdef MEMORY_TRACKING
     atomic_inc(&bio_data->device->replica_disk_end_io_queue_size);
 #endif
+    INIT_WORK(&bio_data->submit_bio_work, replica_disk_end_io_task);
+    queue_work(bio_data->device->replica_disk_end_io_queue, &bio_data->submit_bio_work);
 }
 
 void network_end_io(struct bio *deep_clone) {
@@ -2053,8 +2054,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
 
-    // TODO: Experiment with whether UNBOUND or bound is better. Probably bound
-    device->submit_bio_queue = alloc_workqueue("submit bio queue", WQ_UNBOUND, 0);
+    device->submit_bio_queue = alloc_workqueue("submit bio queue", 0, 0);
     if (!device->submit_bio_queue) {
         printk(KERN_ERR "Cannot allocate submit bio queue");
         return -ENOMEM;
