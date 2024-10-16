@@ -199,6 +199,8 @@ struct rollbaccine_device {
     int num_fsyncs_pending_replication;
     atomic_t num_checksum_and_ivs;
     atomic_t num_bios_in_pending_bio_ring;
+    atomic_t submit_bio_queue_size;
+    atomic_t replica_disk_end_io_queue_size;
     // These counters tell us the maximum amount of memory we need to prealloc
     atomic_t max_outstanding_num_bio_pages;
     atomic_t max_outstanding_num_bio_data;
@@ -210,6 +212,8 @@ struct rollbaccine_device {
     int max_num_pages_in_memory;
     atomic_t max_bios_in_pending_bio_ring;
     atomic_t max_distance_between_bios_in_pending_bio_ring;
+    atomic_t max_submit_bio_queue_size;
+    atomic_t max_replica_disk_end_io_queue_size;
 #endif
 };
 
@@ -391,7 +395,11 @@ void submit_bio_task(struct work_struct *work) {
         submit_bio_noacct(bio_data->bio_src);
     }
 
+#ifdef MEMORY_TRACKING
     this_cpu_inc(num_ops_on_cpu);
+    int curr_queue_size = atomic_dec_return(&device->submit_bio_queue_size);
+    atomic_max(&device->max_submit_bio_queue_size, curr_queue_size + 1);
+#endif
 }
 
 void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data) {
@@ -462,6 +470,7 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
         queue_work(device->submit_bio_queue, &other_bio_data->submit_bio_work);
 #ifdef MEMORY_TRACKING
         device->num_bio_sector_ranges -= 1;
+        atomic_inc(&device->submit_bio_queue_size);
 #endif
     }
     mutex_unlock(&device->index_lock);
@@ -764,12 +773,19 @@ void replica_disk_end_io_task(struct work_struct *work) {
     // printk(KERN_INFO "Replica clone ended, freeing");
     remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->bio_src);
     free_pages_end_io(bio_data->bio_src);
+#ifdef MEMORY_TRACKING
+    int queue_size = atomic_dec_return(&bio_data->device->replica_disk_end_io_queue_size);
+    atomic_max(&bio_data->device->max_replica_disk_end_io_queue_size, queue_size + 1);
+#endif
 }
 
 void replica_disk_end_io(struct bio *received_bio) {
     struct bio_data *bio_data = received_bio->bi_private;
     INIT_WORK(&bio_data->submit_bio_work, replica_disk_end_io_task);
     queue_work(bio_data->device->replica_disk_end_io_queue, &bio_data->submit_bio_work);
+#ifdef MEMORY_TRACKING
+    atomic_inc(&bio_data->device->replica_disk_end_io_queue_size);
+#endif
 }
 
 void network_end_io(struct bio *deep_clone) {
@@ -1375,6 +1391,9 @@ int submit_pending_bio_ring_prefix(void *args) {
                     update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
                 }
                 queue_work(device->submit_bio_queue, &curr_bio_data->submit_bio_work);
+#ifdef MEMORY_TRACKING
+                atomic_inc(&device->submit_bio_queue_size);
+#endif
             }
 
             // Record if we should ack the fsync
@@ -1977,8 +1996,12 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
     DMEMIT("Num pages still in memory: %d\n", device->num_used_memory_pages);
     DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
-    DMEMIT("Num bios still in pending bio ring: %d\n", atomic_read(&device->num_bios_in_pending_bio_ring));
     DMEMIT("Num times broadcast queue blocked on sockets in use: %d\n", atomic_read(&device->next_socket_id));
+    DMEMIT("Num bios on submit queue: %d\n", atomic_read(&device->submit_bio_queue_size));
+    if (!device->is_leader) {
+        DMEMIT("Num bios still in pending bio ring: %d\n", atomic_read(&device->num_bios_in_pending_bio_ring));
+        DMEMIT("Num bios on replica disk end io queue: %d\n", atomic_read(&device->replica_disk_end_io_queue_size));
+    }
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
     DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
@@ -1987,8 +2010,12 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
-    DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
-    DMEMIT("Max distance between bios in pending bio ring: %d\n", atomic_read(&device->max_distance_between_bios_in_pending_bio_ring));
+    DMEMIT("Max bios on submit queue: %d\n", atomic_read(&device->max_submit_bio_queue_size));
+    if (!device->is_leader) {
+        DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
+        DMEMIT("Max distance between bios in pending bio ring: %d\n", atomic_read(&device->max_distance_between_bios_in_pending_bio_ring));
+        DMEMIT("Max bios on replica disk end io queue: %d\n", atomic_read(&device->max_replica_disk_end_io_queue_size));
+    }
 
     for_each_online_cpu(cpu_id) {
         DMEMIT("Number of operations on CPU %d: %d\n", cpu_id, per_cpu(num_ops_on_cpu, cpu_id));
@@ -2192,6 +2219,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->num_fsyncs_pending_replication = 0;
     atomic_set(&device->num_checksum_and_ivs, 0);
     atomic_set(&device->num_bios_in_pending_bio_ring, 0);
+    atomic_set(&device->submit_bio_queue_size, 0);
+    atomic_set(&device->replica_disk_end_io_queue_size, 0);
     atomic_set(&device->max_outstanding_num_bio_data, 0);
     atomic_set(&device->max_outstanding_num_bio_pages, 0);
     atomic_set(&device->max_outstanding_num_deep_clones, 0);
@@ -2201,6 +2230,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->max_outstanding_fsyncs_pending_replication = 0;
     atomic_set(&device->max_bios_in_pending_bio_ring, 0);
     atomic_set(&device->max_distance_between_bios_in_pending_bio_ring, 0);
+    atomic_set(&device->max_submit_bio_queue_size, 0);
+    atomic_set(&device->max_replica_disk_end_io_queue_size, 0);
 #endif
 
     // Enable FUA and PREFLUSH flags
