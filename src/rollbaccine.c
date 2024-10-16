@@ -163,6 +163,7 @@ struct rollbaccine_device {
     struct workqueue_struct *leader_write_disk_end_io_queue;
     struct workqueue_struct *leader_read_disk_end_io_queue;
     struct workqueue_struct *replica_disk_end_io_queue;
+    struct workqueue_struct *replica_insert_bio_queue;
 
     // Sockets, tracked so we can kill them on exit.
     struct list_head server_sockets;
@@ -179,6 +180,12 @@ struct rollbaccine_device {
 
     // Hashing
     struct crypto_shash *hash_alg;
+
+    // Replica threads
+    struct semaphore replica_submit_bio_sema;
+    struct task_struct *replica_submit_bio_thread;
+    struct semaphore replica_ack_fsync_sema;
+    struct task_struct *replica_ack_fsync_thread;
 
     // Counters for tracking memory usage
 #ifdef MEMORY_TRACKING
@@ -271,6 +278,7 @@ void leader_write_disk_end_io(struct bio * shallow_clone);
 void leader_read_disk_end_io(struct bio * shallow_clone);
 void replica_disk_end_io(struct bio * received_bio);
 void network_end_io(struct bio * deep_clone);
+int lock_on_next_free_socket(struct rollbaccine_device *device, struct multisocket *multisocket);
 void broadcast_bio(struct work_struct *work);
 struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
@@ -279,11 +287,9 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size,
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out);
 // Returns array of checksums and IVs for writes, NULL for reads
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
-void kill_thread(struct socket * sock);
-// Returns true if writes in the pending_bio_ring can now be processed
-bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data);
-void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct socket_data *socket_data);
-void ack_fsync(struct rollbaccine_device *device, struct socket_data *socket_data, uint64_t fsync_index);
+void insert_into_pending_bio_ring_task(struct work_struct *work);
+int submit_pending_bio_ring_prefix(void *args);
+int ack_fsync(void *args);
 void blocking_read(struct rollbaccine_device * device, struct socket_data *socket_data);
 void init_socket_data(struct rollbaccine_device *device, struct socket_data *socket_data, struct socket *sock, uint64_t sender_id, uint64_t sender_socket_id);
 struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id);
@@ -772,9 +778,23 @@ void network_end_io(struct bio *deep_clone) {
     try_free_clones(deep_clone);
 }
 
+// Decide which socket to use based on which one is not currently in use
+int lock_on_next_free_socket(struct rollbaccine_device *device, struct multisocket *multisocket) {
+    int socket_id;
+    for (socket_id = 0; socket_id < NUM_NICS; socket_id++) {
+        if (mutex_trylock(&multisocket->socket_data[socket_id].socket_mutex)) {
+            // Found a socket that isn't currently locked, return
+            return socket_id;
+        }
+    }
+    // Just round robin queue on a socket
+    socket_id = atomic_inc_return(&device->next_socket_id) % NUM_NICS;
+    mutex_lock(&multisocket->socket_data[socket_id].socket_mutex);
+    return socket_id;
+}
+
 void broadcast_bio(struct work_struct *work) {
     struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
-    bool found_socket_without_sleeping = false;
     int sent, socket_id;
     struct bio *clone = clone_bio_data->deep_clone;
     unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
@@ -792,9 +812,6 @@ void broadcast_bio(struct work_struct *work) {
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
-    // Round-robin choose the next socket
-    
-
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
     metadata.bal = device->bal;
     metadata.sender_id = device->id;
@@ -804,7 +821,6 @@ void broadcast_bio(struct work_struct *work) {
     metadata.sector = clone->bi_iter.bi_sector;
     // Copy checksum and IV into metadata
     memcpy(metadata.checksum_and_iv, checksum_and_iv, checksum_and_iv_size);
-    
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
     WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
@@ -829,18 +845,7 @@ void broadcast_bio(struct work_struct *work) {
     // Second lock to make sure the list of connected sockets hasn't changed
     down_read(&device->connected_sockets_sem);
     list_for_each_entry_safe(multisocket, next_multisocket, &device->connected_sockets, list) {
-        // Decide which socket to use based on which one is not currently in use
-        for (socket_id = 0; socket_id < NUM_NICS; socket_id++) {
-            if (mutex_trylock(&multisocket->socket_data[socket_id].socket_mutex)) {
-                found_socket_without_sleeping = true;
-                break;
-            }
-        }
-        if (!found_socket_without_sleeping) {
-            // Just round robin queue on a socket
-            socket_id = atomic_inc_return(&device->next_socket_id) % NUM_NICS;
-            mutex_lock(&multisocket->socket_data[socket_id].socket_mutex);
-        }
+        socket_id = lock_on_next_free_socket(device, multisocket);
         socket_data = &multisocket->socket_data[socket_id];
         
         metadata.sender_socket_id = socket_id;
@@ -1295,14 +1300,9 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     return bio_checksum_and_iv; // NOTE: This will be NULL for reads
 }
 
-void kill_thread(struct socket *sock) {
-    // Shut down the socket, causing the thread to unblock (if it was blocked on a socket)
-    if (sock != NULL) {
-        kernel_sock_shutdown(sock, SHUT_RDWR);
-    }
-}
-
-bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_data *bio_data) {
+void insert_into_pending_bio_ring_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, broadcast_work);
+    struct rollbaccine_device *device = bio_data->device;
     int index_offset, head_offset;
     bool inserted_at_head_of_ring;
     cycles_t total_time = get_cycles_if_flag_on();
@@ -1329,103 +1329,146 @@ bool insert_into_pending_bio_ring(struct rollbaccine_device *device, struct bio_
     atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
     atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, index_offset);
 #endif
-    print_and_update_latency("insert_into_pending_bio_ring", &total_time);
+    print_and_update_latency("insert_into_pending_bio_ring_task", &total_time);
 
-    return inserted_at_head_of_ring;
+    if (inserted_at_head_of_ring) {
+        // Wake up the thread that submits bios
+        up(&device->replica_submit_bio_sema);
+    }
 }
 
-void submit_pending_bio_ring_prefix(struct rollbaccine_device *device, struct socket_data *socket_data) {
+int submit_pending_bio_ring_prefix(void *args) {
+    struct rollbaccine_device *device = args;
     struct bio_data *curr_bio_data;
-    bool no_conflict;
-    int max_fsync_index = -1;
+    bool no_conflict, should_ack_fsync;
+    int signal;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
-    down_write(&device->pending_bio_ring_lock);
-    mutex_lock(&device->index_lock); // Necessary to modify outstanding_ops. Obtain out here so this thread doesn't sleep repeatedly
-    print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
-    // Pop as much of the bio prefix off the pending bio ring as possible
-    while ((curr_bio_data = device->pending_bio_ring[device->pending_bio_ring_head]) != NULL) {
-        no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
-        if (!no_conflict) {
-            add_to_pending_ops_tail(device, curr_bio_data);
+    while (!device->shutting_down) {
+        // Block until someone indicates there's writes to process
+        signal = down_interruptible(&device->replica_submit_bio_sema);
+        if (signal == -EINTR && device->shutting_down) {
+            break;
         }
-        // Increment global write index
-        device->write_index = curr_bio_data->write_index;
+
+        should_ack_fsync = false;
+
+        down_write(&device->pending_bio_ring_lock);
+        mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops. Obtain out here (instead of only when interacting with the rb tree) so this thread doesn't need to keep attempting to get it
+        print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
+        // Pop as much of the bio prefix off the pending bio ring as possible
+        while ((curr_bio_data = device->pending_bio_ring[device->pending_bio_ring_head]) != NULL) {
+            no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
+            if (!no_conflict) {
+                add_to_pending_ops_tail(device, curr_bio_data);
+            }
+            // Increment global write index
+            device->write_index = curr_bio_data->write_index;
 #ifdef MEMORY_TRACKING
-        atomic_dec(&device->num_bios_in_pending_bio_ring);
+            atomic_dec(&device->num_bios_in_pending_bio_ring);
 #endif
 
-        // Submit the bio (to a queue) if we can. Don't submit directly since we're still holding a lock, and the submit might block on disk
-        if (no_conflict) {
-            if (curr_bio_data->checksum_and_iv != NULL) {
-                update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
+            // Submit the bio (to a queue) if we can. Don't submit directly since we're still holding a lock, and the submit might block on disk
+            if (no_conflict) {
+                if (curr_bio_data->checksum_and_iv != NULL) {
+                    update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
+                }
+                queue_work(device->submit_bio_queue, &curr_bio_data->submit_bio_work);
             }
-            queue_work(device->submit_bio_queue, &curr_bio_data->submit_bio_work);
+
+            // Record if we should ack the fsync
+            should_ack_fsync |= curr_bio_data->is_fsync;
+
+            // Increment index and wrap around if necessary
+            device->pending_bio_ring[device->pending_bio_ring_head] = NULL;
+            device->pending_bio_ring_head++;
+            device->pending_bio_ring_start_index++;
+            if (device->pending_bio_ring_head >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
+                device->pending_bio_ring_head = 0;
+            }
+            print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
+        }
+        mutex_unlock(&device->index_lock);
+        up_write(&device->pending_bio_ring_lock);
+
+        // Ack the latest fsync
+        if (should_ack_fsync) {
+            up(&device->replica_ack_fsync_sema);
         }
 
-        // Increment max_fsync_index
-        if (curr_bio_data->is_fsync) {
-            max_fsync_index = curr_bio_data->write_index;
-        }
-
-        // Increment index and wrap around if necessary
-        device->pending_bio_ring[device->pending_bio_ring_head] = NULL;
-        device->pending_bio_ring_head++;
-        device->pending_bio_ring_start_index++;
-        if (device->pending_bio_ring_head >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
-            device->pending_bio_ring_head = 0;
-        }
-        print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
+        print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
     }
-    mutex_unlock(&device->index_lock);
-    up_write(&device->pending_bio_ring_lock);
 
-    // Ack the latest fsync
-    if (max_fsync_index != -1) {
-        ack_fsync(device, socket_data, max_fsync_index);
-    }
-
-    print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
+    return 0;
 }
 
-void ack_fsync(struct rollbaccine_device *device, struct socket_data *socket_data, uint64_t fsync_index) {
+int ack_fsync(void *args) {
+    struct rollbaccine_device *device = args;
     struct metadata_msg metadata;
     struct msghdr msg_header;
     struct kvec vec;
-    int sent;
+    struct multisocket *multisocket, *next_multisocket;
+    struct socket_data *socket_data;
+    int sent, last_sent_fsync, socket_id, signal;
 
-    // Need to lock in case multiple threads are trying to send messages on the same socket or modify last_sent_msg_index
-    mutex_lock(&socket_data->socket_mutex);
-    metadata.type = FOLLOWER_ACK;
-    metadata.bal = device->bal;
-    metadata.sender_id = device->id;
-    metadata.sender_socket_id = socket_data->sender_socket_id;
-    metadata.msg_index = socket_data->last_sent_msg_index++;
-    metadata.write_index = fsync_index;
-    hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
-
-    msg_header.msg_name = NULL;
-    msg_header.msg_namelen = 0;
-    msg_header.msg_control = NULL;
-    msg_header.msg_controllen = 0;
-    msg_header.msg_flags = 0;
-
-    vec.iov_base = &metadata;
-    vec.iov_len = sizeof(struct metadata_msg);
-
-    // Keep retrying send until the whole message is sent
-    while (vec.iov_len > 0) {
-        sent = kernel_sendmsg(socket_data->sock, &msg_header, &vec, 1, vec.iov_len);
-        if (sent <= 0) {
-            printk(KERN_ERR "Error replying to fsync, aborting");
+    while (!device->shutting_down) {
+        // Block until someone indicates there's an fsync to send
+        signal = down_interruptible(&device->replica_ack_fsync_sema);
+        if (signal == -EINTR && device->shutting_down) {
             break;
-        } else {
-            vec.iov_base += sent;
-            vec.iov_len -= sent;
         }
+
+        // Because "up" may be called multiple times on this semaphore, we may be sending too many fsyncs back. Check to see if we've already acknowledged the lastest write
+        // This also helps us batch fsyncs
+        mutex_lock(&device->index_lock);
+        if (last_sent_fsync == device->write_index) {
+            mutex_unlock(&device->index_lock);
+            continue;
+        }
+        last_sent_fsync = device->write_index;
+        mutex_unlock(&device->index_lock);
+
+        down_read(&device->connected_sockets_sem);
+        // TODO: Should only ack fsync to the primary
+        list_for_each_entry_safe(multisocket, next_multisocket, &device->connected_sockets, list) {
+            socket_id = lock_on_next_free_socket(device, multisocket);
+            socket_data = &multisocket->socket_data[socket_id];
+
+            metadata.type = FOLLOWER_ACK;
+            metadata.bal = device->bal;
+            metadata.sender_id = device->id;
+            metadata.sender_socket_id = socket_data->sender_socket_id;
+            metadata.msg_index = socket_data->last_sent_msg_index++;
+            metadata.write_index = last_sent_fsync;
+            hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+
+            msg_header.msg_name = NULL;
+            msg_header.msg_namelen = 0;
+            msg_header.msg_control = NULL;
+            msg_header.msg_controllen = 0;
+            msg_header.msg_flags = 0;
+
+            vec.iov_base = &metadata;
+            vec.iov_len = sizeof(struct metadata_msg);
+
+            // Keep retrying send until the whole message is sent
+            while (vec.iov_len > 0) {
+                sent = kernel_sendmsg(socket_data->sock, &msg_header, &vec, 1, vec.iov_len);
+                if (sent <= 0) {
+                    printk(KERN_ERR "Error replying to fsync, aborting");
+                    break;
+                } else {
+                    vec.iov_base += sent;
+                    vec.iov_len -= sent;
+                }
+            }
+            mutex_unlock(&socket_data->socket_mutex);
+        }
+        up_read(&device->connected_sockets_sem);
     }
-    mutex_unlock(&socket_data->socket_mutex);
+
+    return 0;
 }
 
 // Function used by all listening sockets to block and listen to messages
@@ -1445,32 +1488,6 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
     msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
     msg_header.msg_control = NULL;
     msg_header.msg_controllen = 0;
-
-    // TODO: Remove
-    // Temporarily simulate a client that accepts all incoming messages and does nothing, to focus on the primary's performance
-    page = page_cache_alloc(device);
-    while (!device->shutting_down) {
-        // 1. Receive metadata message
-        vec.iov_base = &metadata;
-        vec.iov_len = sizeof(struct metadata_msg);
-
-        received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
-        if (received <= 0) {
-            printk(KERN_ERR "Error reading metadata from socket");
-            break;
-        }
-
-        vec.iov_base = page_address(page);
-        vec.iov_len = PAGE_SIZE;
-
-        received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
-        if (received <= 0) {
-            printk(KERN_ERR "Error reading from socket");
-            break;
-        }
-    }
-
-    // TODO: Remove
 
     while (!device->shutting_down) {
         // 1. Receive metadata message
@@ -1510,6 +1527,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
         bio_data->is_fsync = metadata.type == ROLLBACCINE_FSYNC;
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
+        INIT_WORK(&bio_data->broadcast_work, insert_into_pending_bio_ring_task); // Misuse the broadcast_work field for putting the bio into the pending bio ring
         received_bio->bi_private = bio_data;
 
         // Copy hash and IV
@@ -1571,10 +1589,8 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         // 4. Verify against hash
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
-        // 5. Add bio to pending_bio_ring and submit a prefix from the ring if the next write has arrived
-        if (insert_into_pending_bio_ring(device, bio_data)) {
-            submit_pending_bio_ring_prefix(device, socket_data);
-        }
+        // 5. Add bio to pending_bio_ring
+        queue_work(device->replica_insert_bio_queue, &bio_data->broadcast_work);
     }
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
@@ -2035,6 +2051,12 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
 
+    device->replica_insert_bio_queue = alloc_workqueue("replica insert bio queue", 0, 0);
+    if (!device->replica_insert_bio_queue) {
+        printk(KERN_ERR "Cannot allocate replica insert bio queue");
+        return -ENOMEM;
+    }
+
     // Get the device from argv[0] and store it in device->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &device->dev)) {
         printk(KERN_ERR "Error getting device");
@@ -2085,6 +2107,13 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     INIT_LIST_HEAD(&device->pending_ops);
 
     device->is_leader = strcmp(argv[4], "true") == 0;
+
+    if (!device->is_leader) {
+        sema_init(&device->replica_submit_bio_sema, 0);
+        sema_init(&device->replica_ack_fsync_sema, 0);
+        device->replica_submit_bio_thread = kthread_run(submit_pending_bio_ring_prefix, device, "submit pending bio ring");
+        device->replica_ack_fsync_thread = kthread_run(ack_fsync, device, "ack fsync");
+    }
 
     error = kstrtoint(argv[5], 10, &device->max_memory_pages);
     if (error < 0) {
@@ -2196,15 +2225,25 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     device->shutting_down = true;
 
     // Kill threads
+    if (!device->is_leader) {
+        // Wake threads that are blocking on a semaphore back up
+        send_sig(SIGTERM, device->replica_submit_bio_thread, 1);
+        send_sig(SIGTERM, device->replica_ack_fsync_thread, 1);
+    }
+
     printk(KERN_INFO "Killing server sockets");
     list_for_each_entry_safe(curr, next, &device->server_sockets, list) {
-        kill_thread(curr->sock);
+        if (curr->sock != NULL) {
+            kernel_sock_shutdown(curr->sock, SHUT_RDWR);
+        }
         list_del(&curr->list);
         kfree(curr);
     }
     printk(KERN_INFO "Killing client sockets");
     list_for_each_entry_safe(curr, next, &device->client_sockets, list) {
-        kill_thread(curr->sock);
+        if (curr->sock != NULL) {
+            kernel_sock_shutdown(curr->sock, SHUT_RDWR);
+        }
         list_del(&curr->list);
         kfree(curr);
     }
@@ -2226,6 +2265,7 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     destroy_workqueue(device->leader_write_disk_end_io_queue);
     destroy_workqueue(device->leader_read_disk_end_io_queue);
     destroy_workqueue(device->replica_disk_end_io_queue);
+    destroy_workqueue(device->replica_insert_bio_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
