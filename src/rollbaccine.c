@@ -36,7 +36,7 @@
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
-#define ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER 100000 // Max "hole" between writes
+#define ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER 10000000 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
 #define MODULE_NAME "rollbaccine"
@@ -141,10 +141,8 @@ struct rollbaccine_device {
     struct mutex index_lock;  // Must be obtained for any operation modifying write_index
 
     // TODO: Support with RB tree once the ring is full
-    struct rw_semaphore pending_bio_ring_lock; // Obtain write lock when modifying the start index or ring head, obtain read lock when inserting elements (since each thread is guaranteed to insert into a different place)
     struct bio_data **pending_bio_ring; // Ring buffer of bios received but not yet write-able (because some prefix has not arrived)
-    int pending_bio_ring_start_index;
-    int pending_bio_ring_head;
+    atomic_t pending_bio_ring_head; // Position of next bio to submit in pending_bio_ring
 
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
@@ -291,7 +289,6 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size,
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out);
 // Returns array of checksums and IVs for writes, NULL for reads
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
-void insert_into_pending_bio_ring_task(struct work_struct *work);
 int submit_pending_bio_ring_prefix(void *args);
 int ack_fsync(void *args);
 void blocking_read(struct rollbaccine_device * device, struct socket_data *socket_data);
@@ -1317,50 +1314,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     return bio_checksum_and_iv; // NOTE: This will be NULL for reads
 }
 
-void insert_into_pending_bio_ring_task(struct work_struct *work) {
-    struct bio_data *bio_data = container_of(work, struct bio_data, broadcast_work);
-    struct rollbaccine_device *device = bio_data->device;
-    int index_offset, head_offset;
-    bool inserted_at_head_of_ring;
-    cycles_t total_time = get_cycles_if_flag_on();
-
-    down_read(&device->pending_bio_ring_lock);
-    index_offset = bio_data->write_index - device->pending_bio_ring_start_index;
-    head_offset = index_offset + device->pending_bio_ring_head;
-    inserted_at_head_of_ring = (index_offset == 0);
-
-    // Wrap around the buffer if we've gone past the end
-    if (head_offset >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
-        head_offset -= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
-        if (head_offset > device->pending_bio_ring_head) {
-            printk_ratelimited(KERN_ERR "Pending bio ring full!");
-            // TODO: Resort to RB tree
-        }
-    }
-
-    device->pending_bio_ring[head_offset] = bio_data;
-    up_read(&device->pending_bio_ring_lock);
-
-#ifdef MEMORY_TRACKING
-    int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
-    atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
-    atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, index_offset);
-#endif
-    print_and_update_latency("insert_into_pending_bio_ring_task", &total_time);
-
-    if (inserted_at_head_of_ring) {
-        // Wake up the thread that submits bios
-        up(&device->replica_submit_bio_sema);
-    }
-}
-
 int submit_pending_bio_ring_prefix(void *args) {
     struct rollbaccine_device *device = args;
     struct bio_data *curr_bio_data;
-    struct bio_list submit_queue;
-    struct bio *bio_to_submit;
     bool no_conflict, should_ack_fsync;
-    int signal;
+    int signal, curr_head;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
@@ -1371,56 +1329,48 @@ int submit_pending_bio_ring_prefix(void *args) {
             break;
         }
 
-        bio_list_init(&submit_queue);
         should_ack_fsync = false;
 
-        down_write(&device->pending_bio_ring_lock);
+        // TODO: Should change to atomic
         mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops. Obtain out here (instead of only when interacting with the rb tree) so this thread doesn't need to keep attempting to get it
         print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
+
+        // Store local version of head. Ok since this is the only thread modifying it
+        curr_head = atomic_read(&device->pending_bio_ring_head);
         // Pop as much of the bio prefix off the pending bio ring as possible
-        while ((curr_bio_data = device->pending_bio_ring[device->pending_bio_ring_head]) != NULL) {
+        while ((curr_bio_data = device->pending_bio_ring[curr_head]) != NULL) {
             no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
             if (!no_conflict) {
                 add_to_pending_ops_tail(device, curr_bio_data);
+            }
+            else {
+                if (curr_bio_data->checksum_and_iv != NULL) {
+                    update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
+                }
+                submit_bio_noacct(curr_bio_data->bio_src);
             }
             // Increment global write index
             device->write_index = curr_bio_data->write_index;
 #ifdef MEMORY_TRACKING
             atomic_dec(&device->num_bios_in_pending_bio_ring);
 #endif
-
-            // Submit the bio (to a queue) if we can. Don't submit directly since we're still holding a lock, and the submit might block on disk
-            if (no_conflict) {
-                if (curr_bio_data->checksum_and_iv != NULL) {
-                    update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
-                }
-                bio_list_add(&submit_queue, curr_bio_data->bio_src);
-            }
-
             // Record if we should ack the fsync
             should_ack_fsync |= curr_bio_data->is_fsync;
 
             // Increment index and wrap around if necessary
-            device->pending_bio_ring[device->pending_bio_ring_head] = NULL;
-            device->pending_bio_ring_head++;
-            device->pending_bio_ring_start_index++;
-            if (device->pending_bio_ring_head >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
-                device->pending_bio_ring_head = 0;
+            device->pending_bio_ring[curr_head] = NULL;
+            curr_head++;
+            if (curr_head >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
+                curr_head = 0;
             }
+            atomic_set(&device->pending_bio_ring_head, curr_head);
             print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
         }
         mutex_unlock(&device->index_lock);
-        up_write(&device->pending_bio_ring_lock);
 
         // Ack the latest fsync
         if (should_ack_fsync) {
             up(&device->replica_ack_fsync_sema);
-        }
-
-        // Submit all bios
-        while (!bio_list_empty(&submit_queue)) {
-            bio_to_submit = bio_list_pop(&submit_queue);
-            submit_bio_noacct(bio_to_submit);
         }
 
         print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
@@ -1505,7 +1455,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
     struct page *page;
     struct msghdr msg_header;
     struct kvec vec;
-    int received, i, num_sectors;
+    int received, i, num_sectors, index_offset;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
     struct additional_hash_msg *additional_hash_msg;
 
@@ -1553,7 +1503,6 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
         bio_data->is_fsync = metadata.type == ROLLBACCINE_FSYNC;
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
-        INIT_WORK(&bio_data->broadcast_work, insert_into_pending_bio_ring_task); // Misuse the broadcast_work field for putting the bio into the pending bio ring
         received_bio->bi_private = bio_data;
 
         // Copy hash and IV
@@ -1616,7 +1565,18 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
         // 5. Add bio to pending_bio_ring
-        queue_work(device->replica_insert_bio_queue, &bio_data->broadcast_work);
+        index_offset = bio_data->write_index % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
+        device->pending_bio_ring[index_offset] = bio_data;
+        if (index_offset == atomic_read(&device->pending_bio_ring_head)) {
+            // Wake up the thread that submits bios
+            up(&device->replica_submit_bio_sema);
+        }
+
+#ifdef MEMORY_TRACKING
+        int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
+        atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
+        atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, index_offset);
+#endif
     }
 
     printk(KERN_INFO "Shutting down, exiting blocking read");
@@ -2121,14 +2081,12 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->index_lock);
 
-    init_rwsem(&device->pending_bio_ring_lock);
     device->pending_bio_ring = vzalloc(sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
     if (!device->pending_bio_ring) {
         printk(KERN_ERR "Error allocating pending_bio_ring");
         return -ENOMEM;
     }
-    device->pending_bio_ring_start_index = ROLLBACCINE_INIT_WRITE_INDEX + 1;
-    device->pending_bio_ring_head = 0;
+    atomic_set(&device->pending_bio_ring_head, 1);
     projected_bytes_used += sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
