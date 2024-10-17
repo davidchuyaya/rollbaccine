@@ -38,8 +38,12 @@ vm_ip_data = {}
 with open('vm_ips.json') as f:
     vm_ip_data = json.load(f)
 
-def start_vm(vm_name):
-    print(f"Starting VM: {vm_name}")
+STARTING_VM = 'PowerState/running'
+STOPPING_VM = 'PowerState/stopped'
+
+def manage_vm_power_state(vm_name, action):
+    action_name = "start" if action == STARTING_VM else "stop"
+    print(f"{action_name} VM: {vm_name}")
     start_operation = compute_client.virtual_machines.begin_start(RESOURCE_GROUP_NAME, vm_name)
     start_operation.wait()
 
@@ -48,11 +52,13 @@ def start_vm(vm_name):
         vm = compute_client.virtual_machines.get(RESOURCE_GROUP_NAME, vm_name, expand='instanceView')
         statuses = vm.instance_view.statuses
         for status in statuses:
-            if status.code == 'PowerState/running':
-                print(f"VM {vm_name} is now running.")
+            if status.code == action:
+                print(f"VM {vm_name} is now {action.split('/')[1]}.")
                 return
-        print(f"Waiting for VM {vm_name} to start...")
-        sleep(10)  # Wait 10 seconds before checking again
+        print(f"Waiting for VM {vm_name} to {action_name}...")
+        sleep(10)
+
+
 
 def ssh_and_execute(public_ip, username, private_key_path, script_path, is_leader):
     ssh = paramiko.SSHClient()
@@ -83,38 +89,57 @@ def ssh_and_execute(public_ip, username, private_key_path, script_path, is_leade
             stdin, stdout, stderr = ssh.exec_command(f'sudo {remote_script_path}')
             for line in stdout.read().splitlines():
                 print(line)
-
-        # Run leader/follower-specific commands
-        if is_leader:
-            print(f"Running leader-specific commands on {public_ip}")
-            commands = [
-                "sudo umount /dev/sdb1",
-                "cd rollbaccine/src",
-                "sudo insmod rollbaccine.ko",
-                f"echo \"0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 0 true 250000 abcdefghijklmnop 12340\" | sudo dmsetup create rollbaccine1"
-            ]
-        else:
-            print(f"Running follower-specific commands on {public_ip}")
-            commands = [
-                "sudo umount /dev/sdb1",
-                "cd rollbaccine/src",
-                "sudo insmod rollbaccine.ko",
-                f"echo \"0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 1 false 250000 abcdefghijklmnop 12350 {vm_ip_data['rollbaccineNum0']['private_ip']} 12340\" | sudo dmsetup create rollbaccine2"
-            ]
-
-        for cmd in commands:
-            print(f"Running command: {cmd}")
-            stdin, stdout, stderr = ssh.exec_command(cmd)
-            for line in stdout.read().splitlines():
-                print(line)
-
-        ssh.close()
-
+    
     except Exception as e:
         print(f"Failed to connect to {public_ip}: {e}")
 
-for vm_name, ip_data in vm_ip_data.items():
-    public_ip = ip_data['public_ip']
+    ssh.close()
+
+    commands = [
+    "sudo umount /dev/sdb1 || true",
+    f"cd /home/{username}/rollbaccine/src",
+    "sudo insmod rollbaccine.ko"
+    ]
+
+    # Install rollbaccine
+    if is_leader:
+        print(f"Running leader-specific commands on {vm_name}")
+        commands.append(
+            "echo \"0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 0 true 250000 abcdefghijklmnop 12340\" | sudo dmsetup create rollbaccine1"
+        )
+    else:
+        print(f"Running follower-specific commands on {vm_name}")
+        commands.append(
+            f"echo \"0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 1 false 250000 abcdefghijklmnop 12350 {private_ip_0} 12340\" | sudo dmsetup create rollbaccine2"
+        )
+
+    command_parameters = {
+        'command_id': 'RunShellScript',
+        'script': commands
+    }
+
+    poller = compute_client.virtual_machines.begin_run_command(
+        RESOURCE_GROUP_NAME,
+        vm_name,
+        command_parameters
+    )
+    result = poller.result()  # Wait for the command to complete
+
+    for output in result.value:
+        print(output.message)
+
+# Start all VMs
+for vm_name in vm_ip_data.keys():
+    manage_vm_power_state(vm_name, STARTING_VM)
+
+# Get the private IP of the leader VM
+private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
+
+# Run commands on all VMs
+for vm_name in vm_ip_data.keys():
     is_leader = True if vm_name == 'rollbaccineNum0' else False
-    start_vm(vm_name)
-    ssh_and_execute(public_ip, USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader)
+    ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader)
+
+# # Stop all VMs
+# for vm_name in vm_ip_data.keys():
+#     manage_vm_power_state(vm_name, STOPPING_VM)

@@ -62,6 +62,7 @@ ppg_params = ProximityPlacementGroup(
 compute_client.proximity_placement_groups.create_or_update(RESOURCE_GROUP_NAME, PROXIMITY_PLACEMENT_GROUP_NAME, ppg_params)
 print(f"Proximity Placement Group created: {PROXIMITY_PLACEMENT_GROUP_NAME}")
 
+# TODO: create seperate NSG for each VM?
 print(f"Creating Network Security Group: {NSG_NAME}")
 nsg_params = NetworkSecurityGroup(location=LOCATION)
 nsg_result = network_client.network_security_groups.begin_create_or_update(
