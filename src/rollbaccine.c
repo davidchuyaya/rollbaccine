@@ -148,7 +148,6 @@ struct rollbaccine_device {
     struct mutex index_lock;  // Must be obtained for any operation modifying write_index
 
     // TODO: Support with RB tree once the ring is full
-    struct mutex pending_bio_ring_lock;
     atomic_long_t *pending_bio_ring; // Ring buffer of bios received but not yet write-able (because some prefix has not arrived)
     atomic_t pending_bio_ring_head; // Position of next bio to submit in pending_bio_ring
 
@@ -1345,10 +1344,11 @@ int submit_pending_bio_ring_prefix(void *args) {
         print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
 
         // Store local version of head. Ok since this is the only thread modifying it
-        mutex_lock(&device->pending_bio_ring_lock);
-        curr_head = atomic_read(&device->pending_bio_ring_head);
+        curr_head = atomic_read(&device->pending_bio_ring_head) % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
+        // Prevent reordering
+        smp_mb();
         // Pop as much of the bio prefix off the pending bio ring as possible
-        while ((curr_bio_data = (struct bio_data*) atomic_long_xchg_release(&device->pending_bio_ring[curr_head], 0)) != NULL) {
+        while ((curr_bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[curr_head], 0)) != NULL) {
             mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
             no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
             if (!no_conflict) {
@@ -1373,9 +1373,9 @@ int submit_pending_bio_ring_prefix(void *args) {
 
             // Increment index and wrap around if necessary
             curr_head = atomic_inc_return(&device->pending_bio_ring_head) % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
+            smp_mb();
             print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
         }
-        mutex_unlock(&device->pending_bio_ring_lock);
 
         // Ack the latest fsync
         if (should_ack_fsync) {
@@ -1581,15 +1581,12 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
 
         // 5. Add bio to pending_bio_ring
         index_offset = bio_data->write_index % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
-        // mutex_lock(&device->pending_bio_ring_lock);
-        // device->pending_bio_ring[index_offset] = bio_data;
         atomic_long_set(&device->pending_bio_ring[index_offset], (long)bio_data);
-        // Use "acquire" to ensure that we add to the pending_bio_ring before we determine if the thread should be woken up
-        if (bio_data->write_index == atomic_read_acquire(&device->pending_bio_ring_head)) {
+        smp_mb(); // Prevent reordering
+        if (bio_data->write_index == atomic_read(&device->pending_bio_ring_head)) {
             // Wake up the thread that submits bios
             up(&device->replica_submit_bio_sema);
         }
-        // mutex_unlock(&device->pending_bio_ring_lock);
 
 #ifdef MEMORY_TRACKING
         int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
@@ -2101,7 +2098,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->index_lock);
 
-    mutex_init(&device->pending_bio_ring_lock);
     device->pending_bio_ring = vzalloc(sizeof(atomic_long_t) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
     if (!device->pending_bio_ring) {
         printk(KERN_ERR "Error allocating pending_bio_ring");
