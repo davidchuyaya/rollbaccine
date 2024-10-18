@@ -71,6 +71,7 @@ struct metadata_msg {
     struct ballot bal;
     uint64_t sender_id;
     uint64_t sender_socket_id;
+    uint64_t recipient_id;
     uint64_t msg_index;
     uint64_t write_index;
     uint64_t num_pages;
@@ -87,6 +88,7 @@ struct additional_hash_msg {
     char msg_hash[SHA256_SIZE];
     uint64_t sender_id;
     uint64_t sender_socket_id;
+    uint64_t recipient_id;
     uint64_t msg_index;
     char checksum_and_iv[];
 };
@@ -291,8 +293,8 @@ int lock_on_next_free_socket(struct rollbaccine_device *device, struct multisock
 void broadcast_bio(struct work_struct *work);
 struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
-bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size,
-                                                                    char *expected_hash, uint64_t sender_id, uint64_t sender_socket_id, uint64_t msg_index);
+bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_socket_id, uint64_t intended_recipient_id,
+                uint64_t my_id, uint64_t msg_index);
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out);
 // Returns array of checksums and IVs for writes, NULL for reads
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
@@ -870,6 +872,8 @@ void broadcast_bio(struct work_struct *work) {
         socket_data = &multisocket->socket_data[socket_id];
         
         metadata.sender_socket_id = socket_id;
+        // Send the recipient its own ID so it can check that this message was intended for them
+        metadata.recipient_id = multisocket->sender_id;
         // Create a hash of the message after incrementing msg_index
         metadata.msg_index = socket_data->last_sent_msg_index++;
         hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
@@ -896,6 +900,7 @@ void broadcast_bio(struct work_struct *work) {
         // 2. Send hash & IVs if they exceed what could be sent with the metadata
         if (additional_hash_msg != NULL) {
             additional_hash_msg->sender_socket_id = socket_id;
+            additional_hash_msg->recipient_id = multisocket->sender_id;
             additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
             hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg->msg_hash);
 
@@ -1131,11 +1136,12 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     return is_cloned ? DM_MAPIO_SUBMITTED : DM_MAPIO_REMAPPED;
 }
 
-bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_socket_id, uint64_t msg_index) {
+bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_socket_id, uint64_t intended_recipient_id, uint64_t my_id, uint64_t msg_index) {
     char calculated_hash[SHA256_SIZE];
     bool hash_matches;
     bool sender_matches;
     bool thread_matches;
+    bool i_am_recipient;
     bool msg_index_matches;
 
     // If another thread is writing on this socket, then they will hash as well
@@ -1143,11 +1149,12 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, cha
     hash_matches = memcmp(calculated_hash, expected_hash, SHA256_SIZE) == 0;
     sender_matches = socket_data->sender_id == sender_id;
     thread_matches = socket_data->sender_socket_id == sender_socket_id;
+    i_am_recipient = intended_recipient_id == my_id;
     // This is only correct if no other threads are concurrently modifying waiting_for_msg_index. This is true because only 1 thread listens to each socket (and so only 1 thread verifies messages per socket)
     msg_index_matches = socket_data->waiting_for_msg_index == msg_index;
 
-    if (!hash_matches || !sender_matches || !thread_matches || !msg_index_matches) {
-        printk(KERN_ERR "Received incorrect message, expected hash: %s, hash: %s, expected sender: %llu, sender: %llu, expected thread: %llu, thread: %llu, expected msg index: %llu, msg index: %llu", expected_hash, calculated_hash, socket_data->sender_id, sender_id, socket_data->sender_socket_id, sender_socket_id, socket_data->waiting_for_msg_index, msg_index);
+    if (!hash_matches || !sender_matches || !thread_matches || !i_am_recipient || !msg_index_matches) {
+        printk(KERN_ERR "Received incorrect message, expected hash: %s, hash: %s, expected sender: %llu, sender: %llu, expected thread: %llu, thread: %llu, expected recipient: %llu, I am: %llu, expected msg index: %llu, msg index: %llu", expected_hash, calculated_hash, socket_data->sender_id, sender_id, socket_data->sender_socket_id, sender_socket_id, intended_recipient_id, my_id, socket_data->waiting_for_msg_index, msg_index);
         return false;
     }
     // Increment the message index
@@ -1511,7 +1518,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         // REQ_FUA));
 
         // Verify the message
-        if (!verify_msg(socket_data, (char*) &metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash, metadata.sender_id, metadata.sender_socket_id, metadata.msg_index)) {
+        if (!verify_msg(socket_data, (char*) &metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash, metadata.sender_id, metadata.sender_socket_id, metadata.recipient_id, device->id, metadata.msg_index)) {
             break;
         }
 
@@ -1558,7 +1565,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
             }
 
             // Verify the message
-            if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->msg_index)) {
+            if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->recipient_id, device->id, additional_hash_msg->msg_index)) {
                 break;
             }
 
