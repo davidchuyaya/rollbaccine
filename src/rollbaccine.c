@@ -1006,6 +1006,7 @@ struct bio *deep_bio_clone(struct rollbaccine_device *device, struct bio *bio_sr
 static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bool is_cloned = false;
     bool doesnt_conflict_with_other_writes = true;
+    bool is_empty = bio_sectors(bio) == 0;
     struct rollbaccine_device *device = ti->private;
     struct bio_data *bio_data;
     cycles_t time = get_cycles_if_flag_on();
@@ -1030,8 +1031,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
 
                 bio_data->is_fsync = requires_fsync(bio);
-                // NOTE: Removing the flags causes Azure to crash, so we'll keep them for now
-                // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
+                bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
 
                 // Encrypt
                 bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
@@ -1054,7 +1054,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
 
                 // Set shared data between clones
-                atomic_set(&bio_data->ref_counter, 2);
+                if (is_empty) // We won't be submitting this bio if it's empty, so the shallow_clone is unnecessary (we could remove it, but it's makes the code messier)
+                    atomic_set(&bio_data->ref_counter, 1);
+                else
+                    atomic_set(&bio_data->ref_counter, 2);
                 bio_data->deep_clone->bi_private = bio_data;
                 bio_data->shallow_clone->bi_private = bio_data;
 
@@ -1063,9 +1066,12 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 print_and_update_latency("leader_process_write: encryption -> obtained index lock", &time);
                 // Increment write index
                 bio_data->write_index = ++device->write_index;
-                doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true);
-                if (!doesnt_conflict_with_other_writes) {
-                    add_to_pending_ops_tail(device, bio_data);
+                // Chcek for conflicting writes. If the write is empty, we can skip this
+                if (!is_empty) {
+                    doesnt_conflict_with_other_writes = try_insert_into_outstanding_ops(device, bio_data, true);
+                    if (!doesnt_conflict_with_other_writes) {
+                        add_to_pending_ops_tail(device, bio_data);
+                    }
                 }
                 // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
                 if (bio_data->is_fsync) {
@@ -1082,7 +1088,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 mutex_unlock(&device->index_lock);
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
-                if (doesnt_conflict_with_other_writes) {
+                if (doesnt_conflict_with_other_writes && !is_empty) {
                     if (bio_data->checksum_and_iv != NULL) {
                         update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
                     }
@@ -1350,9 +1356,15 @@ int submit_pending_bio_ring_prefix(void *args) {
         // Pop as much of the bio prefix off the pending bio ring as possible
         while ((curr_bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[curr_head], 0)) != NULL) {
             mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
-            no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
-            if (!no_conflict) {
-                add_to_pending_ops_tail(device, curr_bio_data);
+            // Only check for concurrent writes if it's non-empty
+            if (curr_bio_data->end_sector != curr_bio_data->start_sector) {
+                no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
+                if (!no_conflict) {
+                    add_to_pending_ops_tail(device, curr_bio_data);
+                }
+            }
+            else {
+                no_conflict = true;
             }
             // Increment global write index
             device->write_index = curr_bio_data->write_index;
@@ -1385,7 +1397,11 @@ int submit_pending_bio_ring_prefix(void *args) {
         // Submit all bios
         while (!bio_list_empty(&submit_queue)) {
             bio_to_submit = bio_list_pop(&submit_queue);
-            submit_bio_noacct(bio_to_submit);
+            // If the bio is empty, don't submit, just free it
+            if (bio_sectors(bio_to_submit) == 0)
+                free_pages_end_io(bio_to_submit);
+            else
+                submit_bio_noacct(bio_to_submit);
         }
 
         print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
