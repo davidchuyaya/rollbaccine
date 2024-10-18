@@ -1055,7 +1055,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
 
                 // Set shared data between clones
-                atomic_set(&bio_data->ref_counter, 2);
+                // atomic_set(&bio_data->ref_counter, 2);
+                // TODO: Temp remove networking
+                atomic_set(&bio_data->ref_counter, 1);
+                // TODO: Temp remove networking
                 bio_data->deep_clone->bi_private = bio_data;
                 bio_data->shallow_clone->bi_private = bio_data;
 
@@ -1092,8 +1095,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                     print_and_update_latency("leader_process_write: submit", &time);
                 }
 
-                INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
-                queue_work(device->broadcast_bio_queue, &bio_data->broadcast_work);
+                // TODO: Temp remove networking
+                // INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
+                // queue_work(device->broadcast_bio_queue, &bio_data->broadcast_work);
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
