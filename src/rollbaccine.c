@@ -1325,6 +1325,8 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
 int submit_pending_bio_ring_prefix(void *args) {
     struct rollbaccine_device *device = args;
     struct bio_data *curr_bio_data;
+    struct bio_list submit_queue;
+    struct bio *bio_to_submit;
     bool no_conflict, should_ack_fsync;
     int signal, curr_head;
     cycles_t time = get_cycles_if_flag_on();
@@ -1337,8 +1339,8 @@ int submit_pending_bio_ring_prefix(void *args) {
             break;
         }
 
+        bio_list_init(&submit_queue);
         should_ack_fsync = false;
-
         
         print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
 
@@ -1360,7 +1362,10 @@ int submit_pending_bio_ring_prefix(void *args) {
 #endif
 
             if (no_conflict) {
-                queue_work(device->submit_bio_queue, &curr_bio_data->submit_bio_work);
+                if (curr_bio_data->checksum_and_iv != NULL) {
+                    update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
+                }
+                bio_list_add(&submit_queue, curr_bio_data->bio_src);
             }
 
             // Record if we should ack the fsync
@@ -1380,6 +1385,12 @@ int submit_pending_bio_ring_prefix(void *args) {
         // Ack the latest fsync
         if (should_ack_fsync) {
             up(&device->replica_ack_fsync_sema);
+        }
+
+        // Submit all bios
+        while (!bio_list_empty(&submit_queue)) {
+            bio_to_submit = bio_list_pop(&submit_queue);
+            submit_bio_noacct(bio_to_submit);
         }
 
         print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
@@ -1586,7 +1597,11 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
 #ifdef MEMORY_TRACKING
         int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
         atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
-        atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, index_offset);
+        int distance = index_offset - atomic_read(&device->pending_bio_ring_head);
+        if (distance > 0)
+            atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, distance);
+        else
+            atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER + distance);
 #endif
     }
 
