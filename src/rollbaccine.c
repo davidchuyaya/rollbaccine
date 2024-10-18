@@ -149,7 +149,7 @@ struct rollbaccine_device {
 
     // TODO: Support with RB tree once the ring is full
     struct mutex pending_bio_ring_lock;
-    struct bio_data **pending_bio_ring; // Ring buffer of bios received but not yet write-able (because some prefix has not arrived)
+    atomic_long_t *pending_bio_ring; // Ring buffer of bios received but not yet write-able (because some prefix has not arrived)
     atomic_t pending_bio_ring_head; // Position of next bio to submit in pending_bio_ring
 
     // Logic for fsyncs blocking on replication
@@ -1348,7 +1348,7 @@ int submit_pending_bio_ring_prefix(void *args) {
         mutex_lock(&device->pending_bio_ring_lock);
         curr_head = atomic_read(&device->pending_bio_ring_head);
         // Pop as much of the bio prefix off the pending bio ring as possible
-        while ((curr_bio_data = device->pending_bio_ring[curr_head]) != NULL) {
+        while ((curr_bio_data = (struct bio_data*) atomic_long_xchg_release(&device->pending_bio_ring[curr_head], 0)) != NULL) {
             mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
             no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
             if (!no_conflict) {
@@ -1372,12 +1372,7 @@ int submit_pending_bio_ring_prefix(void *args) {
             should_ack_fsync |= curr_bio_data->is_fsync;
 
             // Increment index and wrap around if necessary
-            device->pending_bio_ring[curr_head] = NULL;
-            curr_head++;
-            if (curr_head >= ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
-                curr_head = 0;
-            }
-            atomic_set(&device->pending_bio_ring_head, curr_head);
+            curr_head = atomic_inc_return(&device->pending_bio_ring_head) % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
             print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
         }
         mutex_unlock(&device->pending_bio_ring_lock);
@@ -1586,22 +1581,21 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
 
         // 5. Add bio to pending_bio_ring
         index_offset = bio_data->write_index % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
-        mutex_lock(&device->pending_bio_ring_lock);
-        device->pending_bio_ring[index_offset] = bio_data;
-        if (index_offset == atomic_read(&device->pending_bio_ring_head)) {
+        // mutex_lock(&device->pending_bio_ring_lock);
+        // device->pending_bio_ring[index_offset] = bio_data;
+        atomic_long_set(&device->pending_bio_ring[index_offset], (long)bio_data);
+        // Use "acquire" to ensure that we add to the pending_bio_ring before we determine if the thread should be woken up
+        if (bio_data->write_index == atomic_read_acquire(&device->pending_bio_ring_head)) {
             // Wake up the thread that submits bios
             up(&device->replica_submit_bio_sema);
         }
-        mutex_unlock(&device->pending_bio_ring_lock);
+        // mutex_unlock(&device->pending_bio_ring_lock);
 
 #ifdef MEMORY_TRACKING
         int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
         atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
         int distance = index_offset - atomic_read(&device->pending_bio_ring_head);
-        if (distance > 0)
-            atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, distance);
-        else
-            atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER + distance);
+        atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, distance % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
 #endif
     }
 
@@ -2108,7 +2102,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     mutex_init(&device->index_lock);
 
     mutex_init(&device->pending_bio_ring_lock);
-    device->pending_bio_ring = vzalloc(sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
+    device->pending_bio_ring = vzalloc(sizeof(atomic_long_t) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
     if (!device->pending_bio_ring) {
         printk(KERN_ERR "Error allocating pending_bio_ring");
         return -ENOMEM;
