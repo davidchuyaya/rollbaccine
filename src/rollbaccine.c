@@ -208,6 +208,8 @@ struct rollbaccine_device {
     atomic_t num_bios_in_pending_bio_ring;
     atomic_t submit_bio_queue_size;
     atomic_t replica_disk_end_io_queue_size;
+    atomic_t broadcast_queue_size;
+    atomic_t num_messages_larger_than_avg;
     // These counters tell us the maximum amount of memory we need to prealloc
     atomic_t max_outstanding_num_bio_pages;
     atomic_t max_outstanding_num_bio_data;
@@ -221,6 +223,7 @@ struct rollbaccine_device {
     atomic_t max_distance_between_bios_in_pending_bio_ring;
     atomic_t max_submit_bio_queue_size;
     atomic_t max_replica_disk_end_io_queue_size;
+    atomic_t max_broadcast_queue_size;
 #endif
 };
 
@@ -863,6 +866,10 @@ void broadcast_bio(struct work_struct *work) {
         additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
         additional_hash_msg->sender_id = device->id;
         memcpy(additional_hash_msg->checksum_and_iv, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
+
+#ifdef MEMORY_TRACKING
+        atomic_inc(&device->num_messages_larger_than_avg);
+#endif
     }
 
     // Second lock to make sure the list of connected sockets hasn't changed
@@ -902,7 +909,7 @@ void broadcast_bio(struct work_struct *work) {
             additional_hash_msg->sender_socket_id = socket_id;
             additional_hash_msg->recipient_id = multisocket->sender_id;
             additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
-            hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size), additional_hash_msg->msg_hash);
+            hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
 
             vec.iov_base = additional_hash_msg;
             vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
@@ -952,6 +959,11 @@ void broadcast_bio(struct work_struct *work) {
     }
     network_end_io(clone);
     print_and_update_latency("broadcast_bio: Broadcast bio", &total_time);
+
+#ifdef MEMORY_TRACKING
+    int queue_size = atomic_dec_return(&device->broadcast_queue_size);
+    atomic_max(&device->max_broadcast_queue_size, queue_size + 1);
+#endif
 }
 
 struct bio *shallow_bio_clone(struct rollbaccine_device *device, struct bio *bio_src) {
@@ -1019,6 +1031,12 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
     bio_set_dev(bio, device->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+
+    // Big problems if the write is smaller than a page
+    if (!is_empty && bio_sectors(bio) < SECTORS_PER_PAGE) {
+        printk(KERN_ERR "Write size is smaller than smallest write we can handle");
+        return DM_MAPIO_REMAPPED;
+    }
 
     // Copy bio if it's a write
     if (device->is_leader) {
@@ -1104,6 +1122,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
                 queue_work(device->broadcast_bio_queue, &bio_data->broadcast_work);
+#ifdef MEMORY_TRACKING
+                atomic_inc(&device->broadcast_queue_size);
+#endif
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
@@ -1573,6 +1594,10 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
             memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg->checksum_and_iv, remaining_checksum_and_iv_size);
             // Free the message
             kfree(additional_hash_msg);
+
+#ifdef MEMORY_TRACKING
+            atomic_inc(&device->num_messages_larger_than_avg);
+#endif
         }
 
         // 3. Receive pages of bio (over the regular socket now, not TLS)
@@ -2009,6 +2034,10 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
         DMEMIT("Num bios still in pending bio ring: %d\n", atomic_read(&device->num_bios_in_pending_bio_ring));
         DMEMIT("Num bios on replica disk end io queue: %d\n", atomic_read(&device->replica_disk_end_io_queue_size));
     }
+    else {
+        DMEMIT("Num bios on broadcast queue: %d\n", atomic_read(&device->broadcast_queue_size));
+    }
+    DMEMIT("Num messages larger than average: %d\n", atomic_read(&device->num_messages_larger_than_avg));
     DMEMIT("Max outstanding num bio pages: %d\n", atomic_read(&device->max_outstanding_num_bio_pages));
     DMEMIT("Max outstanding num bio_data: %d\n", atomic_read(&device->max_outstanding_num_bio_data));
     DMEMIT("Max outstanding num deep clones: %d\n", atomic_read(&device->max_outstanding_num_deep_clones));
@@ -2022,6 +2051,9 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
         DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
         DMEMIT("Max distance between bios in pending bio ring: %d\n", atomic_read(&device->max_distance_between_bios_in_pending_bio_ring));
         DMEMIT("Max bios on replica disk end io queue: %d\n", atomic_read(&device->max_replica_disk_end_io_queue_size));
+    }
+    else {
+        DMEMIT("Max bios on broadcast queue: %d\n", atomic_read(&device->max_broadcast_queue_size));
     }
 
     for_each_online_cpu(cpu_id) {
@@ -2225,6 +2257,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     atomic_set(&device->num_bios_in_pending_bio_ring, 0);
     atomic_set(&device->submit_bio_queue_size, 0);
     atomic_set(&device->replica_disk_end_io_queue_size, 0);
+    atomic_set(&device->broadcast_queue_size, 0);
+    atomic_set(&device->num_messages_larger_than_avg, 0);
     atomic_set(&device->max_outstanding_num_bio_data, 0);
     atomic_set(&device->max_outstanding_num_bio_pages, 0);
     atomic_set(&device->max_outstanding_num_deep_clones, 0);
@@ -2236,6 +2270,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     atomic_set(&device->max_distance_between_bios_in_pending_bio_ring, 0);
     atomic_set(&device->max_submit_bio_queue_size, 0);
     atomic_set(&device->max_replica_disk_end_io_queue_size, 0);
+    atomic_set(&device->max_broadcast_queue_size, 0);
 #endif
 
     // Enable FUA and PREFLUSH flags
