@@ -28,6 +28,7 @@
 #define ROLLBACCINE_RETRY_TIMEOUT 5000  // Number of milliseconds before client attempts to connect to a server again
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_ENCRYPTION_GRANULARITY PAGE_SIZE
+#define ROLLBACCINE_MAX_BROADCAST_QUEUE_SIZE 1000000
 // #define ROLLBACCINE_ENCRYPTION_GRANULARITY SECTOR_SIZE
 #define ROLLBACCINE_SECTORS_PER_ENCRYPTION (ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE)
 #define SECTORS_PER_PAGE (PAGE_SIZE / SECTOR_SIZE)
@@ -93,12 +94,6 @@ struct additional_hash_msg {
     char checksum_and_iv[];
 };
 
-// Allow us to keep track of threads' sockets so we can shut them down and free them on exit.
-struct socket_list {
-    struct socket *sock;
-    struct list_head list;
-};
-
 // Used to return a pair from handshake_ids()
 struct multithreaded_handshake_pair {
     uint64_t sender_id;
@@ -122,6 +117,7 @@ struct multisocket {
     uint64_t sender_id;
     bool sender_socket_id_taken[NUM_NICS]; // Which sender socket IDs have been taken
     struct mutex sender_socket_ids_lock; // Lock on sender_socket_ids to check if the sender is giving us unique socket IDs
+    atomic_t alerted_client_of_liveness_problem;  // Whether we've messaged the client about a liveness problem over this socket, since we don't want to spam the client
     struct list_head list;
 };
 
@@ -173,8 +169,7 @@ struct rollbaccine_device {
     struct workqueue_struct *replica_insert_bio_queue;
 
     // Sockets, tracked so we can kill them on exit.
-    struct list_head server_sockets;
-    struct list_head client_sockets;
+    struct socket *server_socket;
     // Connected sockets. Should be a subset of the sockets above, stored as a multisocket. Handy for broadcasting
     // TODO: Sending thread should block on another signal (like finish init) instead of connected threads
     struct rw_semaphore connected_sockets_sem;
@@ -258,14 +253,12 @@ struct client_thread_params {
 
 struct accepted_thread_params {
     struct rollbaccine_device *device;
+    struct multisocket *multisocket;
     struct socket_data *socket_data;
 };
 
-struct listen_thread_params {
-    struct socket *sock;
-    struct rollbaccine_device *device;
-};
-
+void disconnect(struct rollbaccine_device *device, struct multisocket *multisocket);
+void alert_client_of_liveness_problem(struct rollbaccine_device *device, struct multisocket *multisocket);
 void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
 void submit_bio_task(struct work_struct *work);
 void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data);
@@ -276,8 +269,6 @@ void page_cache_free(struct rollbaccine_device *device, struct page *page_to_fre
 void page_cache_destroy(struct rollbaccine_device *device);
 struct page *page_cache_alloc(struct rollbaccine_device *device);
 void atomic_max(atomic_t *old, int new);
-void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed);
-void release_memory(struct rollbaccine_device *device, int num_pages_released);
 struct bio_data *alloc_bio_data(struct rollbaccine_device * device);
 void ack_bio_to_user_without_executing(struct bio * bio);
 void process_follower_fsync_index(struct rollbaccine_device * device, int follower_id, int follower_fsync_index);
@@ -303,7 +294,7 @@ void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 int submit_pending_bio_ring_prefix(void *args);
 int ack_fsync(void *args);
-void blocking_read(struct rollbaccine_device * device, struct socket_data *socket_data);
+void blocking_read(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data);
 void init_socket_data(struct rollbaccine_device *device, struct socket_data *socket_data, struct socket *sock, uint64_t sender_id, uint64_t sender_socket_id);
 struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id);
 void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, uint64_t thread_id);
@@ -375,6 +366,75 @@ inline cycles_t get_cycles_if_flag_on(void) {
 #else
     return 0;
 #endif
+}
+
+// Check if another thread has already shut down the multisocket. If they have, then we shouldn't be able to find it in the connected_sockets list
+// Note: Caller must hold connected_sockets_sem (read)
+inline bool does_multisocket_exist(struct rollbaccine_device *device, uint64_t sender_id) {
+    struct multisocket *curr;
+    list_for_each_entry(curr, &device->connected_sockets, list) {
+        if (curr->sender_id == sender_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void disconnect(struct rollbaccine_device *device, struct multisocket *multisocket) {
+    int i;
+    struct socket_data *socket_data;
+    struct bio_data *bio_data;
+
+    printk(KERN_INFO "disconnect: Attempting to shut down sockets");
+    down_read(&device->connected_sockets_sem);
+    // Check if some other thread already did the work
+    if (!does_multisocket_exist(device, multisocket->sender_id)) {
+        up_read(&device->connected_sockets_sem);
+        return;
+    }
+    // Shut down all sockets. This will trigger all blocking_read threads to exit, then all call this function
+    for (i = 0; i < NUM_NICS; i++) {
+        socket_data = &multisocket->socket_data[i];
+        // Note: We don't release the socket here. The blocking_read threads will organically stop and release the sockets
+        kernel_sock_shutdown(socket_data->sock, SHUT_RDWR);
+    }
+    up_read(&device->connected_sockets_sem);
+    printk(KERN_INFO "disconnect: Shut down sockets, attempting to delete sockets");
+
+    // Once all blocking_read threads exit, we can modify things
+    down_write(&device->connected_sockets_sem);
+    // Since we reobtained the lock, we have to check again if some other thread did the work
+    if (!does_multisocket_exist(device, multisocket->sender_id)) {
+        up_write(&device->connected_sockets_sem);
+        return;
+    }
+    // Remove this multisocket from connected sockets
+    list_del(&multisocket->list);
+    // Note: We can't actually free this multisocket until all blocking_read threads exit
+    // kfree(multisocket);
+    up_write(&device->connected_sockets_sem);
+
+    // If this is the replica, zero out the pending bio ring. This is ok because anything this replica ACKed must've already been popped off the ring
+    if (!device->shutting_down && !device->is_leader) {
+        printk(KERN_INFO "Replica zeroing out pending bio ring");
+        for (i = 0; i < ROLLBACCINE_AVG_HASHES_PER_WRITE; i++) {
+            bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[i], 0);
+            if (bio_data != NULL) {
+                free_pages_end_io(bio_data->bio_src);
+            }
+        }
+#ifdef MEMORY_TRACKING
+        atomic_set(&device->num_bios_in_pending_bio_ring, 0);
+#endif
+    }
+    printk(KERN_INFO "Disconnected from sender");
+}
+
+void alert_client_of_liveness_problem(struct rollbaccine_device *device, struct multisocket *multisocket) {
+    if (atomic_cmpxchg(&multisocket->alerted_client_of_liveness_problem, 0, 1) == 0) {
+        printk(KERN_ERR "Liveness problem detected, alerting client");
+        // TODO: Telling client about liveness problem
+    }
 }
 
 void print_and_update_latency(char *text, cycles_t *prev_time) {
@@ -552,36 +612,6 @@ void atomic_max(atomic_t *old, int new) {
     } while (old_val < new &&atomic_cmpxchg(old, old_val, new) != old_val);
 }
 
-void block_if_not_enough_memory(struct rollbaccine_device *device, int num_pages_needed) {
-    // TODO: Don't restrict memory for now
-    return;
-    unsigned long flags;
-    if (num_pages_needed > device->max_memory_pages) {
-        printk_ratelimited(KERN_ERR "Write requires more memory than max pages allocated: %d, automatically allowing write through", num_pages_needed);
-        return;
-    }
-
-    spin_lock_irqsave(&device->memory_wait_queue.lock, flags);
-    wait_event_interruptible_locked(device->memory_wait_queue, device->num_used_memory_pages + num_pages_needed <= device->max_memory_pages);
-    device->num_used_memory_pages += num_pages_needed;
-    spin_unlock_irqrestore(&device->memory_wait_queue.lock, flags);
-}
-
-void release_memory(struct rollbaccine_device *device, int num_pages_released) {
-    // TODO: Don't restrict memory for now
-    return;
-    unsigned long flags;
-    if (num_pages_released > 0) {
-        spin_lock_irqsave(&device->memory_wait_queue.lock, flags);
-#ifdef MEMORY_TRACKING
-        device->max_num_pages_in_memory = umax(device->max_num_pages_in_memory, device->num_used_memory_pages);
-#endif
-        device->num_used_memory_pages -= num_pages_released;
-        wake_up_locked(&device->memory_wait_queue);
-        spin_unlock_irqrestore(&device->memory_wait_queue.lock, flags);
-    }
-}
-
 struct bio_data *alloc_bio_data(struct rollbaccine_device *device) {
     struct bio_data *data = kmem_cache_alloc(device->bio_data_cache, GFP_KERNEL);
     // struct bio_data *data = kmalloc(sizeof(struct bio_data), GFP_KERNEL);
@@ -679,7 +709,6 @@ void free_pages_end_io(struct bio *received_bio) {
     struct bio_vec bvec;
     struct bvec_iter iter;
 
-    release_memory(device, (bio_data->end_sector - bio_data->start_sector) / SECTORS_PER_PAGE);
     // Free each page. Reset bio to start first, in case it's pointing to the end
     received_bio->bi_iter.bi_sector = bio_data->start_sector;
     received_bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
@@ -720,7 +749,6 @@ void try_free_clones(struct bio *clone) {
         int num_deep_clones = atomic_dec_return(&bio_data->device->num_deep_clones_not_freed);
         atomic_max(&bio_data->device->max_outstanding_num_deep_clones, num_deep_clones + 1);
 #endif
-        release_memory(bio_data->device, (bio_data->end_sector - bio_data->start_sector) / SECTORS_PER_PAGE);
         bio_put(bio_data->shallow_clone);
         free_pages_end_io(bio_data->deep_clone);
     } else {
@@ -829,7 +857,7 @@ void broadcast_bio(struct work_struct *work) {
     struct rollbaccine_device *device = clone_bio_data->device;
     struct msghdr msg_header;
     struct kvec vec;
-    struct multisocket *multisocket, *next_multisocket;
+    struct multisocket *multisocket, *next_multisocket, *should_disconnect_from_multisocket;
     struct socket_data *socket_data;
     struct metadata_msg metadata;
     struct additional_hash_msg *additional_hash_msg;
@@ -895,7 +923,7 @@ void broadcast_bio(struct work_struct *work) {
             sent = kernel_sendmsg(socket_data->sock, &msg_header, &vec, 1, vec.iov_len);
             if (sent <= 0) {
                 printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
-                // TODO: Should remove the socket from the list and shut down the connection?
+                should_disconnect_from_multisocket = multisocket;
                 goto finish_sending_to_socket;
             } else {
                 vec.iov_base += sent;
@@ -918,6 +946,7 @@ void broadcast_bio(struct work_struct *work) {
                 sent = kernel_sendmsg(socket_data->sock, &msg_header, &vec, 1, vec.iov_len);
                 if (sent <= 0) {
                     printk(KERN_ERR "Error broadcasting checksums and IVs");
+                    should_disconnect_from_multisocket = multisocket;
                     goto finish_sending_to_socket;
                 } else {
                     vec.iov_base += sent;
@@ -938,7 +967,7 @@ void broadcast_bio(struct work_struct *work) {
                 sent = sock_sendmsg(socket_data->sock, &msg_header);
                 if (sent <= 0) {
                     printk(KERN_ERR "Error broadcasting message pages");
-                    // TODO: Should remove the socket from the list and shut down the connection?
+                    should_disconnect_from_multisocket = multisocket;
                     goto finish_sending_to_socket;
                 } else {
                     chunked_bvec.bv_offset += sent;
@@ -954,16 +983,21 @@ void broadcast_bio(struct work_struct *work) {
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
     up_read(&device->connected_sockets_sem);
 
+    if (should_disconnect_from_multisocket != NULL) {
+        // Disconnect from misbehaving replica. Note: This will only disconnect from the *last* misbehaving replica; if multiple misbehave at once, we'll find them eventually.
+        printk(KERN_ERR "Disconnecting from misbehaving replica");
+        alert_client_of_liveness_problem(device, should_disconnect_from_multisocket);
+        disconnect(device, should_disconnect_from_multisocket);
+    }
     if (additional_hash_msg != NULL) {
         kfree(additional_hash_msg);
     }
     network_end_io(clone);
-    print_and_update_latency("broadcast_bio: Broadcast bio", &total_time);
 
-#ifdef MEMORY_TRACKING
     int queue_size = atomic_dec_return(&device->broadcast_queue_size);
     atomic_max(&device->max_broadcast_queue_size, queue_size + 1);
-#endif
+
+    print_and_update_latency("broadcast_bio: Broadcast bio", &total_time);
 }
 
 struct bio *shallow_bio_clone(struct rollbaccine_device *device, struct bio *bio_src) {
@@ -1050,8 +1084,11 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         
         switch (bio_data_dir(bio)) {
             case WRITE:
-                // Wait until there's enough memory. Ask for 2 pages per page since we're deep cloning
-                block_if_not_enough_memory(device, bio_sectors(bio) * 2 / SECTORS_PER_PAGE);
+                // Don't place writes on queue if it's backed up
+                if (atomic_inc_return(&device->broadcast_queue_size) > ROLLBACCINE_MAX_BROADCAST_QUEUE_SIZE) {
+                    printk_ratelimited(KERN_ERR "Broadcast queue is full, blocking write");
+                    return DM_MAPIO_REMAPPED;
+                }
 
                 bio_data->is_fsync = requires_fsync(bio);
                 bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
@@ -1122,9 +1159,6 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 INIT_WORK(&bio_data->broadcast_work, broadcast_bio);
                 queue_work(device->broadcast_bio_queue, &bio_data->broadcast_work);
-#ifdef MEMORY_TRACKING
-                atomic_inc(&device->broadcast_queue_size);
-#endif
                 break;
             case READ:
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
@@ -1507,14 +1541,14 @@ int ack_fsync(void *args) {
 }
 
 // Function used by all listening sockets to block and listen to messages
-void blocking_read(struct rollbaccine_device *device, struct socket_data *socket_data) {
+void blocking_read(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data) {
     struct metadata_msg metadata;
     struct bio *received_bio;
     struct bio_data *bio_data;
     struct page *page;
     struct msghdr msg_header;
     struct kvec vec;
-    int received, i, num_sectors, index_offset;
+    int received, i, num_sectors, index_offset, bio_distance;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
     struct additional_hash_msg *additional_hash_msg;
 
@@ -1532,7 +1566,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
         if (received <= 0) {
             printk(KERN_ERR "Error reading metadata from socket");
-            break;
+            goto disconnect_from_sender;
         }
 
         // printk(KERN_INFO "Received metadata sector: %llu, num pages: %llu, bi_opf: %llu, is fsync: %llu", metadata.sector, metadata.num_pages, metadata.bi_opf, metadata.bi_opf&(REQ_PREFLUSH |
@@ -1540,7 +1574,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
 
         // Verify the message
         if (!verify_msg(socket_data, (char*) &metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash, metadata.sender_id, metadata.sender_socket_id, metadata.recipient_id, device->id, metadata.msg_index)) {
-            break;
+            goto disconnect_from_sender;
         }
 
         // Received ack for fsync
@@ -1582,12 +1616,12 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
             received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
             if (received <= 0) {
                 printk(KERN_ERR "Error reading checksum and IV, %d", received);
-                break;
+                goto disconnect_from_sender;
             }
 
             // Verify the message
             if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->recipient_id, device->id, additional_hash_msg->msg_index)) {
-                break;
+                goto disconnect_from_sender;
             }
 
             // Copy the checksums over
@@ -1601,7 +1635,6 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         }
 
         // 3. Receive pages of bio (over the regular socket now, not TLS)
-        block_if_not_enough_memory(device, metadata.num_pages);
         for (i = 0; i < metadata.num_pages; i++) {
             page = page_cache_alloc(device);
             // page = alloc_page(GFP_KERNEL);
@@ -1618,7 +1651,7 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
             received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
             if (received <= 0) {
                 printk(KERN_ERR "Error reading from socket");
-                break;
+                goto disconnect_from_sender;
             }
             // printk(KERN_INFO "Received bio page: %i", i);
             __bio_add_page(received_bio, page, PAGE_SIZE, 0);
@@ -1631,24 +1664,33 @@ void blocking_read(struct rollbaccine_device *device, struct socket_data *socket
         index_offset = bio_data->write_index % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
         atomic_long_set(&device->pending_bio_ring[index_offset], (long)bio_data);
         smp_mb(); // Prevent reordering
-        if (bio_data->write_index == atomic_read(&device->pending_bio_ring_head)) {
+        bio_distance = bio_data->write_index - atomic_read(&device->pending_bio_ring_head);
+        if (bio_distance == 0) {
             // Wake up the thread that submits bios
             up(&device->replica_submit_bio_sema);
+        }
+        else if (bio_distance > ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
+            // This bio does not fit on the pending bio ring. This is a BIG problem. Likely the leader is too slow or its messages are maliciously being dropped.
+            printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
+            alert_client_of_liveness_problem(device, multisocket);
+            goto disconnect_from_sender;
         }
 
 #ifdef MEMORY_TRACKING
         int num_bios = atomic_inc_return(&device->num_bios_in_pending_bio_ring);
         atomic_max(&device->max_bios_in_pending_bio_ring, num_bios);
-        int distance = index_offset - atomic_read(&device->pending_bio_ring_head);
-        atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, distance % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
+        atomic_max(&device->max_distance_between_bios_in_pending_bio_ring, bio_distance);
 #endif
     }
+    goto cleanup;
 
-    printk(KERN_INFO "Shutting down, exiting blocking read");
-    kernel_sock_shutdown(socket_data->sock, SHUT_RDWR);
-    // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut
-    // it down.
-    //     sock_release(sock);
+disconnect_from_sender:
+    printk(KERN_ERR "Disconnecting from sender");
+    disconnect(device, multisocket);
+
+cleanup:
+    sock_release(socket_data->sock);
+    kfree(socket_data->hash_desc);
 }
 
 void init_socket_data(struct rollbaccine_device *device, struct socket_data *socket_data, struct socket *sock, uint64_t sender_id, uint64_t sender_socket_id) {
@@ -1690,6 +1732,7 @@ struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_devi
     for (i = 0; i < NUM_NICS; i++) {
         multisocket->sender_socket_id_taken[i] = false;
     }
+    atomic_set(&multisocket->alerted_client_of_liveness_problem, 0);
     list_add(&multisocket->list, &device->connected_sockets);
 
 unlock_and_return:
@@ -1799,7 +1842,7 @@ int connect_to_server(void *args) {
     socket_data = &multisocket->socket_data[thread_params->socket_id];
     init_socket_data(thread_params->device, socket_data, thread_params->sock, handshake_pair.sender_id, handshake_pair.sender_socket_id);
 
-    blocking_read(thread_params->device, socket_data);
+    blocking_read(thread_params->device, multisocket, socket_data);
 
 cleanup:
     kfree(thread_params);
@@ -1807,7 +1850,6 @@ cleanup:
 }
 
 int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port) {
-    struct socket_list *sock_list;
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
     int i, error;
@@ -1838,15 +1880,6 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
         }
         thread_params->addr.sin_port = htons(port);
 
-        // Add this socket to the list so we can close it later in order to shut the thread down
-        sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-        if (sock_list == NULL) {
-            printk(KERN_ERR "Error creating sock_list");
-            return -1;
-        }
-        sock_list->sock = thread_params->sock;
-        list_add(&sock_list->list, &device->client_sockets);
-
         // start a thread for this connection
         connect_thread = kthread_run(connect_to_server, thread_params, "connect to server");
         if (IS_ERR(connect_thread)) {
@@ -1861,7 +1894,7 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
 int listen_to_accepted_socket(void *args) {
     struct accepted_thread_params *thread_params = (struct accepted_thread_params *)args;
     
-    blocking_read(thread_params->device, thread_params->socket_data);
+    blocking_read(thread_params->device, thread_params->multisocket, thread_params->socket_data);
 
     kfree(thread_params);
     return 0;
@@ -1869,19 +1902,16 @@ int listen_to_accepted_socket(void *args) {
 
 // Thread that listens to connecting clients
 int listen_for_connections(void *args) {
-    struct listen_thread_params *thread_params = (struct listen_thread_params *)args;
-    struct rollbaccine_device *device = thread_params->device;
+    struct rollbaccine_device *device = args;
     struct socket *new_sock;
     struct accepted_thread_params *new_thread_params;
-    struct socket_list *new_server_socket_list;
-    struct multisocket *multisocket;
     struct multithreaded_handshake_pair handshake_pair;
     struct task_struct *accepted_thread;
     int error;
 
     while (!device->shutting_down) {
         // Blocks until a connection is accepted
-        error = kernel_accept(thread_params->sock, &new_sock, 0);
+        error = kernel_accept(device->server_socket, &new_sock, 0);
         if (error < 0) {
             printk(KERN_ERR "Error accepting connection");
             continue;
@@ -1896,26 +1926,17 @@ int listen_for_connections(void *args) {
         }
         new_thread_params->device = device;
 
-        // Add to list of server sockets
-        new_server_socket_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-        if (new_server_socket_list == NULL) {
-            printk(KERN_ERR "Error creating socket_list");
-            break;
-        }
-        new_server_socket_list->sock = new_sock;
-        // Note: No locks needed here, because only the listener thread writes this list
-        list_add(&new_server_socket_list->list, &device->server_sockets);
-
         // handshake
-        handshake_pair = receive_handshake_id(thread_params->device, new_sock);
-        send_handshake_id(thread_params->device, new_sock, handshake_pair.sender_socket_id);
-        multisocket = create_connected_socket_list_if_null(thread_params->device, handshake_pair.sender_id);
-        if (!add_sender_socket_id_if_unique(thread_params->device, multisocket, handshake_pair.sender_socket_id)) {
+        // TODO: If the client fails during handshake, this will still create the new multisockets...
+        handshake_pair = receive_handshake_id(device, new_sock);
+        send_handshake_id(device, new_sock, handshake_pair.sender_socket_id);
+        new_thread_params->multisocket = create_connected_socket_list_if_null(device, handshake_pair.sender_id);
+        if (!add_sender_socket_id_if_unique(device, new_thread_params->multisocket, handshake_pair.sender_socket_id)) {
             printk(KERN_ERR "Error: Sender thread %llu was reused, replay attack", handshake_pair.sender_socket_id);
             continue;
         }
-        new_thread_params->socket_data = &multisocket->socket_data[handshake_pair.sender_socket_id];
-        init_socket_data(thread_params->device, new_thread_params->socket_data, new_sock, handshake_pair.sender_id, handshake_pair.sender_socket_id);
+        new_thread_params->socket_data = &new_thread_params->multisocket->socket_data[handshake_pair.sender_socket_id];
+        init_socket_data(device, new_thread_params->socket_data, new_sock, handshake_pair.sender_id, handshake_pair.sender_socket_id);
 
         accepted_thread = kthread_run(listen_to_accepted_socket, new_thread_params, "listen to accepted socket");
         if (IS_ERR(accepted_thread)) {
@@ -1924,57 +1945,35 @@ int listen_for_connections(void *args) {
         }
     }
 
-    kernel_sock_shutdown(thread_params->sock, SHUT_RDWR);
+    kernel_sock_shutdown(device->server_socket, SHUT_RDWR);
     // TODO: Releasing the socket is problematic because it makes future calls to shutdown() crash, which may happen if the connection dies, the socket is freed, and later the destructor tries to shut
     // it down.
     //     sock_release(thread_params->sock);
-    kfree(thread_params);
     return 0;
 }
 
 // Returns error code if it fails
 int start_server(struct rollbaccine_device *device, ushort port) {
-    struct listen_thread_params *thread_params;
-    struct socket_list *sock_list;
     struct sockaddr_in addr;
     struct task_struct *listener_thread;
     int error;
     int opt = 1;
     sockptr_t kopt = {.kernel = (char *)&opt, .is_kernel = 1};
 
-    // Create struct to pass parameters to listener thread
-    thread_params = kmalloc(sizeof(struct listen_thread_params), GFP_KERNEL);
-    if (thread_params == NULL) {
-        printk(KERN_ERR "Error creating listen_thread_params");
-        return -1;
-    }
-    thread_params->device = device;
-
-    // Create struct to add the socket to the list of sockets
-    sock_list = kmalloc(sizeof(struct socket_list), GFP_KERNEL);
-    if (sock_list == NULL) {
-        printk(KERN_ERR "Error creating socket_list");
-        return -1;
-    }
-
-    error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
+    error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &device->server_socket);
     if (error < 0) {
         printk(KERN_ERR "Error creating server socket");
         return error;
     }
 
-    // Add the newly created socket to our list of sockets
-    sock_list->sock = thread_params->sock;
-    list_add(&sock_list->list, &device->server_sockets);
-
     // TCP nodelay
-    error = thread_params->sock->ops->setsockopt(thread_params->sock, SOL_TCP, TCP_NODELAY, kopt, sizeof(opt));
+    error = device->server_socket->ops->setsockopt(device->server_socket, SOL_TCP, TCP_NODELAY, kopt, sizeof(opt));
     if (error < 0) {
         printk(KERN_ERR "Error setting TCP_NODELAY");
         return error;
     }
 
-    error = sock_setsockopt(thread_params->sock, SOL_SOCKET, SO_REUSEPORT, kopt, sizeof(opt));
+    error = sock_setsockopt(device->server_socket, SOL_SOCKET, SO_REUSEPORT, kopt, sizeof(opt));
     if (error < 0) {
         printk(KERN_ERR "Error setting SO_REUSEPORT");
         return error;
@@ -1986,20 +1985,20 @@ int start_server(struct rollbaccine_device *device, ushort port) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
 
-    error = kernel_bind(thread_params->sock, (struct sockaddr *)&addr, sizeof(addr));
+    error = kernel_bind(device->server_socket, (struct sockaddr *)&addr, sizeof(addr));
     if (error < 0) {
         printk(KERN_ERR "Error binding socket");
         return error;
     }
 
-    error = kernel_listen(thread_params->sock, ROLLBACCINE_MAX_CONNECTIONS);
+    error = kernel_listen(device->server_socket, ROLLBACCINE_MAX_CONNECTIONS);
     if (error < 0) {
         printk(KERN_ERR "Error listening on socket");
         return error;
     }
 
     // Listen for connections
-    listener_thread = kthread_run(listen_for_connections, thread_params, "listener");
+    listener_thread = kthread_run(listen_for_connections, device, "listener");
     if (IS_ERR(listener_thread)) {
         printk(KERN_ERR "Error creating listener thread");
         return -1;
@@ -2203,7 +2202,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     printk(KERN_INFO "Starting server at port: %u", port);
 
     INIT_LIST_HEAD(&device->connected_sockets);
-    INIT_LIST_HEAD(&device->server_sockets);
     error = start_server(device, port);
     if (error < 0) {
         printk(KERN_ERR "Error starting server");
@@ -2211,7 +2209,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
 
     // Connect to other servers. argv[7], argv[8], etc are all server addresses and ports to connect to.
-    INIT_LIST_HEAD(&device->client_sockets);
     for (i = 8; i < argc; i += 2) {
         error = kstrtou16(argv[i + 1], 10, &port);
         if (error < 0) {
@@ -2257,7 +2254,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     atomic_set(&device->num_bios_in_pending_bio_ring, 0);
     atomic_set(&device->submit_bio_queue_size, 0);
     atomic_set(&device->replica_disk_end_io_queue_size, 0);
-    atomic_set(&device->broadcast_queue_size, 0);
     atomic_set(&device->num_messages_larger_than_avg, 0);
     atomic_set(&device->max_outstanding_num_bio_data, 0);
     atomic_set(&device->max_outstanding_num_bio_pages, 0);
@@ -2270,8 +2266,10 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     atomic_set(&device->max_distance_between_bios_in_pending_bio_ring, 0);
     atomic_set(&device->max_submit_bio_queue_size, 0);
     atomic_set(&device->max_replica_disk_end_io_queue_size, 0);
-    atomic_set(&device->max_broadcast_queue_size, 0);
 #endif
+
+    atomic_set(&device->broadcast_queue_size, 0);
+    atomic_set(&device->max_broadcast_queue_size, 0);
 
     // Enable FUA and PREFLUSH flags
     ti->num_flush_bios = 1;
@@ -2284,10 +2282,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 }
 
 static void rollbaccine_destructor(struct dm_target *ti) {
-    struct socket_list *curr, *next;
     struct multisocket *curr_multi, *next_multi;
     struct rollbaccine_device *device = ti->private;
-    int i;
     if (device == NULL) return;
 
     // Warning: Changing this boolean should technically be atomic. I don't think it's a big deal tho, since by the time shutting_down is true, we don't care what the protocol does. *Ideally* it shuts
@@ -2296,37 +2292,20 @@ static void rollbaccine_destructor(struct dm_target *ti) {
 
     // Kill threads
     if (!device->is_leader) {
-        // Wake threads that are blocking on a semaphore back up
+        printk(KERN_INFO "Killing replica threads that are blocking on semaphores");
         send_sig(SIGTERM, device->replica_submit_bio_thread, 1);
         send_sig(SIGTERM, device->replica_ack_fsync_thread, 1);
     }
 
-    printk(KERN_INFO "Killing server sockets");
-    list_for_each_entry_safe(curr, next, &device->server_sockets, list) {
-        if (curr->sock != NULL) {
-            kernel_sock_shutdown(curr->sock, SHUT_RDWR);
-        }
-        list_del(&curr->list);
-        kfree(curr);
-    }
-    printk(KERN_INFO "Killing client sockets");
-    list_for_each_entry_safe(curr, next, &device->client_sockets, list) {
-        if (curr->sock != NULL) {
-            kernel_sock_shutdown(curr->sock, SHUT_RDWR);
-        }
-        list_del(&curr->list);
-        kfree(curr);
-    }
+    printk(KERN_INFO "Killing server socket");
+    kernel_sock_shutdown(device->server_socket, SHUT_RDWR);
 
-    // Free socket list (sockets should already be freed)
+    printk(KERN_INFO "Killing connections to other nodes");
     list_for_each_entry_safe(curr_multi, next_multi, &device->connected_sockets, list) {
-        for (i = 0; i < NUM_NICS; i++) {
-            kfree(curr_multi->socket_data[i].hash_desc);
-        }
-        list_del(&curr_multi->list);
-        kfree(curr_multi);
+        disconnect(device, curr_multi);
     }
 
+    printk(KERN_INFO "Freeing remaining structures");
     kvfree(device->checksums);
     crypto_free_aead(device->tfm);
     crypto_free_shash(device->hash_alg);
@@ -2340,7 +2319,8 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
     page_cache_destroy(device);
-    kfree(device);
+    // TODO: Don't free because threads may be attempting to acquire global locks still. Could theoretically gather all threads and wait for them
+    // kfree(device);
 
     printk(KERN_INFO "Server destructed");
 }
