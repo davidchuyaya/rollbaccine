@@ -118,6 +118,7 @@ struct multisocket {
     bool sender_socket_id_taken[NUM_NICS]; // Which sender socket IDs have been taken
     struct mutex sender_socket_ids_lock; // Lock on sender_socket_ids to check if the sender is giving us unique socket IDs
     atomic_t alerted_client_of_liveness_problem;  // Whether we've messaged the client about a liveness problem over this socket, since we don't want to spam the client
+    atomic_t disconnected;
     struct list_head list;
 };
 
@@ -368,50 +369,25 @@ inline cycles_t get_cycles_if_flag_on(void) {
 #endif
 }
 
-// Check if another thread has already shut down the multisocket. If they have, then we shouldn't be able to find it in the connected_sockets list
-// Note: Caller must hold connected_sockets_sem (read)
-inline bool does_multisocket_exist(struct rollbaccine_device *device, uint64_t sender_id) {
-    struct multisocket *curr;
-    list_for_each_entry(curr, &device->connected_sockets, list) {
-        if (curr->sender_id == sender_id) {
-            return true;
-        }
-    }
-    return false;
-}
-
 void disconnect(struct rollbaccine_device *device, struct multisocket *multisocket) {
     int i;
     struct socket_data *socket_data;
     struct bio_data *bio_data;
 
-    printk(KERN_INFO "disconnect: Attempting to shut down sockets");
-    down_read(&device->connected_sockets_sem);
-    // Check if some other thread already did the work
-    if (!does_multisocket_exist(device, multisocket->sender_id)) {
-        up_read(&device->connected_sockets_sem);
+    if (atomic_cmpxchg(&multisocket->disconnected, 0, 1) == 1) {
         return;
     }
-    // Shut down all sockets. This will trigger all blocking_read threads to exit, then all call this function
+
+    printk(KERN_INFO "disconnect: Attempting to shut down sockets");
+    down_write(&device->connected_sockets_sem);
+    // Shut down all sockets. This will trigger all blocking_read threads to exit
     for (i = 0; i < NUM_NICS; i++) {
         socket_data = &multisocket->socket_data[i];
         // Note: We don't release the socket here. The blocking_read threads will organically stop and release the sockets
         kernel_sock_shutdown(socket_data->sock, SHUT_RDWR);
     }
-    up_read(&device->connected_sockets_sem);
-    printk(KERN_INFO "disconnect: Shut down sockets, attempting to delete sockets");
-
-    // Once all blocking_read threads exit, we can modify things
-    down_write(&device->connected_sockets_sem);
-    // Since we reobtained the lock, we have to check again if some other thread did the work
-    if (!does_multisocket_exist(device, multisocket->sender_id)) {
-        up_write(&device->connected_sockets_sem);
-        return;
-    }
     // Remove this multisocket from connected sockets
     list_del(&multisocket->list);
-    // Note: We can't actually free this multisocket until all blocking_read threads exit
-    // kfree(multisocket);
     up_write(&device->connected_sockets_sem);
 
     // If this is the replica, zero out the pending bio ring. This is ok because anything this replica ACKed must've already been popped off the ring
@@ -1558,7 +1534,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
     msg_header.msg_control = NULL;
     msg_header.msg_controllen = 0;
 
-    while (!device->shutting_down) {
+    while (!device->shutting_down && !atomic_read(&multisocket->disconnected)) {
         // 1. Receive metadata message
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
@@ -1616,11 +1592,15 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
             received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
             if (received <= 0) {
                 printk(KERN_ERR "Error reading checksum and IV, %d", received);
+                free_pages_end_io(received_bio);
+                kfree(additional_hash_msg);
                 goto disconnect_from_sender;
             }
 
             // Verify the message
             if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->recipient_id, device->id, additional_hash_msg->msg_index)) {
+                free_pages_end_io(received_bio);
+                kfree(additional_hash_msg);
                 goto disconnect_from_sender;
             }
 
@@ -1651,6 +1631,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
             received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
             if (received <= 0) {
                 printk(KERN_ERR "Error reading from socket");
+                free_pages_end_io(received_bio);
                 goto disconnect_from_sender;
             }
             // printk(KERN_INFO "Received bio page: %i", i);
@@ -1672,6 +1653,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         else if (bio_distance > ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
             // This bio does not fit on the pending bio ring. This is a BIG problem. Likely the leader is too slow or its messages are maliciously being dropped.
             printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
+            free_pages_end_io(received_bio);
             alert_client_of_liveness_problem(device, multisocket);
             goto disconnect_from_sender;
         }
@@ -1689,7 +1671,8 @@ disconnect_from_sender:
     disconnect(device, multisocket);
 
 cleanup:
-    sock_release(socket_data->sock);
+    // TODO: Can't release the socket in case another thread calls disconnect and tries to shut down the released socket...
+    // sock_release(socket_data->sock);
     kfree(socket_data->hash_desc);
 }
 
@@ -1733,6 +1716,7 @@ struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_devi
         multisocket->sender_socket_id_taken[i] = false;
     }
     atomic_set(&multisocket->alerted_client_of_liveness_problem, 0);
+    atomic_set(&multisocket->disconnected, 0);
     list_add(&multisocket->list, &device->connected_sockets);
 
 unlock_and_return:
