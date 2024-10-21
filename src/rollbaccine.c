@@ -1653,7 +1653,6 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         else if (bio_distance > ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
             // This bio does not fit on the pending bio ring. This is a BIG problem. Likely the leader is too slow or its messages are maliciously being dropped.
             printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
-            free_pages_end_io(received_bio);
             alert_client_of_liveness_problem(device, multisocket);
             goto disconnect_from_sender;
         }
