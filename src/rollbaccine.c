@@ -37,7 +37,7 @@
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
-#define ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER 10000000 // Max "hole" between writes
+#define ROLLBACCINE_PENDING_BIO_RING_SIZE 10000000  // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
 #define MODULE_NAME "rollbaccine"
@@ -393,7 +393,7 @@ void disconnect(struct rollbaccine_device *device, struct multisocket *multisock
     // If this is the replica, zero out the pending bio ring. This is ok because anything this replica ACKed must've already been popped off the ring
     if (!device->shutting_down && !device->is_leader) {
         printk(KERN_INFO "Replica zeroing out pending bio ring");
-        for (i = 0; i < ROLLBACCINE_AVG_HASHES_PER_WRITE; i++) {
+        for (i = 0; i < ROLLBACCINE_PENDING_BIO_RING_SIZE; i++) {
             bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[i], 0);
             if (bio_data != NULL) {
                 free_pages_end_io(bio_data->bio_src);
@@ -1388,7 +1388,7 @@ int submit_pending_bio_ring_prefix(void *args) {
         print_and_update_latency("submit_pending_bio_ring_prefix: obtained lock", &time);
 
         // Store local version of head. Ok since this is the only thread modifying it
-        curr_head = atomic_read(&device->pending_bio_ring_head) % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
+        curr_head = atomic_read(&device->pending_bio_ring_head) % ROLLBACCINE_PENDING_BIO_RING_SIZE;
         // Prevent reordering
         smp_mb();
         // Pop as much of the bio prefix off the pending bio ring as possible
@@ -1422,7 +1422,7 @@ int submit_pending_bio_ring_prefix(void *args) {
             should_ack_fsync |= curr_bio_data->is_fsync;
 
             // Increment index and wrap around if necessary
-            curr_head = atomic_inc_return(&device->pending_bio_ring_head) % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
+            curr_head = atomic_inc_return(&device->pending_bio_ring_head) % ROLLBACCINE_PENDING_BIO_RING_SIZE;
             smp_mb();
             print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
         }
@@ -1527,6 +1527,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
     int received, i, num_sectors, index_offset, bio_distance;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
     struct additional_hash_msg *additional_hash_msg;
+    long replaced_bio_data;
 
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
@@ -1642,19 +1643,29 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
 
         // 5. Add bio to pending_bio_ring
-        index_offset = bio_data->write_index % ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
-        atomic_long_set(&device->pending_bio_ring[index_offset], (long)bio_data);
+        bio_distance = bio_data->write_index - atomic_read(&device->pending_bio_ring_head);
+        smp_mb();
+        if (bio_distance > ROLLBACCINE_PENDING_BIO_RING_SIZE) {
+            printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
+            free_pages_end_io(received_bio);
+            alert_client_of_liveness_problem(device, multisocket);
+            goto disconnect_from_sender;
+        }
+        // Only place the bio if the previous entry there was already processed
+        index_offset = bio_data->write_index % ROLLBACCINE_PENDING_BIO_RING_SIZE;
+        replaced_bio_data = atomic_long_cmpxchg(&device->pending_bio_ring[index_offset], 0, (long)bio_data);
+        if (replaced_bio_data != 0) {
+            printk(KERN_ERR "Pending bio ring overflowing, attempted to replace non-NULL element, bio distance: %d", bio_distance);
+            free_pages_end_io(received_bio);
+            alert_client_of_liveness_problem(device, multisocket);
+            goto disconnect_from_sender;
+        }
         smp_mb(); // Prevent reordering
+        // Check bio distance again, this time to see if we should wake up the submit thread
         bio_distance = bio_data->write_index - atomic_read(&device->pending_bio_ring_head);
         if (bio_distance == 0) {
             // Wake up the thread that submits bios
             up(&device->replica_submit_bio_sema);
-        }
-        else if (bio_distance > ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER) {
-            // This bio does not fit on the pending bio ring. This is a BIG problem. Likely the leader is too slow or its messages are maliciously being dropped.
-            printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
-            alert_client_of_liveness_problem(device, multisocket);
-            goto disconnect_from_sender;
         }
 
 #ifdef MEMORY_TRACKING
@@ -2135,13 +2146,13 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->index_lock);
 
-    device->pending_bio_ring = vzalloc(sizeof(atomic_long_t) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER);
+    device->pending_bio_ring = vzalloc(sizeof(atomic_long_t) * ROLLBACCINE_PENDING_BIO_RING_SIZE);
     if (!device->pending_bio_ring) {
         printk(KERN_ERR "Error allocating pending_bio_ring");
         return -ENOMEM;
     }
     atomic_set(&device->pending_bio_ring_head, 1);
-    projected_bytes_used += sizeof(struct bio_data *) * ROLLBACCINE_AVG_WRITES_OUT_OF_ORDER;
+    projected_bytes_used += sizeof(struct bio_data *) * ROLLBACCINE_PENDING_BIO_RING_SIZE;
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->replica_fsync_lock);
