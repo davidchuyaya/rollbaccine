@@ -37,7 +37,7 @@
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
-#define ROLLBACCINE_PENDING_BIO_RING_SIZE 100 // Max "hole" between writes
+#define ROLLBACCINE_PENDING_BIO_RING_SIZE 1000000 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
 #define MODULE_NAME "rollbaccine"
