@@ -325,6 +325,11 @@ ssh-add ~/.ssh/id_rsa
 ```
 Then follow the instructions outputted by [launch.sh](launch.sh) to SSH into the VM and launch rollbaccine.
 
+On each machine restart, run the following script:
+```bash
+./on_restart.sh
+```
+
 When you're done with the VMs, delete them, replacing `rollbaccine` with the name you used above:
 ```bash
 ./cleanup -n rollbaccine
