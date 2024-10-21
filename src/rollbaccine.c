@@ -37,7 +37,7 @@
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
-#define ROLLBACCINE_PENDING_BIO_RING_SIZE 10000000  // Max "hole" between writes
+#define ROLLBACCINE_PENDING_BIO_RING_SIZE 100 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
 #define MODULE_NAME "rollbaccine"
@@ -1389,8 +1389,6 @@ int submit_pending_bio_ring_prefix(void *args) {
 
         // Store local version of head. Ok since this is the only thread modifying it
         curr_head = atomic_read(&device->pending_bio_ring_head) % ROLLBACCINE_PENDING_BIO_RING_SIZE;
-        // Prevent reordering
-        smp_mb();
         // Pop as much of the bio prefix off the pending bio ring as possible
         while ((curr_bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[curr_head], 0)) != NULL) {
             mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
@@ -1423,7 +1421,6 @@ int submit_pending_bio_ring_prefix(void *args) {
 
             // Increment index and wrap around if necessary
             curr_head = atomic_inc_return(&device->pending_bio_ring_head) % ROLLBACCINE_PENDING_BIO_RING_SIZE;
-            smp_mb();
             print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
         }
 
@@ -1644,7 +1641,6 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
 
         // 5. Add bio to pending_bio_ring
         bio_distance = bio_data->write_index - atomic_read(&device->pending_bio_ring_head);
-        smp_mb();
         if (bio_distance > ROLLBACCINE_PENDING_BIO_RING_SIZE) {
             printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
             free_pages_end_io(received_bio);
@@ -1660,7 +1656,6 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
             alert_client_of_liveness_problem(device, multisocket);
             goto disconnect_from_sender;
         }
-        smp_mb(); // Prevent reordering
         // Check bio distance again, this time to see if we should wake up the submit thread
         bio_distance = bio_data->write_index - atomic_read(&device->pending_bio_ring_head);
         if (bio_distance == 0) {
