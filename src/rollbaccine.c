@@ -1370,6 +1370,7 @@ int submit_pending_bio_ring_prefix(void *args) {
     struct bio_data *curr_bio_data;
     struct bio_list submit_queue;
     struct bio *bio_to_submit;
+    struct blk_plug plug; // Used to merge bios
     bool no_conflict, should_ack_fsync;
     int signal, curr_head;
     cycles_t time = get_cycles_if_flag_on();
@@ -1430,6 +1431,7 @@ int submit_pending_bio_ring_prefix(void *args) {
         }
 
         // Submit all bios
+        blk_start_plug(&plug);
         while (!bio_list_empty(&submit_queue)) {
             bio_to_submit = bio_list_pop(&submit_queue);
             // If the bio is empty, don't submit, just free it
@@ -1438,6 +1440,7 @@ int submit_pending_bio_ring_prefix(void *args) {
             else
                 submit_bio_noacct(bio_to_submit);
         }
+        blk_finish_plug(&plug);
 
         print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
     }
