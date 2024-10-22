@@ -715,17 +715,30 @@ void free_pages_end_io(struct bio *received_bio) {
 // Decrement the reference counter tracking the number of clones. Free both deep & shallow clones when it hits 0.
 void try_free_clones(struct bio *clone) {
     struct bio_data *bio_data = clone->bi_private;
+    struct bio *received_bio = bio_data->shallow_clone;
+    struct rollbaccine_device *device = bio_data->device;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
     // If ref_counter == 0
     if (atomic_dec_and_test(&bio_data->ref_counter)) {
         // printk(KERN_INFO "Freeing clone, write index: %d", deep_clone_bio_data->write_index);
 #ifdef MEMORY_TRACKING
         // Note: Decrement first, because after the function executes, bio_data will be freed and we won't have a valid pointer to device
-        int num_shallow_clones = atomic_dec_return(&bio_data->device->num_shallow_clones_not_freed);
-        atomic_max(&bio_data->device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
+        atomic_dec(&bio_data->device->num_deep_clones_not_freed);
         int num_deep_clones = atomic_dec_return(&bio_data->device->num_deep_clones_not_freed);
         atomic_max(&bio_data->device->max_outstanding_num_deep_clones, num_deep_clones + 1);
 #endif
-        bio_put(bio_data->shallow_clone);
+        received_bio->bi_iter.bi_sector = bio_data->start_sector;
+        received_bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
+        received_bio->bi_iter.bi_idx = 0;
+        bio_for_each_segment(bvec, received_bio, iter) {
+            page_cache_free(device, bvec.bv_page);
+            // __free_page(bvec.bv_page);
+#ifdef MEMORY_TRACKING
+            int num_bio_pages = atomic_dec_return(&device->num_bio_pages_not_freed);
+            atomic_max(&device->max_outstanding_num_bio_pages, num_bio_pages + 1);
+#endif
+        }
         free_pages_end_io(bio_data->deep_clone);
     } else {
         // printk(KERN_INFO "Decrementing clone ref count to %d, write index: %d", atomic_read(&deep_clone_bio_data->ref_counter), deep_clone_bio_data->write_index);
@@ -1081,7 +1094,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
 
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
-                bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
+                bio_data->shallow_clone = deep_bio_clone(device, bio_data->deep_clone);
                 if (!bio_data->shallow_clone) {
                     printk(KERN_ERR "Could not create shallow clone");
                     return DM_MAPIO_REMAPPED;
