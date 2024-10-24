@@ -255,80 +255,96 @@ def save_to_csv(job_name, result, output_file):
             ]
             writer.writerow(row)
 
-def run_fio_benchmark(public_ip, username, private_key_path, vm_name, parameters):
+def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, parameters_list):
     """
-    Execute the fio benchmark on the VM and retrieve the results.
+    Execute multiple fio benchmarks on the VM and retrieve the results.
     """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
         ssh.connect(public_ip, username=username, key_filename=private_key_path)
-        # Define FIO benchmark parameters
-        job_name = f'benchmark_{vm_name}'
-        write_mode = parameters.get('write_mode', 'readwrite')
-        direct = parameters.get('direct', 0)
-        bs = parameters.get('bs', '4k')
-        runtime = parameters.get('runtime', 60)
-        filename = '/dev/mapper/rollbaccine1'  # Adjust if necessary
-        output_file = f'{job_name}_fio_results.json'  # Output file on VM
-        
-        # Construct the FIO command
-        fio_command = (
-            f'sudo fio '
-            f'--name={job_name} '
-            f'--rw={write_mode} '
-            f'--direct={direct} '
-            f'--bs={bs} '
-            f'--runtime={runtime} '
-            f'--filename={filename} '
-            f'--output-format=json '
-            f'> {output_file}'
-        )
-
-        print(f"Running FIO benchmark on {vm_name}")
-        print(f"FIO command: {fio_command}")
-        
-        # Execute the FIO command on the remote VM
-        stdin, stdout, stderr = ssh.exec_command(fio_command)
-        exit_status = stdout.channel.recv_exit_status()
-        if exit_status == 0:
-            print(f"FIO benchmark completed successfully on {public_ip}")
-        else:
-            error_msg = stderr.read().decode().strip()
-            print(f"FIO benchmark failed on {public_ip}: {error_msg}")
-            return False  # Indicate failure
-
-        # Retrieve the FIO result file
-        local_result_dir = './results'
-        os.makedirs(local_result_dir, exist_ok=True)
-        local_result_path = os.path.join(local_result_dir, f'{vm_name}_fio_results.json')
-        print(f"Retrieving FIO results from {public_ip} to {local_result_path}")
         sftp = ssh.open_sftp()
-        try:
-            sftp.get(f'/home/{username}/{output_file}', local_result_path)
-            print(f"FIO results saved to {local_result_path}")
-            # Load the result and save to CSV
-            with open(local_result_path, 'r') as f:
-                fio_result = json.load(f)
-            csv_output_file = os.path.join(local_result_dir, 'fio_results.csv')
-            # Check if CSV file exists; if not, create it with headers
-            if not os.path.exists(csv_output_file):
-                with open(csv_output_file, mode='w', newline='') as file:
-                    writer = csv.writer(file)
-                    writer.writerow(["Job Name", "FIO Job", "Read IOPS", "Read Bandwidth (KB/s)", "Read Latency (ns)", 
-                                     "Write IOPS", "Write Bandwidth (KB/s)", "Write Latency (ns)"])
-            save_to_csv(job_name, fio_result, csv_output_file)
-            print(f"Results saved to {csv_output_file}")
-        except Exception as e:
-            print(f"Error retrieving FIO results from {public_ip}: {e}")
-            return False
-        finally:
-            sftp.close()
+        for idx, parameters in enumerate(parameters_list):
+            job_name = parameters.get('name', f'benchmark_{vm_name}_{idx}')
+            write_mode = parameters.get('write_mode', 'readwrite')
+            direct = parameters.get('direct', 0)
+            bs = parameters.get('bs', '4k')
+            runtime = parameters.get('runtime', 60)
+            filename = parameters.get('filename', '/dev/mapper/rollbaccine1')  # Adjust if necessary
+            output_file = f'{job_name}_fio_results.json'  # Output file on VM
+
+            # Additional parameters
+            status_interval = parameters.get('status_interval', 5)  # In seconds
+
+
+            # Construct the FIO command
+            fio_command = (
+                f'sudo fio '
+                f'--name={job_name} '
+                f'--rw={write_mode} '
+                f'--direct={direct} '
+                f'--bs={bs} '
+                f'--runtime={runtime} '
+                f'--filename={filename} '
+                f'--output-format=json '
+                f'--time_based '
+                f'--status-interval={status_interval} '
+            )
+
+            fio_command += f'> {output_file}'
+
+            print(f"Running FIO benchmark '{job_name}' on {vm_name}")
+            print(f"FIO command: {fio_command}")
+            
+            # Execute the FIO command on the remote VM
+            stdin, stdout, stderr = ssh.exec_command(fio_command)
+            # Print status updates
+            while not stdout.channel.exit_status_ready():
+                if stdout.channel.recv_ready():
+                    output = stdout.channel.recv(1024).decode()
+                    print(output, end='')
+                sleep(status_interval)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status == 0:
+                print(f"\nFIO benchmark '{job_name}' completed successfully on {public_ip}")
+            else:
+                error_msg = stderr.read().decode().strip()
+                print(f"FIO benchmark '{job_name}' failed on {public_ip}: {error_msg}")
+                continue  # Proceed to the next benchmark
+
+            # Retrieve the FIO result file
+            local_result_dir = './results'
+            os.makedirs(local_result_dir, exist_ok=True)
+            local_result_path = os.path.join(local_result_dir, f'{vm_name}_{job_name}_fio_results.json')
+            print(f"Retrieving FIO results for '{job_name}' from {public_ip} to {local_result_path}")
+            try:
+                sftp.get(f'/home/{username}/{output_file}', local_result_path)
+                print(f"FIO results for '{job_name}' saved to {local_result_path}")
+                # Load the result and save to CSV
+                with open(local_result_path, 'r') as f:
+                    fio_result = json.load(f)
+                csv_output_file = os.path.join(local_result_dir, 'fio_results.csv')
+                # Check if CSV file exists; if not, create it with headers
+                if not os.path.exists(csv_output_file):
+                    with open(csv_output_file, mode='w', newline='') as file:
+                        writer = csv.writer(file)
+                        writer.writerow([
+                            "Job Name", "FIO Job", "Read IOPS", "Read Bandwidth (KB/s)", 
+                            "Read Latency (ns)", "Write IOPS", "Write Bandwidth (KB/s)", 
+                            "Write Latency (ns)"
+                        ])
+                save_to_csv(job_name, fio_result, csv_output_file)
+                print(f"Results for '{job_name}' saved to {csv_output_file}")
+            except Exception as e:
+                print(f"Error retrieving FIO results for '{job_name}' from {public_ip}: {e}")
+                continue  # Proceed to the next benchmark
     except Exception as e:
-        print(f"Error running FIO benchmark on {public_ip}: {e}")
+        print(f"Error running FIO benchmarks on {public_ip}: {e}")
         return False
-    ssh.close()
+    finally:
+        sftp.close()
+        ssh.close()
     return True  # Indicate success
 
 # # Start all VMs
@@ -336,29 +352,28 @@ def run_fio_benchmark(public_ip, username, private_key_path, vm_name, parameters
 #     manage_vm_power_state(vm_name, STARTING_VM)
 
 # Get the private IP of the leader VM
-# private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
+private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
 
-# # Run commands on all VMs
-# for vm_name in vm_ip_data.keys():
-#     is_leader = True if vm_name == 'rollbaccineNum0' else False
-#     ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader)
+# Run commands on all VMs
+for vm_name in vm_ip_data.keys():
+    is_leader = True if vm_name == 'rollbaccineNum0' else False
+    ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader)
 
-fio_parameters = {
+fio_parameters_list = [{
         'bs': '4k',
         'write_mode': 'readwrite',
         'direct': 0,
         'runtime': 60,
-        
         'name': 'rollbaccine',
-    }
+    }]
 
 # Run Fio on Leader
-success = run_fio_benchmark(
+success = run_multiple_fio_benchmarks(
     vm_ip_data['rollbaccineNum0']['public_ip'],
     USERNAME,
     PRIVATE_KEY_PATH,
     'rollbaccineNum0',
-    fio_parameters
+    fio_parameters_list
 )
 print(success)
 
