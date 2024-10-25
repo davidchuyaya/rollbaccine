@@ -38,26 +38,6 @@ vm_ip_data = {}
 with open('vm_ips.json') as f:
     vm_ip_data = json.load(f)
 
-STARTING_VM = 'PowerState/running'
-STOPPING_VM = 'PowerState/stopped'
-
-def manage_vm_power_state(vm_name, action):
-    action_name = "start" if action == STARTING_VM else "stop"
-    print(f"{action_name} VM: {vm_name}")
-    start_operation = compute_client.virtual_machines.begin_start(RESOURCE_GROUP_NAME, vm_name)
-    start_operation.wait()
-
-    # Poll the VM status until it is running
-    while True:
-        vm = compute_client.virtual_machines.get(RESOURCE_GROUP_NAME, vm_name, expand='instanceView')
-        statuses = vm.instance_view.statuses
-        for status in statuses:
-            if status.code == action:
-                print(f"VM {vm_name} is now {action.split('/')[1]}.")
-                return
-        print(f"Waiting for VM {vm_name} to {action_name}...")
-        sleep(10)
-
 
 
 def connect_ssh(public_ip, username, private_key_path):
@@ -148,7 +128,7 @@ def get_leader_commands(username):
     Returns the list of commands to execute on the leader VM.
     """
     commands = [
-        "sudo umount /dev/sdb1 || true",
+        "sudo umount /dev/sdb1",
         f"cd /home/{username}/rollbaccine/src",
         "sudo insmod rollbaccine.ko",
         'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 0 true 250000 abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1'
@@ -160,7 +140,7 @@ def get_follower_commands(username, private_ip_0):
     Returns the list of commands to execute on the follower VM.
     """
     commands = [
-        "sudo umount /dev/sdb1 || true",
+        "sudo umount /dev/sdb1",
         f"cd /home/{username}/rollbaccine/src",
         "sudo insmod rollbaccine.ko",
         f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 1 false 250000 abcdefghijklmnop 12350 {private_ip_0} 12340" | sudo dmsetup create rollbaccine2'
@@ -257,7 +237,7 @@ def save_to_csv(job_name, result, output_file):
 
 def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, parameters_list):
     """
-    Execute multiple fio benchmarks on the VM and retrieve the results.
+    Execute multiple FIO benchmarks on the VM and retrieve the results.
     """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -270,15 +250,15 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
             write_mode = parameters.get('write_mode', 'readwrite')
             direct = parameters.get('direct', 0)
             bs = parameters.get('bs', '4k')
-            runtime = parameters.get('runtime', 60)
-            filename = parameters.get('filename', '/dev/mapper/rollbaccine1')  # Adjust if necessary
-            output_file = f'{job_name}_fio_results.json'  # Output file on VM
+            filename = parameters.get('filename', '/dev/mapper/rollbaccine1')
+            runtime = parameters.get('runtime', 120)
+            status_interval = parameters.get('status_interval', 5)
+            ramp_time = parameters.get('ramp_time', 0)
+            output_file = f'/home/{username}/{job_name}_fio_results.json'
 
-            # Additional parameters
-            status_interval = parameters.get('status_interval', 5)  # In seconds
+            # Include size? 
 
-
-            # Construct the FIO command
+            # Build the FIO command
             fio_command = (
                 f'sudo fio '
                 f'--name={job_name} '
@@ -288,18 +268,18 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
                 f'--runtime={runtime} '
                 f'--filename={filename} '
                 f'--output-format=json '
-                f'--time_based '
                 f'--status-interval={status_interval} '
+                f'--ramp_time={ramp_time} '
             )
 
-            fio_command += f'> {output_file}'
+            fio_command += f' > {output_file}'
 
             print(f"Running FIO benchmark '{job_name}' on {vm_name}")
             print(f"FIO command: {fio_command}")
-            
+
             # Execute the FIO command on the remote VM
             stdin, stdout, stderr = ssh.exec_command(fio_command)
-            # Print status updates
+            # Monitor the output
             while not stdout.channel.exit_status_ready():
                 if stdout.channel.recv_ready():
                     output = stdout.channel.recv(1024).decode()
@@ -313,25 +293,22 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
                 print(f"FIO benchmark '{job_name}' failed on {public_ip}: {error_msg}")
                 continue  # Proceed to the next benchmark
 
-            # Retrieve the FIO result file
             local_result_dir = './results'
             os.makedirs(local_result_dir, exist_ok=True)
             local_result_path = os.path.join(local_result_dir, f'{vm_name}_{job_name}_fio_results.json')
             print(f"Retrieving FIO results for '{job_name}' from {public_ip} to {local_result_path}")
             try:
-                sftp.get(f'/home/{username}/{output_file}', local_result_path)
+                sftp.get(output_file, local_result_path)
                 print(f"FIO results for '{job_name}' saved to {local_result_path}")
-                # Load the result and save to CSV
                 with open(local_result_path, 'r') as f:
                     fio_result = json.load(f)
                 csv_output_file = os.path.join(local_result_dir, 'fio_results.csv')
-                # Check if CSV file exists; if not, create it with headers
                 if not os.path.exists(csv_output_file):
                     with open(csv_output_file, mode='w', newline='') as file:
                         writer = csv.writer(file)
                         writer.writerow([
-                            "Job Name", "FIO Job", "Read IOPS", "Read Bandwidth (KB/s)", 
-                            "Read Latency (ns)", "Write IOPS", "Write Bandwidth (KB/s)", 
+                            "Job Name", "FIO Job", "Read IOPS", "Read Bandwidth (KB/s)",
+                            "Read Latency (ns)", "Write IOPS", "Write Bandwidth (KB/s)",
                             "Write Latency (ns)"
                         ])
                 save_to_csv(job_name, fio_result, csv_output_file)
@@ -343,13 +320,11 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
         print(f"Error running FIO benchmarks on {public_ip}: {e}")
         return False
     finally:
-        sftp.close()
+        if 'sftp' in locals():
+            sftp.close()
         ssh.close()
     return True  # Indicate success
 
-# # Start all VMs
-# for vm_name in vm_ip_data.keys():
-#     manage_vm_power_state(vm_name, STARTING_VM)
 
 # Get the private IP of the leader VM
 private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
@@ -357,15 +332,51 @@ private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
 # Run commands on all VMs
 for vm_name in vm_ip_data.keys():
     is_leader = True if vm_name == 'rollbaccineNum0' else False
-    ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader)
+    ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
 
-fio_parameters_list = [{
-        'bs': '4k',
-        'write_mode': 'readwrite',
+fio_parameters_list = [
+    ####################
+    #    READ/WRITE   #
+    #####################
+
+    {
+        'name': 'benchmark_seq_read',
+        'write_mode': 'read',
+        'bs': '4k',                  
+        'size': '10G',               
         'direct': 0,
-        'runtime': 60,
-        'name': 'rollbaccine',
-    }]
+        'ramp_time': 45,                 
+    },
+    {
+        'name': 'benchmark_seq_write',
+        'write_mode': 'write',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,                 
+    },
+    {
+        'name': 'benchmark_rand_read',
+        'write_mode': 'randread',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,                 
+    },
+    {
+        'name': 'benchmark_rand_write',
+        'write_mode': 'randwrite',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,                 
+    },
+    {
+        'name': 'benchmark_randrw',
+        'write_mode': 'randrw',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,                 
+    },
+    ]
+
 
 # Run Fio on Leader
 success = run_multiple_fio_benchmarks(
@@ -376,7 +387,3 @@ success = run_multiple_fio_benchmarks(
     fio_parameters_list
 )
 print(success)
-
-# # Stop all VMs
-# for vm_name in vm_ip_data.keys():
-#     manage_vm_power_state(vm_name, STOPPING_VM)
