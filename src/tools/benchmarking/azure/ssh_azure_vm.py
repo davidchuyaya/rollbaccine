@@ -255,14 +255,39 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
             write_mode = parameters.get('write_mode', 'readwrite')
             direct = parameters.get('direct', 0)
             bs = parameters.get('bs', '4k')
-            filename = parameters.get('filename', '/dev/mapper/rollbaccine1')
-            runtime = parameters.get('runtime', 120)
+            filename = parameters.get('filename', f'/dev/mapper/rollbaccine1')
+            filename_format = parameters.get('filename_format')
+            runtime = parameters.get('runtime', 0)
             ramp_time = parameters.get('ramp_time', 0)
-            # iodepth = parameters.get('iodepth', 1)
-            # numjobs = parameters.get('numjobs', 1)
-            size = parameters.get('size', '1G')
+            iodepth = parameters.get('iodepth', 1)
+            numjobs = parameters.get('numjobs', 1)
+            size = parameters.get('size', None)
             group_reporting = parameters.get('group_reporting', True)
             output_file = f'/home/{username}/{job_name}_fio_results.json'
+
+            # Create the directory for the files
+            file_dir = os.path.dirname(filename)
+            if file_dir and file_dir != '/':
+                mkdir_command = f'mkdir -p {file_dir}'
+                print(f"Creating directory {file_dir} on {vm_name}")
+                ssh.exec_command(mkdir_command)
+
+            # Preallocate the file if necessary
+            if write_mode in ['randwrite', 'randrw', 'randread'] and os.path.basename(filename):
+                # Check if file exists
+                try:
+                    sftp.stat(filename)
+                    print(f"File {filename} already exists on {vm_name}")
+                except FileNotFoundError:
+                    # Create the file using fallocate
+                    fallocate_command = f'fallocate -l {size} {filename}'
+                    print(f"Preallocating file {filename} of size {size} on {vm_name}")
+                    stdin, stdout, stderr = ssh.exec_command(fallocate_command)
+                    exit_status = stdout.channel.recv_exit_status()
+                    if exit_status != 0:
+                        error_output = stderr.read().decode()
+                        print(f"Error creating file {filename} on {vm_name}: {error_output}")
+                        continue  # Skip this benchmark
 
             # Build the FIO command
             fio_command = (
@@ -271,25 +296,30 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
                 f'--rw={write_mode} '
                 f'--direct={direct} '
                 f'--bs={bs} '
-                f'--runtime={runtime} '
-                f'--filename={filename} '
-                f'--output-format=json '
-                f'--time_based '
-                # f'--iodepth={iodepth} '
-                # f'--numjobs={numjobs} '
-                f'--size={size} '
-                f'--ramp_time={ramp_time} '
             )
 
-            # if group_reporting:
-            #     fio_command += '--group_reporting '
+            if size:
+                fio_command += f'--size={size} '
+            if runtime > 0:
+                fio_command += f'--runtime={runtime} '
+                fio_command += f'--time_based '
+            if ramp_time > 0:
+                fio_command += f'--ramp_time={ramp_time} '
+            fio_command += f'--filename={filename} '
+            if filename_format:
+                fio_command += f'--filename_format={filename_format} '
+            fio_command += f'--output-format=json '
+            fio_command += f'--iodepth={iodepth} '
+            fio_command += f'--numjobs={numjobs} '
+            if group_reporting:
+                fio_command += '--group_reporting '
 
-            # # Handle optional parameters
-            # rwmixread = parameters.get('rwmixread')
-            # if rwmixread:
-            #     fio_command += f' --rwmixread={rwmixread} '
+            # Include additional FIO options if provided
+            additional_fio_options = parameters.get('additional_fio_options')
+            if additional_fio_options:
+                fio_command += f'{additional_fio_options} '
 
-            fio_command += f' > {output_file}'
+            fio_command += f'> {output_file}'
 
             print(f"Running FIO benchmark '{job_name}' on {vm_name}")
             print(f"FIO command: {fio_command}")
@@ -353,52 +383,117 @@ for vm_name in vm_ip_data.keys():
     is_leader = True if vm_name == 'rollbaccineNum0' else False
     ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
 
-fio_parameters_list = [
-    ####################
-    #    READ/WRITE   #
-    #####################
+# fio_parameters_list = [
+#     ####################
+#     #    READ/WRITE   #
+#     #####################
 
+#     {
+#         'name': 'benchmark_seq_read',
+#         'write_mode': 'read',
+#         'bs': '4k',                  
+#         'size': '10G',               
+#         'direct': 0,
+#         'ramp_time': 45,                 
+#     },
+#     {
+#         'name': 'benchmark_seq_write',
+#         'write_mode': 'write',
+#         'bs': '4k',                  
+#         'size': '10G',               
+#         'direct': 0,
+#         'ramp_time': 45,              
+#     },
+#     {
+#         'name': 'benchmark_rand_read',
+#         'write_mode': 'randread',
+#         'bs': '4k',                  
+#         'size': '10G',               
+#         'direct': 0,
+#         'ramp_time': 45,                  
+#     },
+#     {
+#         'name': 'benchmark_rand_write',
+#         'write_mode': 'randwrite',
+#         'bs': '4k',                  
+#         'size': '10G',               
+#         'direct': 0,
+#         'ramp_time': 45,
+#     },
+#     {
+#         'name': 'benchmark_randrw',
+#         'write_mode': 'randrw',
+#         'bs': '4k',                  
+#         'size': '10G',               
+#         'direct': 0,       
+#         'ramp_time': 45,           
+#     },
+#     ]
+
+# seq-wr-1th-1f Single thread creates and sequentially writes a new 60GB file. [rows #21–24]
+
+# seq-wr-32th-32f 32 threads sequentially write 32 new 2GB files. Each thread writes its own file. [rows #25–28]
+
+# rnd-wr-Nth-1f N threads (1, 32) randomly write to a single preallocated 60GB file. [rows #29–36]
+
+# files-cr-Nth N threads (1, 32) create 4 million 4KB files over many directories. [rows #37–38]    
+
+# TODO: update engine to use async engine?
+
+files_dir = f"/home/{USERNAME}/files"                                                                                               
+fio_parameters_list = [
+    # {
+    #     'name': 'seq_wr_1th_1f',
+    #     'write_mode': 'write',
+    #     'bs': '1M',
+    #     'size': '60G',
+    #     'direct': 1,
+    #     'filename': f'{files_dir}/new_60G_file',
+    #     'iodepth': 32,
+    #     'numjobs': 1,
+    #     'group_reporting': True,
+    #     'runtime': 0,
+    # },
+    # {
+    #     'name': 'seq_wr_32th_32f',
+    #     'write_mode': 'write',
+    #     'bs': '1M',
+    #     'size': '2G',
+    #     'direct': 1,
+    #     'filename': f'{files_dir}/seq_wr_32th_32f', 
+    #     'filename_format': f'{files_dir}/seq_wr_32th_32f.$jobnum',
+    #     'iodepth': 32,
+    #     'numjobs': 32,
+    #     'group_reporting': True,
+    #     'runtime': 0,
+    # },
+    # TODO: Revert
     {
-        'name': 'benchmark_seq_read',
-        'write_mode': 'read',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,                 
-    },
-    {
-        'name': 'benchmark_seq_write',
-        'write_mode': 'write',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,              
-    },
-    {
-        'name': 'benchmark_rand_read',
-        'write_mode': 'randread',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,                  
-    },
-    {
-        'name': 'benchmark_rand_write',
+        'name': 'rnd_wr_1th_1f',
         'write_mode': 'randwrite',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,
+        'bs': '4k',
+        'size': '3G',
+        'direct': 1,
+        'filename': f'{files_dir}/rnd_wr_1th_1f',
+        'iodepth': 5,
+        'numjobs': 1,
+        'group_reporting': True,
+        'runtime': 0,
     },
-    {
-        'name': 'benchmark_randrw',
-        'write_mode': 'randrw',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,       
-        'ramp_time': 45,           
-    },
-    ]
+    # {
+    #     'name': 'rnd_wr_32th_1f',
+    #     'write_mode': 'randwrite',
+    #     'bs': '4k',
+    #     'size': '60G',
+    #     'direct': 1,
+    #     'filename': f'{files_dir}/rnd_wr_32th_1f',
+    #     'iodepth': 32,
+    #     'numjobs': 32,
+    #     'group_reporting': True,
+    #     'runtime': 0,
+    # },
+
+]
 
 
 # Run Fio on Leader
