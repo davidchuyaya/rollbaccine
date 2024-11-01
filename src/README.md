@@ -334,3 +334,50 @@ When you're done with the VMs, delete them, replacing `rollbaccine` with the nam
 ```bash
 ./cleanup -n rollbaccine
 ```
+
+# Running on Azure
+
+## Setup
+
+Before we run the scripts in tools/benchmarking/azure, we need to create a `.env` file at the root of the repository and fill in the following variables:
+
+```bash
+AZURE_USERNAME="" # Your Azure username
+SUBSCRIPTION_ID="" # Your Azure subscription ID
+SSH_KEY="" # Your SSH public key
+PRIVATE_KEY_PATH="" # The path to your SSH private key
+BASE_PATH="" # The path to the root directory of this repository
+```
+
+
+## Launching VMs
+
+To launch VMs, run the following command:
+
+```bash
+cd tools/benchmarking/azure
+python3 setup_azure_vm.py
+```
+
+This will create a resource group, a proximity placement group, and two VMs. The VMs will be named `rollbaccineNum0` and `rollbaccineNum1`.
+
+## Running FIO benchmarks
+
+To run FIO benchmarks, run the following command:
+
+```bash
+python3 ssh_azure_vm.py
+```
+
+This will run FIO benchmarks on the two VMs and save the results to the `results` directory.
+
+## Plotting results
+
+To plot the results, run the following command:
+
+```bash
+python3 plot_fio_results.py
+```
+
+This will create a `graphs` directory and save the bar graphs to it.
+

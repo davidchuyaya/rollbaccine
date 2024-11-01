@@ -4,3 +4,5 @@ azure-mgmt-network
 azure-mgmt-resource
 paramiko
 python-dotenv
+matplotlib
+numpy

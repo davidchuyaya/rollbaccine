@@ -239,6 +239,11 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
     """
     Execute multiple FIO benchmarks on the VM and retrieve the results.
     """
+    import paramiko
+    import os
+    import json
+    import csv
+
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -252,11 +257,12 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
             bs = parameters.get('bs', '4k')
             filename = parameters.get('filename', '/dev/mapper/rollbaccine1')
             runtime = parameters.get('runtime', 120)
-            status_interval = parameters.get('status_interval', 5)
             ramp_time = parameters.get('ramp_time', 0)
+            # iodepth = parameters.get('iodepth', 1)
+            # numjobs = parameters.get('numjobs', 1)
+            size = parameters.get('size', '1G')
+            group_reporting = parameters.get('group_reporting', True)
             output_file = f'/home/{username}/{job_name}_fio_results.json'
-
-            # Include size? 
 
             # Build the FIO command
             fio_command = (
@@ -268,9 +274,20 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
                 f'--runtime={runtime} '
                 f'--filename={filename} '
                 f'--output-format=json '
-                f'--status-interval={status_interval} '
+                f'--time_based '
+                # f'--iodepth={iodepth} '
+                # f'--numjobs={numjobs} '
+                f'--size={size} '
                 f'--ramp_time={ramp_time} '
             )
+
+            # if group_reporting:
+            #     fio_command += '--group_reporting '
+
+            # # Handle optional parameters
+            # rwmixread = parameters.get('rwmixread')
+            # if rwmixread:
+            #     fio_command += f' --rwmixread={rwmixread} '
 
             fio_command += f' > {output_file}'
 
@@ -279,18 +296,20 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
 
             # Execute the FIO command on the remote VM
             stdin, stdout, stderr = ssh.exec_command(fio_command)
-            # Monitor the output
-            while not stdout.channel.exit_status_ready():
-                if stdout.channel.recv_ready():
-                    output = stdout.channel.recv(1024).decode()
-                    print(output, end='')
-                sleep(status_interval)
+
+            # Wait for the command to complete
             exit_status = stdout.channel.recv_exit_status()
+            stdout_output = stdout.read().decode()
+            stderr_output = stderr.read().decode()
+
             if exit_status == 0:
-                print(f"\nFIO benchmark '{job_name}' completed successfully on {public_ip}")
+                print(f"FIO benchmark '{job_name}' completed successfully on {public_ip}")
+                if stdout_output:
+                    print(stdout_output)
             else:
-                error_msg = stderr.read().decode().strip()
-                print(f"FIO benchmark '{job_name}' failed on {public_ip}: {error_msg}")
+                print(f"FIO benchmark '{job_name}' failed on {public_ip}")
+                if stderr_output:
+                    print(f"Error Output:\n{stderr_output}")
                 continue  # Proceed to the next benchmark
 
             local_result_dir = './results'
@@ -352,28 +371,32 @@ fio_parameters_list = [
         'write_mode': 'write',
         'bs': '4k',                  
         'size': '10G',               
-        'direct': 0,                 
+        'direct': 0,
+        'ramp_time': 45,              
     },
     {
         'name': 'benchmark_rand_read',
         'write_mode': 'randread',
         'bs': '4k',                  
         'size': '10G',               
-        'direct': 0,                 
+        'direct': 0,
+        'ramp_time': 45,                  
     },
     {
         'name': 'benchmark_rand_write',
         'write_mode': 'randwrite',
         'bs': '4k',                  
         'size': '10G',               
-        'direct': 0,                 
+        'direct': 0,
+        'ramp_time': 45,
     },
     {
         'name': 'benchmark_randrw',
         'write_mode': 'randrw',
         'bs': '4k',                  
         'size': '10G',               
-        'direct': 0,                 
+        'direct': 0,       
+        'ramp_time': 45,           
     },
     ]
 
