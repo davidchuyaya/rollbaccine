@@ -263,9 +263,14 @@ def run_everything(fio_parameters_list, is_rollbaccine=True):
     )
     print("FIO benchmarks completed:", success)
 
-    # Run delete_azure_vm.py to delete resources
+    # Run delete_azure_vm.py to create resources
     print("Running delete_azure_vm.py to delete Azure VMs")
-    subprocess.run(['python3', 'delete_azure_vm.py'])
+    try:
+        subprocess.run(['python3', 'delete_azure_vm.py'], check=True)
+        print("Azure VMs setup completed successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"Error deleting Azure VMs: {e}")
+        return  # Exit the function if deletion fails
 
 
 
