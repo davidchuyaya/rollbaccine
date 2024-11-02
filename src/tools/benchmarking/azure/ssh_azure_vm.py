@@ -6,7 +6,7 @@ import paramiko
 from dotenv import load_dotenv
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
-from time import sleep
+from fio_utils import is_fio_installed, install_fio, run_multiple_fio_benchmarks
 
 load_dotenv()
 
@@ -72,30 +72,6 @@ def install_rollbaccine(ssh, username, script_path):
     stdin, stdout, stderr = ssh.exec_command(f'sudo {remote_script_path}')
     for line in stdout.read().splitlines():
         print(line.decode())
-
-def is_fio_installed(ssh):
-    """
-    Checks if fio is installed on the remote machine.
-    """
-    stdin, stdout, stderr = ssh.exec_command('which fio')
-    fio_path = stdout.read().decode().strip()
-    return fio_path != ''
-
-def install_fio(ssh):
-    """
-    Installs fio on the remote machine.
-    """
-    install_fio_commands = [
-        "sudo apt-get update",
-        "sudo apt-get install -y fio"
-    ]
-    for cmd in install_fio_commands:
-        stdin, stdout, stderr = ssh.exec_command(cmd)
-        exit_status = stdout.channel.recv_exit_status()
-        if exit_status != 0:
-            print(f"Error running command '{cmd}': {stderr.read().decode().strip()}")
-            return False
-    return True
 
 def is_python3_installed(ssh):
     """
@@ -212,223 +188,141 @@ def ssh_and_execute(public_ip, username, private_key_path, script_path, is_leade
 
     run_commands_on_vm(compute_client, resource_group_name, vm_name, commands)
 
-# Function to save the result to a CSV file
-def save_to_csv(job_name, result, output_file):
-    # Extract relevant performance data from fio output
-    jobs = result.get("jobs", [])
-    if not jobs:
-        print(f"No jobs found in fio output")
-        return
-    
-    with open(output_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        for job in jobs:
-            row = [
-                job_name,
-                job["jobname"],
-                job["read"]["iops"],
-                job["read"]["bw"],
-                job["read"]["lat_ns"]["mean"],
-                job["write"]["iops"],
-                job["write"]["bw"],
-                job["write"]["lat_ns"]["mean"]
-            ]
-            writer.writerow(row)
-
-def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, parameters_list):
+def ssh_and_execute_normal_disk(public_ip, username, private_key_path, vm_name):
     """
-    Execute multiple FIO benchmarks on the VM and retrieve the results.
+    Connects to the VM via SSH and ensures that fio and Python 3 are installed.
     """
-    import paramiko
-    import os
-    import json
-    import csv
-
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh = connect_ssh(public_ip, username, private_key_path)
+    except Exception as e:
+        print(f"Failed to connect to {public_ip}: {e}")
+        return False
 
     try:
-        ssh.connect(public_ip, username=username, key_filename=private_key_path)
-        sftp = ssh.open_sftp()
-        for idx, parameters in enumerate(parameters_list):
-            job_name = parameters.get('name', f'benchmark_{vm_name}_{idx}')
-            write_mode = parameters.get('write_mode', 'readwrite')
-            direct = parameters.get('direct', 0)
-            bs = parameters.get('bs', '4k')
-            filename = parameters.get('filename', f'/dev/mapper/rollbaccine1')
-            filename_format = parameters.get('filename_format')
-            runtime = parameters.get('runtime', 0)
-            ramp_time = parameters.get('ramp_time', 0)
-            iodepth = parameters.get('iodepth', 1)
-            numjobs = parameters.get('numjobs', 1)
-            size = parameters.get('size', None)
-            group_reporting = parameters.get('group_reporting', True)
-            output_file = f'/home/{username}/{job_name}_fio_results.json'
+        print(f"Checking if fio is installed on {public_ip}")
+        if not is_fio_installed(ssh):
+            print(f"fio not found on {public_ip}. Installing fio...")
+            if not install_fio(ssh):
+                ssh.close()
+                return False
+            print(f"fio installed on {public_ip}")
+        else:
+            print(f"fio is already installed on {public_ip}")
 
-            # Create the directory for the files
-            file_dir = os.path.dirname(filename)
-            if file_dir and file_dir != '/':
-                mkdir_command = f'mkdir -p {file_dir}'
-                print(f"Creating directory {file_dir} on {vm_name}")
-                ssh.exec_command(mkdir_command)
+        print(f"Checking if Python 3 is installed on {public_ip}")
+        if not is_python3_installed(ssh):
+            print(f"Python 3 not found on {public_ip}. Installing Python 3...")
+            if not install_python3(ssh):
+                ssh.close()
+                return False
+            print(f"Python 3 installed successfully on {public_ip}")
+        else:
+            print(f"Python 3 is already installed on {public_ip}")
 
-            # Preallocate the file if necessary
-            if write_mode in ['randwrite', 'randrw', 'randread'] and os.path.basename(filename):
-                # Check if file exists
-                try:
-                    sftp.stat(filename)
-                    print(f"File {filename} already exists on {vm_name}")
-                except FileNotFoundError:
-                    # Create the file using fallocate
-                    fallocate_command = f'fallocate -l {size} {filename}'
-                    print(f"Preallocating file {filename} of size {size} on {vm_name}")
-                    stdin, stdout, stderr = ssh.exec_command(fallocate_command)
-                    exit_status = stdout.channel.recv_exit_status()
-                    if exit_status != 0:
-                        error_output = stderr.read().decode()
-                        print(f"Error creating file {filename} on {vm_name}: {error_output}")
-                        continue  # Skip this benchmark
-
-            # Build the FIO command
-            fio_command = (
-                f'sudo fio '
-                f'--name={job_name} '
-                f'--rw={write_mode} '
-                f'--direct={direct} '
-                f'--bs={bs} '
-            )
-
-            if size:
-                fio_command += f'--size={size} '
-            if runtime > 0:
-                fio_command += f'--runtime={runtime} '
-                fio_command += f'--time_based '
-            if ramp_time > 0:
-                fio_command += f'--ramp_time={ramp_time} '
-            fio_command += f'--filename={filename} '
-            if filename_format:
-                fio_command += f'--filename_format={filename_format} '
-            fio_command += f'--output-format=json '
-            fio_command += f'--iodepth={iodepth} '
-            fio_command += f'--numjobs={numjobs} '
-            if group_reporting:
-                fio_command += '--group_reporting '
-
-            # Include additional FIO options if provided
-            additional_fio_options = parameters.get('additional_fio_options')
-            if additional_fio_options:
-                fio_command += f'{additional_fio_options} '
-
-            fio_command += f'> {output_file}'
-
-            print(f"Running FIO benchmark '{job_name}' on {vm_name}")
-            print(f"FIO command: {fio_command}")
-
-            # Execute the FIO command on the remote VM
-            stdin, stdout, stderr = ssh.exec_command(fio_command)
-
-            # Wait for the command to complete
-            exit_status = stdout.channel.recv_exit_status()
-            stdout_output = stdout.read().decode()
-            stderr_output = stderr.read().decode()
-
-            if exit_status == 0:
-                print(f"FIO benchmark '{job_name}' completed successfully on {public_ip}")
-                if stdout_output:
-                    print(stdout_output)
-            else:
-                print(f"FIO benchmark '{job_name}' failed on {public_ip}")
-                if stderr_output:
-                    print(f"Error Output:\n{stderr_output}")
-                continue  # Proceed to the next benchmark
-
-            local_result_dir = './results'
-            os.makedirs(local_result_dir, exist_ok=True)
-            local_result_path = os.path.join(local_result_dir, f'{vm_name}_{job_name}_fio_results.json')
-            print(f"Retrieving FIO results for '{job_name}' from {public_ip} to {local_result_path}")
-            try:
-                sftp.get(output_file, local_result_path)
-                print(f"FIO results for '{job_name}' saved to {local_result_path}")
-                with open(local_result_path, 'r') as f:
-                    fio_result = json.load(f)
-                csv_output_file = os.path.join(local_result_dir, 'fio_results.csv')
-                if not os.path.exists(csv_output_file):
-                    with open(csv_output_file, mode='w', newline='') as file:
-                        writer = csv.writer(file)
-                        writer.writerow([
-                            "Job Name", "FIO Job", "Read IOPS", "Read Bandwidth (KB/s)",
-                            "Read Latency (ns)", "Write IOPS", "Write Bandwidth (KB/s)",
-                            "Write Latency (ns)"
-                        ])
-                save_to_csv(job_name, fio_result, csv_output_file)
-                print(f"Results for '{job_name}' saved to {csv_output_file}")
-            except Exception as e:
-                print(f"Error retrieving FIO results for '{job_name}' from {public_ip}: {e}")
-                continue  # Proceed to the next benchmark
-    except Exception as e:
-        print(f"Error running FIO benchmarks on {public_ip}: {e}")
-        return False
     finally:
-        if 'sftp' in locals():
-            sftp.close()
         ssh.close()
-    return True  # Indicate success
+
+def run_everything(fio_parameters_list, is_rollbaccine=True):
+    """
+    Function to set up Azure VMs, run FIO benchmarks on normal disk, and then delete the VMs.
+    """
+    import subprocess
+    import json
+    import time
+
+    # Run setup_azure_vm.py to create resources
+    print("Running setup_azure_vm.py to create Azure VMs")
+    try:
+        subprocess.run(['python3', 'setup_azure_vm.py'], check=True)
+        print("Azure VMs setup completed successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"Error setting up Azure VMs: {e}")
+        return  # Exit the function if setup fails
+
+    # Load vm_ip_data from 'vm_ips.json' generated by setup_azure_vm.py
+    with open('vm_ips.json') as f:
+        vm_ip_data = json.load(f)
+
+    # Run ssh_and_execute_normal_disk on all VMs
+    for vm_name in vm_ip_data.keys():
+        if is_rollbaccine:
+            private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
+            is_leader = True if vm_name == 'rollbaccineNum0' else False
+            ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
+        else:
+            ssh_and_execute_normal_disk(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, vm_name)
+
+    # Run FIO benchmarks
+    success = run_multiple_fio_benchmarks(
+        vm_ip_data['rollbaccineNum0']['public_ip'],
+        USERNAME,
+        PRIVATE_KEY_PATH,
+        'rollbaccineNum0',
+        fio_parameters_list,
+        is_rollbaccine
+    )
+    print("FIO benchmarks completed:", success)
+
+    # Run delete_azure_vm.py to delete resources
+    print("Running delete_azure_vm.py to delete Azure VMs")
+    subprocess.run(['python3', 'delete_azure_vm.py'])
 
 
-# Get the private IP of the leader VM
-private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
+
+# # Get the private IP of the leader VM
+# private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
 
 # Run commands on all VMs
-for vm_name in vm_ip_data.keys():
-    is_leader = True if vm_name == 'rollbaccineNum0' else False
-    ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
+# for vm_name in vm_ip_data.keys():
+#     is_leader = True if vm_name == 'rollbaccineNum0' else False
+#     ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
 
-# fio_parameters_list = [
-#     ####################
-#     #    READ/WRITE   #
-#     #####################
+fio_parameters_list = [
+    ####################
+    #    READ/WRITE   #
+    #####################
 
-#     {
-#         'name': 'benchmark_seq_read',
-#         'write_mode': 'read',
-#         'bs': '4k',                  
-#         'size': '10G',               
-#         'direct': 0,
-#         'ramp_time': 45,                 
-#     },
-#     {
-#         'name': 'benchmark_seq_write',
-#         'write_mode': 'write',
-#         'bs': '4k',                  
-#         'size': '10G',               
-#         'direct': 0,
-#         'ramp_time': 45,              
-#     },
-#     {
-#         'name': 'benchmark_rand_read',
-#         'write_mode': 'randread',
-#         'bs': '4k',                  
-#         'size': '10G',               
-#         'direct': 0,
-#         'ramp_time': 45,                  
-#     },
-#     {
-#         'name': 'benchmark_rand_write',
-#         'write_mode': 'randwrite',
-#         'bs': '4k',                  
-#         'size': '10G',               
-#         'direct': 0,
-#         'ramp_time': 45,
-#     },
-#     {
-#         'name': 'benchmark_randrw',
-#         'write_mode': 'randrw',
-#         'bs': '4k',                  
-#         'size': '10G',               
-#         'direct': 0,       
-#         'ramp_time': 45,           
-#     },
-#     ]
+    {
+        'name': 'benchmark_seq_read',
+        'write_mode': 'read',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,
+        'ramp_time': 45,                 
+    },
+    {
+        'name': 'benchmark_seq_write',
+        'write_mode': 'write',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,
+        'ramp_time': 45,              
+    },
+    {
+        'name': 'benchmark_rand_read',
+        'write_mode': 'randread',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,
+        'ramp_time': 45,                  
+    },
+    {
+        'name': 'benchmark_rand_write',
+        'write_mode': 'randwrite',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,
+        'ramp_time': 45,
+    },
+    {
+        'name': 'benchmark_randrw',
+        'write_mode': 'randrw',
+        'bs': '4k',                  
+        'size': '10G',               
+        'direct': 0,       
+        'ramp_time': 45,           
+    },
+    ]
 
 # seq-wr-1th-1f Single thread creates and sequentially writes a new 60GB file. [rows #21–24]
 
@@ -440,68 +334,59 @@ for vm_name in vm_ip_data.keys():
 
 # TODO: update engine to use async engine?
 
-files_dir = f"/home/{USERNAME}/files"                                                                                               
-fio_parameters_list = [
-    # {
-    #     'name': 'seq_wr_1th_1f',
-    #     'write_mode': 'write',
-    #     'bs': '1M',
-    #     'size': '60G',
-    #     'direct': 1,
-    #     'filename': f'{files_dir}/new_60G_file',
-    #     'iodepth': 32,
-    #     'numjobs': 1,
-    #     'group_reporting': True,
-    #     'runtime': 0,
-    # },
-    # {
-    #     'name': 'seq_wr_32th_32f',
-    #     'write_mode': 'write',
-    #     'bs': '1M',
-    #     'size': '2G',
-    #     'direct': 1,
-    #     'filename': f'{files_dir}/seq_wr_32th_32f', 
-    #     'filename_format': f'{files_dir}/seq_wr_32th_32f.$jobnum',
-    #     'iodepth': 32,
-    #     'numjobs': 32,
-    #     'group_reporting': True,
-    #     'runtime': 0,
-    # },
-    # TODO: Revert
-    {
-        'name': 'rnd_wr_1th_1f',
-        'write_mode': 'randwrite',
-        'bs': '4k',
-        'size': '3G',
-        'direct': 1,
-        'filename': f'{files_dir}/rnd_wr_1th_1f',
-        'iodepth': 5,
-        'numjobs': 1,
-        'group_reporting': True,
-        'runtime': 0,
-    },
-    # {
-    #     'name': 'rnd_wr_32th_1f',
-    #     'write_mode': 'randwrite',
-    #     'bs': '4k',
-    #     'size': '60G',
-    #     'direct': 1,
-    #     'filename': f'{files_dir}/rnd_wr_32th_1f',
-    #     'iodepth': 32,
-    #     'numjobs': 32,
-    #     'group_reporting': True,
-    #     'runtime': 0,
-    # },
+# files_dir = f"/home/{USERNAME}/files"                                                                                               
+# fio_parameters_list = [
+#     # {
+#     #     'name': 'seq_wr_1th_1f',
+#     #     'write_mode': 'write',
+#     #     'bs': '1M',
+#     #     'size': '60G',
+#     #     'direct': 1,
+#     #     'filename': f'{files_dir}/new_60G_file',
+#     #     'iodepth': 32,
+#     #     'numjobs': 1,
+#     #     'group_reporting': True,
+#     #     'runtime': 0,
+#     # },
+#     # {
+#     #     'name': 'seq_wr_32th_32f',
+#     #     'write_mode': 'write',
+#     #     'bs': '1M',
+#     #     'size': '2G',
+#     #     'direct': 1,
+#     #     'filename': f'{files_dir}/seq_wr_32th_32f', 
+#     #     'filename_format': f'{files_dir}/seq_wr_32th_32f.$jobnum',
+#     #     'iodepth': 32,
+#     #     'numjobs': 32,
+#     #     'group_reporting': True,
+#     #     'runtime': 0,
+#     # },
+#     # TODO: Revert
+#     {
+#         'name': 'rnd_wr_1th_1f',
+#         'write_mode': 'randwrite',
+#         'bs': '4k',
+#         'size': '3G',
+#         'direct': 1,
+#         'filename': f'{files_dir}/rnd_wr_1th_1f',
+#         'iodepth': 5,
+#         'numjobs': 1,
+#         'group_reporting': True,
+#         'runtime': 0,
+#     },
+#     # {
+#     #     'name': 'rnd_wr_32th_1f',
+#     #     'write_mode': 'randwrite',
+#     #     'bs': '4k',
+#     #     'size': '60G',
+#     #     'direct': 1,
+#     #     'filename': f'{files_dir}/rnd_wr_32th_1f',
+#     #     'iodepth': 32,
+#     #     'numjobs': 32,
+#     #     'group_reporting': True,
+#     #     'runtime': 0,
+#     # },
 
-]
+# ]
 
-
-# Run Fio on Leader
-success = run_multiple_fio_benchmarks(
-    vm_ip_data['rollbaccineNum0']['public_ip'],
-    USERNAME,
-    PRIVATE_KEY_PATH,
-    'rollbaccineNum0',
-    fio_parameters_list
-)
-print(success)
+run_everything(fio_parameters_list, is_rollbaccine=False)
