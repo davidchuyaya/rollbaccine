@@ -55,6 +55,11 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
     Execute multiple FIO benchmarks on the VM and retrieve the results.
     """
     try:
+        import paramiko
+        import os
+        import json
+        import csv
+
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(public_ip, username=username, key_filename=private_key_path)
@@ -62,7 +67,7 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
 
         for parameters in parameters_list:
             job_name = parameters['name']
-            if is_rollbaccine:
+            if not is_rollbaccine:
                 job_name = "normal_disk_" + job_name
             write_mode = parameters['write_mode']
             bs = parameters['bs']
@@ -78,29 +83,12 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
 
             output_file = f'/home/{username}/{job_name}_fio_results.json'
 
-            # Create the directory for the files
+            # Create the directory for the files if necessary
             file_dir = os.path.dirname(filename)
             if file_dir and file_dir != '/':
                 mkdir_command = f'mkdir -p {file_dir}'
                 print(f"Creating directory {file_dir} on {vm_name}")
                 ssh.exec_command(mkdir_command)
-
-            # Preallocate the file if necessary
-            if write_mode in ['randwrite', 'randrw', 'randread'] and os.path.basename(filename):
-                # Check if file exists
-                try:
-                    sftp.stat(filename)
-                    print(f"File {filename} already exists on {vm_name}")
-                except FileNotFoundError:
-                    # Create the file using fallocate
-                    fallocate_command = f'fallocate -l {size} {filename}'
-                    print(f"Preallocating file {filename} of size {size} on {vm_name}")
-                    stdin, stdout, stderr = ssh.exec_command(fallocate_command)
-                    exit_status = stdout.channel.recv_exit_status()
-                    if exit_status != 0:
-                        error_output = stderr.read().decode()
-                        print(f"Error creating file {filename} on {vm_name}: {error_output}")
-                        continue  # Skip this benchmark
 
             # Build the FIO command
             fio_command = (
