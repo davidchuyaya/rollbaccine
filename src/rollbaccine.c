@@ -1484,6 +1484,7 @@ int ack_fsync(void *args) {
             metadata.bal = device->bal;
             metadata.sender_id = device->id;
             metadata.sender_socket_id = socket_data->sender_socket_id;
+            metadata.recipient_id = multisocket->sender_id;
             metadata.msg_index = socket_data->last_sent_msg_index++;
             metadata.write_index = last_sent_fsync;
             hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
