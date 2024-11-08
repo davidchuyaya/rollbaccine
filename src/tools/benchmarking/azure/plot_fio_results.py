@@ -36,9 +36,11 @@ def extract_performance_data(results):
         read_iops = job_data['read']['iops']
         read_bw = job_data['read']['bw']  # Bandwidth in KB/s
         read_lat = job_data['read']['lat_ns']['mean'] / 1000  # Convert to microseconds
+        read_throughput = job_data['read']['bw_bytes'] / (1024 * 1024)  # Convert to MB/s
         write_iops = job_data['write']['iops']
         write_bw = job_data['write']['bw']  # Bandwidth in KB/s
         write_lat = job_data['write']['lat_ns']['mean'] / 1000  # Convert to microseconds
+        write_throughput = job_data['write']['bw_bytes'] / (1024 * 1024)  # Convert to MB/s
 
         if base_job_name not in performance_data:
             performance_data[base_job_name] = {}
@@ -47,9 +49,11 @@ def extract_performance_data(results):
             'read_iops': read_iops,
             'read_bw': read_bw,
             'read_lat_us': read_lat,
+            'read_throughput_mbs': read_throughput,
             'write_iops': write_iops,
             'write_bw': write_bw,
-            'write_lat_us': write_lat
+            'write_lat_us': write_lat,
+            'write_throughput_mbs': write_throughput
         }
     return performance_data
 
@@ -184,6 +188,24 @@ def main():
         title='Write Latency per FIO Job',
         ylabel='Latency (μs)',
         output_file=os.path.join(output_dir, 'write_latency_grouped_bar_graph.png')
+    )
+
+    # Plot Read Throughput
+    plot_grouped_bar_graph(
+        performance_data,
+        metric='read_throughput_mbs',
+        title='Read Throughput per FIO Job',
+        ylabel='Throughput (MB/s)',
+        output_file=os.path.join(output_dir, 'read_throughput_grouped_bar_graph.png')
+    )
+
+    # Plot Write Throughput
+    plot_grouped_bar_graph(
+        performance_data,
+        metric='write_throughput_mbs',
+        title='Write Throughput per FIO Job',
+        ylabel='Throughput (MB/s)',
+        output_file=os.path.join(output_dir, 'write_throughput_grouped_bar_graph.png')
     )
 
 if __name__ == "__main__":

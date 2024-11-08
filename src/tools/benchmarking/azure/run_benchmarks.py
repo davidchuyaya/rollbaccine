@@ -399,5 +399,5 @@ fio_parameters_list = [
 #     # },
 
 # ]
-#run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=False)
-run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True)
+run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=False)
+#run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True)
