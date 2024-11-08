@@ -50,23 +50,20 @@ def save_to_csv(job_name, result, output_file):
             ]
             writer.writerow(row)
 
-def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, parameters_list, is_rollbaccine):
+def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, parameters_template, numjobs_list, is_rollbaccine):
     """
-    Execute multiple FIO benchmarks on the VM and retrieve the results.
+    Executes FIO benchmarks with varying numbers of threads on the VM and retrieves the results.
     """
     try:
-        import paramiko
-        import os
-        import json
-        import csv
-
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(public_ip, username=username, key_filename=private_key_path)
         sftp = ssh.open_sftp()
 
-        for parameters in parameters_list:
-            job_name = parameters['name']
+        for numjobs in numjobs_list:
+            parameters = parameters_template.copy()
+            parameters['numjobs'] = numjobs
+            job_name = f"{parameters['name']}_threads_{numjobs}"
             if not is_rollbaccine:
                 job_name = "normal_disk_" + job_name
             write_mode = parameters['write_mode']
@@ -78,7 +75,6 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
             filename = parameters.get('filename', '/tmp/fio_test_file')
             filename_format = parameters.get('filename_format', '')
             iodepth = parameters.get('iodepth', 1)
-            numjobs = parameters.get('numjobs', 1)
             group_reporting = parameters.get('group_reporting', False)
 
             output_file = f'/home/{username}/{job_name}_fio_results.json'
@@ -152,7 +148,8 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
                 print(f"FIO results for '{job_name}' saved to {local_result_path}")
                 with open(local_result_path, 'r') as f:
                     fio_result = json.load(f)
-                csv_output_file = os.path.join(local_result_dir, f'{job_name}_fio_results.csv')
+                disk_type = "normal_disk" if not is_rollbaccine else "rollbaccine"
+                csv_output_file = os.path.join(local_result_dir, f'{disk_type}_{parameters["name"]}_fio_results.csv')
                 if not os.path.exists(csv_output_file):
                     with open(csv_output_file, mode='w', newline='') as file:
                         writer = csv.writer(file)

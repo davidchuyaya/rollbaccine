@@ -156,25 +156,26 @@ def ssh_and_execute(public_ip, username, private_key_path, script_path, is_leade
             print(f"Installing rollbaccine on {public_ip}")
             install_rollbaccine(ssh, username, script_path)
         
-        print(f"Checking if fio is installed on {public_ip}")
-        if not is_fio_installed(ssh):
-            print(f"fio not found on {public_ip}. Installing fio...")
-            if not install_fio(ssh):
-                ssh.close()
-                return False
-            print(f"fio installed on {public_ip}")
-        else:
-            print(f"fio is already installed on {public_ip}")
-        
-        print(f"Checking if Python 3 is installed on {public_ip}")
-        if not is_python3_installed(ssh):
-            print(f"Python 3 not found on {public_ip}. Installing Python 3...")
-            if not install_python3(ssh):
-                ssh.close()
-                return False
-            print(f"Python 3 installed successfully on {public_ip}")
-        else:
-            print(f"Python 3 is already installed on {public_ip}")
+        if is_leader:
+            print(f"Checking if fio is installed on {public_ip}")
+            if not is_fio_installed(ssh):
+                print(f"fio not found on {public_ip}. Installing fio...")
+                if not install_fio(ssh):
+                    ssh.close()
+                    return False
+                print(f"fio installed on {public_ip}")
+            else:
+                print(f"fio is already installed on {public_ip}")
+            
+            print(f"Checking if Python 3 is installed on {public_ip}")
+            if not is_python3_installed(ssh):
+                print(f"Python 3 not found on {public_ip}. Installing Python 3...")
+                if not install_python3(ssh):
+                    ssh.close()
+                    return False
+                print(f"Python 3 installed successfully on {public_ip}")
+            else:
+                print(f"Python 3 is already installed on {public_ip}")
         
     finally:
         ssh.close()
@@ -222,7 +223,7 @@ def ssh_and_execute_normal_disk(public_ip, username, private_key_path, vm_name):
     finally:
         ssh.close()
 
-def run_everything(fio_parameters_list, is_rollbaccine=True):
+def run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True):
     """
     Function to set up Azure VMs, run FIO benchmarks on normal disk, and then delete the VMs.
     """
@@ -253,15 +254,17 @@ def run_everything(fio_parameters_list, is_rollbaccine=True):
             ssh_and_execute_normal_disk(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, vm_name)
 
     # Run FIO benchmarks
-    success = run_multiple_fio_benchmarks(
-        vm_ip_data['rollbaccineNum0']['public_ip'],
-        USERNAME,
-        PRIVATE_KEY_PATH,
-        'rollbaccineNum0',
-        fio_parameters_list,
-        is_rollbaccine
-    )
-    print("FIO benchmarks completed:", success)
+    for fio_parameters_template in fio_parameters_list:
+        success = run_multiple_fio_benchmarks(
+            vm_ip_data['rollbaccineNum0']['public_ip'],
+            USERNAME,
+            PRIVATE_KEY_PATH,
+            'rollbaccineNum0',
+            fio_parameters_template,
+            numjobs_list,
+            is_rollbaccine
+        )
+        print(f"FIO benchmarks for '{fio_parameters_template['name']}' completed:", success)
 
     # Run delete_azure_vm.py to create resources
     print("Running delete_azure_vm.py to delete Azure VMs")
@@ -281,6 +284,9 @@ def run_everything(fio_parameters_list, is_rollbaccine=True):
 # for vm_name in vm_ip_data.keys():
 #     is_leader = True if vm_name == 'rollbaccineNum0' else False
 #     ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
+
+# Define the list of numjobs (thread counts) you want to test
+numjobs_list = [1, 2, 4, 8]
 
 fio_parameters_list = [
     ####################
@@ -393,5 +399,5 @@ fio_parameters_list = [
 #     # },
 
 # ]
-run_everything(fio_parameters_list, is_rollbaccine=False)
-run_everything(fio_parameters_list, is_rollbaccine=True)
+#run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=False)
+run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True)
