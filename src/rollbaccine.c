@@ -624,6 +624,9 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
         if (device->max_replica_fsync_index < follower_fsync_index) {
             device->max_replica_fsync_index = follower_fsync_index;
             max_index_changed = true;
+#ifdef MEMORY_TRACKING
+            device->last_acked_fsync_index = follower_fsync_index;
+#endif
         }
     }
     // Otherwise, find the largest fsync index that a quorum agrees to
@@ -1482,7 +1485,9 @@ int ack_fsync(void *args) {
         }
         last_sent_fsync = device->write_index;
         mutex_unlock(&device->index_lock);
+#ifdef MEMORY_TRACKING
         device->last_acked_fsync_index = last_sent_fsync;
+#endif
 
         down_read(&device->connected_sockets_sem);
         // TODO: Should only ack fsync to the primary
@@ -2049,8 +2054,8 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
     DMEMIT("Max bios on submit queue: %d\n", atomic_read(&device->max_submit_bio_queue_size));
+    DMEMIT("Last ACK'd fsync index: %d\n", device->last_acked_fsync_index);
     if (!device->is_leader) {
-        DMEMIT("Last ACK'd fsync index: %d\n", device->last_acked_fsync_index);
         DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
         DMEMIT("Max distance between bios in pending bio ring: %d\n", atomic_read(&device->max_distance_between_bios_in_pending_bio_ring));
         DMEMIT("Max bios on replica disk end io queue: %d\n", atomic_read(&device->max_replica_disk_end_io_queue_size));
