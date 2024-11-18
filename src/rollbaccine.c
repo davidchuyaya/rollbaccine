@@ -1376,8 +1376,8 @@ int submit_pending_bio_ring_prefix(void *args) {
     struct bio_list submit_queue;
     struct bio *bio_to_submit;
     struct blk_plug plug; // Used to merge bios
-    bool no_conflict, should_ack_fsync, bios_between_plug;
-    int signal, curr_head;
+    bool no_conflict, should_ack_fsync;
+    int signal, curr_head, bios_between_plug;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
