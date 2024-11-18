@@ -663,10 +663,10 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
             bio_write_index = bio->bi_private;
             if (bio_write_index <= device->max_replica_fsync_index) {
                 // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
-                // Ack the fsync to the user
-                ack_bio_to_user_without_executing(bio);
                 // Remove from queue
                 bio_list_pop(&device->fsyncs_pending_replication);
+                // Ack the fsync to the user
+                ack_bio_to_user_without_executing(bio);
 #ifdef MEMORY_TRACKING
                 device->num_fsyncs_pending_replication -= 1;
 #endif
