@@ -75,7 +75,8 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
             filename = parameters.get('filename', '/tmp/fio_test_file')
             filename_format = parameters.get('filename_format', '')
             iodepth = parameters.get('iodepth', 1)
-            group_reporting = parameters.get('group_reporting', False)
+            group_reporting = parameters.get('group_reporting', True)
+            fsync = parameters.get('fsync', 0)
 
             output_file = f'/home/{username}/{job_name}_fio_results.json'
 
@@ -110,6 +111,8 @@ def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, 
             fio_command += f'--numjobs={numjobs} '
             if group_reporting:
                 fio_command += '--group_reporting '
+            if fsync == 1:
+                fio_command += '--fsync=1 '
 
             # Include additional FIO options if provided
             additional_fio_options = parameters.get('additional_fio_options')

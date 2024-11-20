@@ -3,11 +3,11 @@ import csv
 import os
 import json
 import paramiko
+import itertools
 from dotenv import load_dotenv
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
 from fio_utils import is_fio_installed, install_fio, run_multiple_fio_benchmarks
-
 load_dotenv()
 
 username = os.getenv('AZURE_USERNAME')
@@ -225,7 +225,7 @@ def ssh_and_execute_normal_disk(public_ip, username, private_key_path, vm_name):
 
 def run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True):
     """
-    Function to set up Azure VMs, run FIO benchmarks on normal disk, and then delete the VMs.
+    Function to set up Azure VMs, run FIO benchmarks, and then delete the VMs.
     """
     import subprocess
     import json
@@ -244,7 +244,7 @@ def run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True):
     with open('vm_ips.json') as f:
         vm_ip_data = json.load(f)
 
-    # Run ssh_and_execute_normal_disk on all VMs
+    # Run ssh_and_execute on all VMs
     for vm_name in vm_ip_data.keys():
         if is_rollbaccine:
             private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
@@ -266,138 +266,56 @@ def run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True):
         )
         print(f"FIO benchmarks for '{fio_parameters_template['name']}' completed:", success)
 
-    # Run delete_azure_vm.py to create resources
+    # Run delete_azure_vm.py to delete resources
     print("Running delete_azure_vm.py to delete Azure VMs")
     try:
         subprocess.run(['python3', 'delete_azure_vm.py'], check=True)
-        print("Azure VMs setup completed successfully")
+        print("Azure VMs deleted successfully")
     except subprocess.CalledProcessError as e:
         print(f"Error deleting Azure VMs: {e}")
         return  # Exit the function if deletion fails
 
+# Possible values for each parameter
+io_directions = ['read', 'write']
+sequentialities = ['seq', 'rand']
+bufferings = [1, 0]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
+persistences = [1, 0]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
 
+# Generate all permutations
+all_combinations = list(itertools.product(io_directions, sequentialities, bufferings, persistences))
 
-# # Get the private IP of the leader VM
-# private_ip_0 = vm_ip_data['rollbaccineNum0']['private_ip']
+fio_parameters_list = []
 
-# Run commands on all VMs
-# for vm_name in vm_ip_data.keys():
-#     is_leader = True if vm_name == 'rollbaccineNum0' else False
-#     ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
+for io_direction, sequentiality, direct_io, fsync in all_combinations:
+    # Construct the 'rw' parameter for FIO
+    if sequentiality == 'seq':
+        rw = io_direction
+    else:
+        rw = 'rand' + io_direction
+
+    # Build the fio parameter dictionary
+    fio_param = {
+        'name': f'{sequentiality}_{io_direction}_direct{direct_io}_fsync{fsync}',
+        'write_mode': rw,
+        'bs': '4k',
+        'size': '10G',
+        'direct': direct_io,
+        'ramp_time': 45,
+        'iodepth': 1,  # Default iodepth
+        'group_reporting': True,
+    }
+
+    # Add fsync parameter if persistence is required
+    if fsync == 1:
+        fio_param['fsync'] = 1  # Issue fsync after each write
+
+    fio_parameters_list.append(fio_param)
 
 # Define the list of numjobs (thread counts) you want to test
-numjobs_list = [1, 2, 4, 8]
+numjobs_list = [1, 2, 4, 8, 16]
 
-fio_parameters_list = [
-    ####################
-    #    READ/WRITE   #
-    #####################
+# Run benchmarks on Rollbaccine
+# run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True)
 
-    {
-        'name': 'benchmark_seq_read',
-        'write_mode': 'read',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,                 
-    },
-    {
-        'name': 'benchmark_seq_write',
-        'write_mode': 'write',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,              
-    },
-    {
-        'name': 'benchmark_rand_read',
-        'write_mode': 'randread',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,                  
-    },
-    {
-        'name': 'benchmark_rand_write',
-        'write_mode': 'randwrite',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,
-        'ramp_time': 45,
-    },
-    {
-        'name': 'benchmark_randrw',
-        'write_mode': 'randrw',
-        'bs': '4k',                  
-        'size': '10G',               
-        'direct': 0,       
-        'ramp_time': 45,           
-    },
-    ]
-
-# seq-wr-1th-1f Single thread creates and sequentially writes a new 60GB file. [rows #21–24]
-
-# seq-wr-32th-32f 32 threads sequentially write 32 new 2GB files. Each thread writes its own file. [rows #25–28]
-
-# rnd-wr-Nth-1f N threads (1, 32) randomly write to a single preallocated 60GB file. [rows #29–36]
-
-# files-cr-Nth N threads (1, 32) create 4 million 4KB files over many directories. [rows #37–38]    
-
-# TODO: update engine to use async engine?
-
-# files_dir = f"/home/{USERNAME}/files"                                                                                               
-# fio_parameters_list = [
-#     # {
-#     #     'name': 'seq_wr_1th_1f',
-#     #     'write_mode': 'write',
-#     #     'bs': '1M',
-#     #     'size': '60G',
-#     #     'direct': 1,
-#     #     'filename': f'{files_dir}/new_60G_file',
-#     #     'iodepth': 32,
-#     #     'numjobs': 1,
-#     #     'group_reporting': True,
-#     #     'runtime': 0,
-#     # },
-#     # {
-#     #     'name': 'seq_wr_32th_32f',
-#     #     'write_mode': 'write',
-#     #     'bs': '1M',
-#     #     'size': '2G',
-#     #     'direct': 1,
-#     #     'filename': f'{files_dir}/seq_wr_32th_32f', 
-#     #     'filename_format': f'{files_dir}/seq_wr_32th_32f.$jobnum',
-#     #     'iodepth': 32,
-#     #     'numjobs': 32,
-#     #     'group_reporting': True,
-#     #     'runtime': 0,
-#     # },
-#     # TODO: Revert
-#     {
-#         'name': 'rnd_wr_1th_1f',
-#         'write_mode': 'randwrite',
-#         'bs': '4k',
-#         'size': '3G',
-#         'direct': 1,
-#         'filename': f'{files_dir}/rnd_wr_1th_1f',
-#         'iodepth': 5,
-#         'numjobs': 1,
-#         'group_reporting': True,
-#         'runtime': 0,
-#     },
-#     # {
-#     #     'name': 'rnd_wr_32th_1f',
-#     #     'write_mode': 'randwrite',
-#     #     'bs': '4k',
-#     #     'size': '60G',
-#     #     'direct': 1,
-#     #     'filename': f'{files_dir}/rnd_wr_32th_1f',
-#     #     'iodepth': 32,
-#     #     'numjobs': 32,
-#     #     'group_reporting': True,
-#     #     'runtime': 0,
-#     # },
-
-# ]
+# Run benchmarks on Normal Disk
 run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=False)
-#run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True)
