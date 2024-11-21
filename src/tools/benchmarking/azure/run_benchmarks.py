@@ -29,6 +29,7 @@ SUBSCRIPTION_ID = config['subscription_id']
 USERNAME = config['username']
 PRIVATE_KEY_PATH = config['ssh_key_path']
 SCRIPT_PATH = os.path.join(os.getenv('BASE_PATH'), config['install_script_path'])
+FIO_UTILS_PATH = os.path.join(os.getenv('BASE_PATH'), config['fio_utils_path'])
 RESOURCE_GROUP_NAME = config['resource_group_name']
 
 compute_client = ComputeManagementClient(credential=DefaultAzureCredential(), subscription_id=SUBSCRIPTION_ID)
@@ -223,7 +224,7 @@ def ssh_and_execute_normal_disk(public_ip, username, private_key_path, vm_name):
     finally:
         ssh.close()
 
-def run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True):
+def run_everything(is_rollbaccine=True):
     """
     Function to set up Azure VMs, run FIO benchmarks, and then delete the VMs.
     """
@@ -231,6 +232,14 @@ def run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True):
     import json
     import time
 
+    # we want to change vms to be 1 if it's normal disk, 2 if it's rollbaccine
+    with open('config.json', 'r+') as f:
+        config = json.load(f)
+        config['num_vms'] = 2 if is_rollbaccine else 1
+        f.seek(0)
+        json.dump(config, f, indent=4)
+        f.truncate()
+    
     # Run setup_azure_vm.py to create resources
     print("Running setup_azure_vm.py to create Azure VMs")
     try:
@@ -252,70 +261,39 @@ def run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True):
             ssh_and_execute(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, SCRIPT_PATH, is_leader, vm_name, compute_client, RESOURCE_GROUP_NAME, private_ip_0)
         else:
             ssh_and_execute_normal_disk(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, vm_name)
+        if vm_name == 'rollbaccineNum0':
+            try:
+                ssh = connect_ssh(vm_ip_data[vm_name]['public_ip'], username, PRIVATE_KEY_PATH)
+                sftp = ssh.open_sftp()
+                sftp.put(FIO_UTILS_PATH, f"/home/{USERNAME}/fio_utils.py")
+                sftp.close()
+                ssh.close()
+            except Exception as e:
+                print(f"Failed to connect to {vm_ip_data[vm_name]['public_ip']}: {e}")
+                return False
 
-    # Run FIO benchmarks
-    for fio_parameters_template in fio_parameters_list:
-        success = run_multiple_fio_benchmarks(
-            vm_ip_data['rollbaccineNum0']['public_ip'],
-            USERNAME,
-            PRIVATE_KEY_PATH,
-            'rollbaccineNum0',
-            fio_parameters_template,
-            numjobs_list,
-            is_rollbaccine
-        )
-        print(f"FIO benchmarks for '{fio_parameters_template['name']}' completed:", success)
+    # Run fio_utils.py on the VM
+    # stdin, stdout, stderr = ssh.exec_command('python3 fio_utils.py')
+    # exit_status = stdout.channel.recv_exit_status()
+
+    # if exit_status == 0:
+    #     print(stdout.read().decode())
+    # else:
+    #     print(f"Error running FIO benchmarks: {stderr.read().decode()}")
 
     # Run delete_azure_vm.py to delete resources
-    print("Running delete_azure_vm.py to delete Azure VMs")
-    try:
-        subprocess.run(['python3', 'delete_azure_vm.py'], check=True)
-        print("Azure VMs deleted successfully")
-    except subprocess.CalledProcessError as e:
-        print(f"Error deleting Azure VMs: {e}")
-        return  # Exit the function if deletion fails
+    # print("Running delete_azure_vm.py to delete Azure VMs")
+    # try:
+    #     subprocess.run(['python3', 'delete_azure_vm.py'], check=True)
+    #     print("Azure VMs deleted successfully")
+    # except subprocess.CalledProcessError as e:
+    #     print(f"Error deleting Azure VMs: {e}")
+    #     return  # Exit the function if deletion fails
 
-# Possible values for each parameter
-io_directions = ['read', 'write']
-sequentialities = ['seq', 'rand']
-bufferings = [1, 0]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
-persistences = [1, 0]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
-
-# Generate all permutations
-all_combinations = list(itertools.product(io_directions, sequentialities, bufferings, persistences))
-
-fio_parameters_list = []
-
-for io_direction, sequentiality, direct_io, fsync in all_combinations:
-    # Construct the 'rw' parameter for FIO
-    if sequentiality == 'seq':
-        rw = io_direction
-    else:
-        rw = 'rand' + io_direction
-
-    # Build the fio parameter dictionary
-    fio_param = {
-        'name': f'{sequentiality}_{io_direction}_direct{direct_io}_fsync{fsync}',
-        'write_mode': rw,
-        'bs': '4k',
-        'size': '10G',
-        'direct': direct_io,
-        'ramp_time': 45,
-        'iodepth': 1,  # Default iodepth
-        'group_reporting': True,
-    }
-
-    # Add fsync parameter if persistence is required
-    if fsync == 1:
-        fio_param['fsync'] = 1  # Issue fsync after each write
-
-    fio_parameters_list.append(fio_param)
-
-# Define the list of numjobs (thread counts) you want to test
-numjobs_list = [1, 2, 4, 8, 16]
 
 # Run benchmarks on Rollbaccine
 # run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=True)
 
 # Run benchmarks on Normal Disk
-run_everything(fio_parameters_list, numjobs_list, is_rollbaccine=False)
+run_everything(is_rollbaccine=False)
+

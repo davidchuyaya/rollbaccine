@@ -6,4 +6,3 @@ paramiko
 python-dotenv
 matplotlib
 numpy
-itertools

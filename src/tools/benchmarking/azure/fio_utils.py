@@ -1,7 +1,7 @@
-import json
-import csv
 import os
-import paramiko
+import subprocess
+import uuid
+import itertools
 
 def is_fio_installed(ssh):
     """
@@ -28,149 +28,122 @@ def install_fio(ssh):
             return False
     return True
 
-def save_to_csv(job_name, result, output_file):
-    # Extract relevant performance data from fio output
-    jobs = result.get("jobs", [])
-    if not jobs:
-        print(f"No jobs found in fio output")
-        return
-    
-    with open(output_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        for job in jobs:
-            row = [
-                job_name,
-                job["jobname"],
-                job["read"]["iops"],
-                job["read"]["bw"],
-                job["read"]["lat_ns"]["mean"],
-                job["write"]["iops"],
-                job["write"]["bw"],
-                job["write"]["lat_ns"]["mean"]
-            ]
-            writer.writerow(row)
-
-def run_multiple_fio_benchmarks(public_ip, username, private_key_path, vm_name, parameters_template, numjobs_list, is_rollbaccine):
+def run_multiple_fio_benchmarks(fio_parameters_list, numjobs_list, is_rollbaccine, output_dir):
     """
-    Executes FIO benchmarks with varying numbers of threads on the VM and retrieves the results.
+    Executes FIO benchmarks with varying numbers of threads locally and retrieves the results.
     """
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(public_ip, username=username, key_filename=private_key_path)
-        sftp = ssh.open_sftp()
-
+    total_benchmarks = len(fio_parameters_list) * len(numjobs_list)
+    current_benchmark = 0
+    print(f"Running {total_benchmarks} FIO benchmarks locally")
+    for fio_parameters_template in fio_parameters_list:
         for numjobs in numjobs_list:
-            parameters = parameters_template.copy()
+            parameters = fio_parameters_template.copy()
             parameters['numjobs'] = numjobs
-            job_name = f"{parameters['name']}_threads_{numjobs}"
+            short_uuid = str(uuid.uuid4())[:4]
+            job_name = f"{parameters['name']}_threads_{numjobs}_{short_uuid}"
             if not is_rollbaccine:
                 job_name = "normal_disk_" + job_name
-            write_mode = parameters['write_mode']
-            bs = parameters['bs']
-            size = parameters.get('size', '')
-            direct = parameters.get('direct', 1)
-            runtime = parameters.get('runtime', 0)
-            ramp_time = parameters.get('ramp_time', 0)
-            filename = parameters.get('filename', '/tmp/fio_test_file')
-            filename_format = parameters.get('filename_format', '')
-            iodepth = parameters.get('iodepth', 1)
-            group_reporting = parameters.get('group_reporting', True)
-            fsync = parameters.get('fsync', 0)
 
-            output_file = f'/home/{username}/{job_name}_fio_results.json'
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
 
-            # Create the directory for the files if necessary
-            file_dir = os.path.dirname(filename)
-            if file_dir and file_dir != '/':
-                mkdir_command = f'mkdir -p {file_dir}'
-                print(f"Creating directory {file_dir} on {vm_name}")
-                ssh.exec_command(mkdir_command)
+            fio_command = build_fio_command(parameters, output_file)
 
-            # Build the FIO command
-            fio_command = (
-                f'sudo fio '
-                f'--name={job_name} '
-                f'--rw={write_mode} '
-                f'--direct={direct} '
-                f'--bs={bs} '
-            )
-
-            if size:
-                fio_command += f'--size={size} '
-            if runtime > 0:
-                fio_command += f'--runtime={runtime} '
-                fio_command += f'--time_based '
-            if ramp_time > 0:
-                fio_command += f'--ramp_time={ramp_time} '
-            fio_command += f'--filename={filename} '
-            if filename_format:
-                fio_command += f'--filename_format={filename_format} '
-            fio_command += f'--output-format=json '
-            fio_command += f'--iodepth={iodepth} '
-            fio_command += f'--numjobs={numjobs} '
-            if group_reporting:
-                fio_command += '--group_reporting '
-            if fsync == 1:
-                fio_command += '--fsync=1 '
-
-            # Include additional FIO options if provided
-            additional_fio_options = parameters.get('additional_fio_options')
-            if additional_fio_options:
-                fio_command += f'{additional_fio_options} '
-
-            fio_command += f'> {output_file}'
-
-            print(f"Running FIO benchmark '{job_name}' on {vm_name}")
+            print(f"Running FIO benchmark '{job_name}'")
             print(f"FIO command: {fio_command}")
 
-            # Execute the FIO command on the remote VM
-            stdin, stdout, stderr = ssh.exec_command(fio_command)
+            # Execute the FIO command locally
+            result = subprocess.run(fio_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Wait for the command to complete
-            exit_status = stdout.channel.recv_exit_status()
-            stdout_output = stdout.read().decode()
-            stderr_output = stderr.read().decode()
-
-            if exit_status == 0:
-                print(f"FIO benchmark '{job_name}' completed successfully on {public_ip}")
-                if stdout_output:
-                    print(stdout_output)
+            if result.returncode == 0:
+                print(f"FIO benchmark '{job_name}' completed successfully")
+                if result.stdout:
+                    print(result.stdout.decode())
             else:
-                print(f"FIO benchmark '{job_name}' failed on {public_ip}")
-                if stderr_output:
-                    print(f"Error Output:\n{stderr_output}")
+                print(f"FIO benchmark '{job_name}' failed")
+                if result.stderr:
+                    print(f"Error Output:\n{result.stderr.decode()}")
                 continue  # Proceed to the next benchmark
 
-            local_result_dir = './results'
-            os.makedirs(local_result_dir, exist_ok=True)
-            local_result_path = os.path.join(local_result_dir, f'{job_name}_fio_results.json')
-            print(f"Retrieving FIO results for '{job_name}' from {public_ip} to {local_result_path}")
-            try:
-                sftp.get(output_file, local_result_path)
-                print(f"FIO results for '{job_name}' saved to {local_result_path}")
-                with open(local_result_path, 'r') as f:
-                    fio_result = json.load(f)
-                disk_type = "normal_disk" if not is_rollbaccine else "rollbaccine"
-                csv_output_file = os.path.join(local_result_dir, f'{disk_type}_{parameters["name"]}_fio_results.csv')
-                if not os.path.exists(csv_output_file):
-                    with open(csv_output_file, mode='w', newline='') as file:
-                        writer = csv.writer(file)
-                        writer.writerow([
-                            "Job Name", "FIO Job", "Read IOPS", "Read Bandwidth (KB/s)",
-                            "Read Latency (ns)", "Write IOPS", "Write Bandwidth (KB/s)",
-                            "Write Latency (ns)"
-                        ])
-                save_to_csv(job_name, fio_result, csv_output_file)
-                print(f"Results for '{job_name}' saved to {csv_output_file}")
-            except Exception as e:
-                print(f"Error retrieving FIO results for '{job_name}' from {public_ip}: {e}")
-                continue  # Proceed to the next benchmark
-    except Exception as e:
-        print(f"Error running FIO benchmarks on {public_ip}: {e}")
-        return False
-    finally:
-        if 'sftp' in locals():
-            sftp.close()
-        ssh.close()
+            current_benchmark += 1
+            print(f"Completed {current_benchmark} of {total_benchmarks} benchmarks")
+
     return True  # Indicate success
+
+def build_fio_command(parameters, output_file):
+    """
+    Builds the FIO command based on the given parameters.
+    """
+    fio_command = (
+        f'sudo fio '
+        f'--name={parameters["name"]} '
+        f'--rw={parameters["write_mode"]} '
+        f'--direct={parameters.get("direct", 1)} '
+        f'--bs={parameters["bs"]} '
+    )
+    if parameters.get('runtime', 0) > 0:
+        fio_command += f'--runtime={parameters["runtime"]} '
+        fio_command += '--time_based '
+    if parameters.get('ramp_time', 0) > 0:
+        fio_command += f'--ramp_time={parameters["ramp_time"]} '
+    fio_command += f'--filename={parameters.get("filename", "/tmp/fio_test_file")} '
+    if parameters.get('filename_format'):
+        fio_command += f'--filename_format={parameters["filename_format"]} '
+    fio_command += f'--output-format=json '
+    fio_command += f'--iodepth={parameters.get("iodepth", 1)} '
+    fio_command += f'--numjobs={parameters["numjobs"]} '
+    if parameters.get('group_reporting', True):
+        fio_command += '--group_reporting '
+    if parameters.get('fsync', 0) == 1:
+        fio_command += '--fsync=1 '
+
+    # Include additional FIO options if provided
+    additional_fio_options = parameters.get('additional_fio_options')
+    if additional_fio_options:
+        fio_command += f'{additional_fio_options} '
+
+    fio_command += f'> {output_file}'
+    return fio_command
+
+# Possible values for each parameter
+io_directions = ['read', 'write']
+sequentialities = ['seq', 'rand']
+bufferings = [1, 0]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
+persistences = [1, 0]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
+
+# Generate all permutations
+all_combinations = list(itertools.product(io_directions, sequentialities, bufferings, persistences))
+all_combinations = [combo for combo in all_combinations if not (combo[0] == 'read' and combo[3] == 1)]
+fio_parameters_list = []
+print(f"all_combinations: {all_combinations}")
+
+for io_direction, sequentiality, direct_io, fsync in all_combinations:
+    # Construct the 'rw' parameter for FIO
+    if sequentiality == 'seq':
+        rw = io_direction
+    else:
+        rw = 'rand' + io_direction
+
+    # Build the fio parameter dictionary
+    fio_param = {
+        'name': f'{sequentiality}_{io_direction}_direct{direct_io}_fsync{fsync}',
+        'write_mode': rw,
+        'bs': '4k',
+        'direct': direct_io,
+        'filename': '/dev/sdb1',
+        'runtime': 30,
+        'ramp_time': 60,
+        'group_reporting': True,
+    }
+
+    # Add fsync parameter if persistence is required
+    if fsync == 1:
+        fio_param['fsync'] = 1  # Issue fsync after each write
+
+    fio_parameters_list.append(fio_param)
+
+# Define the list of numjobs (thread counts) you want to test
+numjobs_list = [1, 2, 4, 8, 16]
+
+if __name__ == "__main__":
+    run_multiple_fio_benchmarks(fio_parameters_list, numjobs_list, True, 'results')
