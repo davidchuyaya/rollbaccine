@@ -258,6 +258,27 @@ sudo dmsetup status server1
 To see memory tracking statistics, you will need to uncomment `#define MEMORY_TRACKING`.
 
 
+### Ping
+Measure round trip network latency.  
+Replace `<listen port>`, `<server addr>`, and `<server port>` with the desired ports. Only `<listen port>` is necessary.
+```bash
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 <listen port> <server addr> <server port>" | sudo dmsetup create server
+```
+
+For example, set up ping locally between 2 ramdisks with 1GBs each, `/dev/ram0` and `/dev/ram1` respectively:
+```bash
+sudo modprobe brd rd_nr=2 rd_size=1048576
+sudo insmod server.ko
+echo "0 `sudo blockdev --getsz /dev/ram0` server /dev/ram0 12340" | sudo dmsetup create server1
+echo "0 `sudo blockdev --getsz /dev/ram1` server /dev/ram1 12350 127.0.0.1 12340" | sudo dmsetup create server2
+sudo ../tools/device_tester /dev/mapper/server1 write 
+```
+
+Pings are only triggered during fsync.  
+The ping latency should be displayed in the outputs of `server1`.  
+Note that the output will not be accurate if there are concurrent fsync.
+
+
 ### Integrity
 Our custom integrity checker vs dm-integrity.
 
