@@ -29,9 +29,12 @@ struct socket_list {
 
 struct server_device {
     struct dm_dev *dev;
+    struct bio_set bs;
     bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
 
-    unsigned long ping_send_time;
+    u64 ping_send_time;
+    u64 fsync_invoke_time;
+    struct bio *fsync_bio;
 
     // Sockets, tracked so we can kill them on exit.
     struct list_head server_sockets;
@@ -60,6 +63,7 @@ struct listen_thread_params {
     struct server_device *device;
 };
 
+void fsync_end_io(struct bio *clone);
 void send_ping(struct server_device *device);
 void kill_thread(struct socket *sock);
 void blocking_read(struct server_device *device, struct socket *sock);
@@ -70,6 +74,19 @@ int listen_for_connections(void *args);
 int start_server(struct server_device *device, ushort port);
 int __init server_init_module(void);
 void server_exit_module(void);
+
+void fsync_end_io(struct bio *clone) {
+    struct server_device *device = clone->bi_private;
+    u64 fsync_end_time = ktime_get_ns();
+
+    printk(KERN_INFO "Fsync complete, time elapsed: %lluns", (fsync_end_time - device->fsync_invoke_time));
+
+    // the cloned bio is no longer useful
+    bio_put(clone);
+
+    // release the fsync bio
+    bio_endio(device->fsync_bio);
+}
 
 void send_ping(struct server_device *device) {
     int sent;
@@ -104,7 +121,7 @@ void send_ping(struct server_device *device) {
             }
         }
 
-        device->ping_send_time = jiffies;
+        device->ping_send_time = ktime_get_ns();
         // Label to jump to if socket cannot be written to, so we can iterate the next socket
     finish_sending_to_socket:
     }
@@ -113,14 +130,32 @@ void send_ping(struct server_device *device) {
 
 static int server_map(struct dm_target *ti, struct bio *bio) {
     struct server_device *device = ti->private;
+    struct bio *clone;
 
     bio_set_dev(bio, device->dev->bdev);
     bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
     
-    // Trigger ping
+    // Trigger ping and track fsync latency
     if (bio->bi_opf & (REQ_PREFLUSH | REQ_FUA)) {
+        device->fsync_bio = bio;
+
+        clone = bio_alloc_clone(bio->bi_bdev, bio, GFP_NOIO, &device->bs);
+        if (!clone) {
+            printk(KERN_INFO "Could not create clone");
+            return DM_MAPIO_REMAPPED;
+        }
+        clone->bi_end_io = fsync_end_io;
+        clone->bi_private = device;
+        clone->bi_iter.bi_sector = bio->bi_iter.bi_sector;
+
+        printk(KERN_INFO "Submitting fsync bio");
+        device->fsync_invoke_time = ktime_get_ns();
+        submit_bio_noacct(clone);
+
         printk(KERN_INFO "Triggering ping");
         send_ping(device);
+
+        return DM_MAPIO_SUBMITTED;
     }
 
     return DM_MAPIO_REMAPPED;
@@ -139,7 +174,7 @@ void blocking_read(struct server_device *device, struct socket *sock) {
     struct kvec vec;
     struct msg ping_msg;
     int sent, received;
-    unsigned long ping_receive_time;
+    u64 ping_receive_time;
 
     msg_header.msg_name = 0;
     msg_header.msg_namelen = 0;
@@ -178,8 +213,8 @@ void blocking_read(struct server_device *device, struct socket *sock) {
         }
         // Calculate time elapsed from ping
         else {
-            ping_receive_time = jiffies;
-            printk(KERN_INFO "Ping complete, time elapsed: %uus", jiffies_to_usecs(ping_receive_time - device->ping_send_time));
+            ping_receive_time = ktime_get_ns();
+            printk(KERN_INFO "Ping complete, time elapsed: %lluns", (ping_receive_time - device->ping_send_time));
         }
     }
 
@@ -436,6 +471,7 @@ static int server_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
+    bioset_init(&device->bs, 0, 0, BIOSET_NEED_BVECS);
     device->shutting_down = false;
     mutex_init(&device->connected_sockets_lock);
 
@@ -509,6 +545,7 @@ static void server_destructor(struct dm_target *ti) {
         kfree(curr);
     }
 
+    bioset_exit(&device->bs);
     dm_put_device(ti, device->dev);
     kfree(device);
 
