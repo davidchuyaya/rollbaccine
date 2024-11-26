@@ -302,13 +302,13 @@ def run_everything(is_rollbaccine=True):
 
 
     # Run delete_azure_vm.py to delete resources
-    # print("Running delete_azure_vm.py to delete Azure VMs")
-    # try:
-    #     subprocess.run(['python3', 'delete_azure_vm.py'], check=True)
-    #     print("Azure VMs deleted successfully")
-    # except subprocess.CalledProcessError as e:
-    #     print(f"Error deleting Azure VMs: {e}")
-    #     return  # Exit the function if deletion fails
+    print("Running delete_azure_vm.py to delete Azure VMs")
+    try:
+        subprocess.run(['python3', 'delete_azure_vm.py'], check=True)
+        print("Azure VMs deleted successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"Error deleting Azure VMs: {e}")
+        return  # Exit the function if deletion fails
 
 
 # Run benchmarks on Rollbaccine

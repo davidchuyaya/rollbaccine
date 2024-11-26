@@ -103,7 +103,6 @@ def build_fio_command(parameters, output_file):
         fio_command += f'{additional_fio_options} '
 
     fio_command += f'> {output_file}'
-    print(f"fio_command: {fio_command}")
     return fio_command
 
 # Possible values for each parameter
@@ -145,8 +144,6 @@ for io_direction, sequentiality, direct_io, fsync in all_combinations:
 
 # Define the list of numjobs (thread counts) you want to test
 numjobs_list = [1, 2, 4, 8, 16]
-
-#print(f"fio_parameters_list: {fio_parameters_list}")
 
 if __name__ == "__main__":
     run_multiple_fio_benchmarks(fio_parameters_list, numjobs_list, True, 'results')

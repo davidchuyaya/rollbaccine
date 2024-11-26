@@ -40,6 +40,7 @@
 #define ROLLBACCINE_PENDING_BIO_RING_SIZE 1000000 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
+#define ROLLBACCINE_PLUG_NUM_BIOS 256 / 4 // Number of bios to allow between to calls to blk_plug for merging. 256K is the largest write we can send to disk, 4K is the size of individual writes
 #define MODULE_NAME "rollbaccine"
 
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
@@ -220,6 +221,7 @@ struct rollbaccine_device {
     atomic_t max_submit_bio_queue_size;
     atomic_t max_replica_disk_end_io_queue_size;
     atomic_t max_broadcast_queue_size;
+    int last_acked_fsync_index;
 #endif
 };
 
@@ -622,6 +624,9 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
         if (device->max_replica_fsync_index < follower_fsync_index) {
             device->max_replica_fsync_index = follower_fsync_index;
             max_index_changed = true;
+#ifdef MEMORY_TRACKING
+            device->last_acked_fsync_index = follower_fsync_index;
+#endif
         }
     }
     // Otherwise, find the largest fsync index that a quorum agrees to
@@ -658,10 +663,10 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
             bio_write_index = bio->bi_private;
             if (bio_write_index <= device->max_replica_fsync_index) {
                 // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
-                // Ack the fsync to the user
-                ack_bio_to_user_without_executing(bio);
                 // Remove from queue
                 bio_list_pop(&device->fsyncs_pending_replication);
+                // Ack the fsync to the user
+                ack_bio_to_user_without_executing(bio);
 #ifdef MEMORY_TRACKING
                 device->num_fsyncs_pending_replication -= 1;
 #endif
@@ -1372,7 +1377,7 @@ int submit_pending_bio_ring_prefix(void *args) {
     struct bio *bio_to_submit;
     struct blk_plug plug; // Used to merge bios
     bool no_conflict, should_ack_fsync;
-    int signal, curr_head;
+    int signal, curr_head, bios_between_plug;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
@@ -1431,6 +1436,7 @@ int submit_pending_bio_ring_prefix(void *args) {
         }
 
         // Submit all bios
+        bios_between_plug = 0;
         blk_start_plug(&plug);
         while (!bio_list_empty(&submit_queue)) {
             bio_to_submit = bio_list_pop(&submit_queue);
@@ -1439,6 +1445,12 @@ int submit_pending_bio_ring_prefix(void *args) {
                 free_pages_end_io(bio_to_submit);
             else
                 submit_bio_noacct(bio_to_submit);
+            bios_between_plug++;
+            if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+                blk_finish_plug(&plug);
+                blk_start_plug(&plug);
+                bios_between_plug = 0;
+            }
         }
         blk_finish_plug(&plug);
 
@@ -1473,6 +1485,9 @@ int ack_fsync(void *args) {
         }
         last_sent_fsync = device->write_index;
         mutex_unlock(&device->index_lock);
+#ifdef MEMORY_TRACKING
+        device->last_acked_fsync_index = last_sent_fsync;
+#endif
 
         down_read(&device->connected_sockets_sem);
         // TODO: Should only ack fsync to the primary
@@ -1484,6 +1499,7 @@ int ack_fsync(void *args) {
             metadata.bal = device->bal;
             metadata.sender_id = device->id;
             metadata.sender_socket_id = socket_data->sender_socket_id;
+            metadata.recipient_id = multisocket->sender_id;
             metadata.msg_index = socket_data->last_sent_msg_index++;
             metadata.write_index = last_sent_fsync;
             hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
@@ -2038,6 +2054,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
     DMEMIT("Max bios on submit queue: %d\n", atomic_read(&device->max_submit_bio_queue_size));
+    DMEMIT("Last ACK'd fsync index: %d\n", device->last_acked_fsync_index);
     if (!device->is_leader) {
         DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
         DMEMIT("Max distance between bios in pending bio ring: %d\n", atomic_read(&device->max_distance_between_bios_in_pending_bio_ring));
@@ -2258,6 +2275,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     atomic_set(&device->max_distance_between_bios_in_pending_bio_ring, 0);
     atomic_set(&device->max_submit_bio_queue_size, 0);
     atomic_set(&device->max_replica_disk_end_io_queue_size, 0);
+    device->last_acked_fsync_index = 0;
 #endif
 
     atomic_set(&device->broadcast_queue_size, 0);
