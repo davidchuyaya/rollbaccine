@@ -159,14 +159,15 @@ def run_everything(system_type: System, benchmark: Benchmark):
         # Copy the repo to the VM because it contains our python script
         install_rollbaccine(ssh, USERNAME)
 
-        if not is_installed(ssh, 'which python3'):
-            python_installed_success = ssh_execute(ssh, [
-                "sudo apt-get update",
-                "sudo apt-get install -y python3 python3-pip"
-            ])
-            if not python_installed_success:
-                ssh.close()
-                return False
+        # Install python and the requirements
+        python_installed_success = ssh_execute(ssh, [
+            "sudo apt-get update",
+            "sudo apt-get install -y python3 python3-pip",
+            f"pip3 install --break-system-packages -r /home/{USERNAME}/rollbaccine/src/tools/benchmarking/requirements.txt"
+        ])
+        if not python_installed_success:
+            ssh.close()
+            return False
         
         print("Running benchmark")
         stdin, stdout, stderr = ssh.exec_command(f"python3 /home/{USERNAME}/rollbaccine/src/tools/benchmarking/{benchmark.filename()} {system_type}", get_pty=True)

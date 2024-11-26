@@ -3,6 +3,7 @@ import subprocess
 import uuid
 import itertools
 import sys
+import time
 
 # Add the parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -137,6 +138,7 @@ class FioBenchmark(Benchmark):
                 print(f"Running FIO benchmark '{job_name}'")
                 print(f"FIO command: {fio_command}")
 
+                start_time = time.time()
                 # Execute the FIO command locally
                 result = subprocess.run(fio_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -151,7 +153,8 @@ class FioBenchmark(Benchmark):
                     continue  # Proceed to the next benchmark
 
                 current_benchmark += 1
-                print(f"Completed {current_benchmark} of {total_benchmarks} benchmarks")
+                end_time = time.time()
+                print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time):.2f} seconds, completed {current_benchmark} of {total_benchmarks} benchmarks***")
 
         return True  # Indicate success
 
