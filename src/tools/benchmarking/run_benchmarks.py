@@ -126,13 +126,16 @@ def run_everything(system_type: System, benchmark: Benchmark):
     # The backup is not exposed to the benchmark, so we don't add it to connections
     print("Connecting to VMs and setting up")
     connections = []
+    private_ips = []
     i = 0
     primary_private_ip = ''
     for vm_name in vm_ip_data.keys():
         ssh = ssh_and_setup(vm_ip_data[vm_name]['public_ip'], USERNAME, PRIVATE_KEY_PATH, system_type, i, primary_private_ip)
+        private_ip = vm_ip_data[vm_name]['private_ip']
+        private_ips.append(private_ip)
         if system_type == System.ROLLBACCINE:
             if i == 0:
-                primary_private_ip = vm_ip_data[vm_name]['private_ip']
+                primary_private_ip = private_ip
             elif i == 1:
                 ssh.close()
                 i += 1
@@ -142,7 +145,7 @@ def run_everything(system_type: System, benchmark: Benchmark):
             
     # Install everything the benchmark needs on the VM
     print(f"Installing {benchmark.name()} on the main VM")
-    benchmark_install_success = benchmark.install(connections)
+    benchmark_install_success = benchmark.install(connections, private_ips, system_type)
     if not benchmark_install_success:
         print(f"Failed to install {benchmark.name()} on the VM")
         return False
@@ -153,26 +156,35 @@ def run_everything(system_type: System, benchmark: Benchmark):
             ssh.close()
     
     # Copy the repo to the VM that runs the benchmark, install python, and run the benchmark
-    print("Copying repo to benchmarking VM")
     try:
         ssh = connections[benchmark.benchmarking_vm()]
         # Copy the repo to the VM because it contains our python script
+        print("Copying repo to benchmarking VM")
         install_rollbaccine(ssh, USERNAME)
 
-        # Install python and the requirements
+        # Install python and the requirements, create output folder
+        print("Install python for benchmarking")
+        OUTPUT_DIR = "results"
         python_installed_success = ssh_execute(ssh, [
             "sudo apt-get update",
             "sudo apt-get install -y python3 python3-pip",
-            f"pip3 install --break-system-packages -r /home/{USERNAME}/rollbaccine/src/tools/benchmarking/requirements.txt"
+            f"cd /home/{USERNAME}/rollbaccine/src/tools/benchmarking",
+            f"pip3 install --break-system-packages -r requirements.txt",
+            f"mkdir -p /home/{USERNAME}/{OUTPUT_DIR}"
         ])
         if not python_installed_success:
             ssh.close()
             return False
         
         print("Running benchmark")
-        stdin, stdout, stderr = ssh.exec_command(f"python3 /home/{USERNAME}/rollbaccine/src/tools/benchmarking/{benchmark.filename()} {system_type}", get_pty=True)
+        stdin, stdout, stderr = ssh.exec_command(f"cd /home/{USERNAME}/rollbaccine/src/tools/benchmarking; python3 {benchmark.filename()} {system_type} {OUTPUT_DIR}", get_pty=True)
         for line in iter(stdout.readline, ""):
             print(line, end="")
+
+        print("Downloading results")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        download_dir(ssh, f"/home/{USERNAME}/{OUTPUT_DIR}", OUTPUT_DIR)
+
         ssh.close()
         print("Benchmark completed, deleting resources")
     except Exception as e:
@@ -180,6 +192,7 @@ def run_everything(system_type: System, benchmark: Benchmark):
         return False
 
     # Run delete_azure_vm.py to delete resources
+    # TODO: Add a parameter to specify whether the system should shut down or not after the benchmark
     delete_resources()
 
 # Run benchmarks on Normal Disk

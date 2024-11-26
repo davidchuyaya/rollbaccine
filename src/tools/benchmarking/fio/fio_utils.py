@@ -48,14 +48,7 @@ class FioBenchmark(Benchmark):
         return fio_command
     
     def build_fio_parameters_list(self, system_type: System):
-        if system_type == System.UNREPLICATED:
-            filename = '/dev/sdb1'
-        elif system_type == System.DM:
-            filename = 'TODO' # TODO: Replace with the correct device name
-        elif system_type == System.REPLICATED:
-            filename = '/dev/sda'
-        elif system_type == System.ROLLBACCINE:
-            filename = '/dev/mapper/rollbaccine1'
+        filename = mount_point(system_type)
 
         # Possible values for each parameter
         io_directions = ['read', 'write']
@@ -107,7 +100,7 @@ class FioBenchmark(Benchmark):
     def benchmarking_vm(self):
         return 0 # Run fio on the primary
 
-    def install(self, connections):
+    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System):
         ssh = connections[self.benchmarking_vm()]
         if not is_installed(ssh, 'which fio'):
             return ssh_execute(ssh, [
@@ -130,7 +123,6 @@ class FioBenchmark(Benchmark):
                 short_uuid = str(uuid.uuid4())[:4]
                 job_name = f"{system_type}_{parameters['name']}_threads_{numjobs}_{short_uuid}"
 
-                os.makedirs(output_dir, exist_ok=True)
                 output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
 
                 fio_command = self.build_fio_command(parameters, output_file)
@@ -159,4 +151,4 @@ class FioBenchmark(Benchmark):
         return True  # Indicate success
 
 if __name__ == "__main__":
-    FioBenchmark().run(System[sys.argv[1]], 'results')
+    FioBenchmark().run(System[sys.argv[1]], sys.argv[2])
