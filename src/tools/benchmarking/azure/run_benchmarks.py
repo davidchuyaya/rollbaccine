@@ -1,9 +1,6 @@
-import subprocess
-import csv
 import os
 import json
 import paramiko
-import itertools
 from dotenv import load_dotenv
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
@@ -98,6 +95,17 @@ def install_python3(ssh):
             error_msg = stderr.read().decode().strip()
             print(f"Error running command '{cmd}': {error_msg}")
             return False
+    return True
+
+def unmount_disk(ssh):
+    """
+    Unmounts the disk on the remote machine.
+    """
+    stdin, stdout, stderr = ssh.exec_command('sudo umount /dev/sdb1')
+    exit_status = stdout.channel.recv_exit_status()
+    if exit_status != 0:
+        print(f"Error unmounting disk: {stderr.read().decode()}")
+        return False
     return True
 
 def get_leader_commands(username):
@@ -201,6 +209,9 @@ def ssh_and_execute_normal_disk(public_ip, username, private_key_path, vm_name):
         return False
 
     try:
+        print(f"Unmounting /dev/sdb1 on {vm_name}")
+        unmount_disk(ssh)
+
         print(f"Checking if fio is installed on {public_ip}")
         if not is_fio_installed(ssh):
             print(f"fio not found on {public_ip}. Installing fio...")
@@ -273,13 +284,22 @@ def run_everything(is_rollbaccine=True):
                 return False
 
     # Run fio_utils.py on the VM
-    # stdin, stdout, stderr = ssh.exec_command('python3 fio_utils.py')
-    # exit_status = stdout.channel.recv_exit_status()
+    ssh = connect_ssh(vm_ip_data[vm_name]['public_ip'], username, PRIVATE_KEY_PATH)
+    stdin, stdout, stderr = ssh.exec_command('python3 fio_utils.py')
+    exit_status = stdout.channel.recv_exit_status()
+    if exit_status == 0:
+        print(stdout.read().decode())
+        local_results_dir = os.path.join(os.getcwd(), 'results')
+        os.makedirs(local_results_dir, exist_ok=True)
+        sftp = ssh.open_sftp()
+        remote_dir = f'/home/{USERNAME}/results'
+        for filename in sftp.listdir(remote_dir):
+            sftp.get(f'{remote_dir}/{filename}', f'{local_results_dir}/{filename}')
+        sftp.close()
+    else:
+        print(f"Error running FIO benchmarks: {stderr.read().decode()}")
+    ssh.close()
 
-    # if exit_status == 0:
-    #     print(stdout.read().decode())
-    # else:
-    #     print(f"Error running FIO benchmarks: {stderr.read().decode()}")
 
     # Run delete_azure_vm.py to delete resources
     # print("Running delete_azure_vm.py to delete Azure VMs")

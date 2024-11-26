@@ -1,212 +1,133 @@
 import os
 import json
+import glob
+import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
 
-def read_fio_json_results(results_dir):
-    """
-    Reads all FIO JSON result files in the specified directory.
-    Returns a list of tuples containing the job name, category (normal_disk or rollbaccine), and the FIO result data.
-    """
-    results = []
-    for filename in os.listdir(results_dir):
-        if filename.endswith('.json'):
-            filepath = os.path.join(results_dir, filename)
-            # Determine the category based on filename
-            if filename.startswith('normal_disk_'):
-                category = 'normal_disk'
-                base_job_name = filename[len('normal_disk_'):-len('_fio_results.json')]
-            else:
-                category = 'rollbaccine'
-                base_job_name = filename[:-len('_fio_results.json')]
-            with open(filepath, 'r') as f:
-                data = json.load(f)
-                for job in data['jobs']:
-                    job_name = job['jobname']
-                    results.append((base_job_name, category, job))
-    return results
+def parse_fio_results(result_dir):
+    # Initialize a list to hold all the data
+    data = []
 
-def extract_performance_data(results):
-    """
-    Extracts performance metrics from FIO results.
-    Returns a nested dictionary with base job names as keys and performance metrics as values for both categories.
-    """
-    performance_data = {}
-    for base_job_name, category, job_data in results:
-        read_iops = job_data['read']['iops']
-        read_bw = job_data['read']['bw']  # Bandwidth in KB/s
-        read_lat = job_data['read']['lat_ns']['mean'] / 1000  # Convert to microseconds
-        read_throughput = job_data['read']['bw_bytes'] / (1024 * 1024)  # Convert to MB/s
-        write_iops = job_data['write']['iops']
-        write_bw = job_data['write']['bw']  # Bandwidth in KB/s
-        write_lat = job_data['write']['lat_ns']['mean'] / 1000  # Convert to microseconds
-        write_throughput = job_data['write']['bw_bytes'] / (1024 * 1024)  # Convert to MB/s
+    # Glob all JSON files in the result directory
+    json_files = glob.glob(os.path.join(result_dir, '*_fio_results.json'))
+    print(f"Found {len(json_files)} JSON files in {result_dir}")
 
-        if base_job_name not in performance_data:
-            performance_data[base_job_name] = {}
+    for json_file in json_files:
+        with open(json_file, 'r') as f:
+            fio_result = json.load(f)
 
-        performance_data[base_job_name][category] = {
-            'read_iops': read_iops,
-            'read_bw': read_bw,
-            'read_lat_us': read_lat,
-            'read_throughput_mbs': read_throughput,
-            'write_iops': write_iops,
-            'write_bw': write_bw,
-            'write_lat_us': write_lat,
-            'write_throughput_mbs': write_throughput
-        }
-    return performance_data
+        # Extract job name from the filename
+        filename = os.path.basename(json_file)
+        job_name = filename.replace('_fio_results.json', '')
 
-def plot_grouped_bar_graph(performance_data, metric, title, ylabel, output_file):
-    """
-    Plots a grouped bar chart for the specified performance metric.
-    """
-    categories = ['normal_disk', 'rollbaccine']
-    job_names = list(performance_data.keys())
-    num_jobs = len(job_names)
-    num_categories = len(categories)
+        # Extract configuration and thread count from the job name
+        parts = job_name.split('_threads_')
+        if len(parts) < 2:
+            print(f"Skipping file {json_file} because it doesn't match the expected pattern")
+            continue  # Skip files that don't match the expected pattern
+        config_name = parts[0]
+        threads_part = parts[1]
+        num_threads = int(threads_part.split('_')[0])
 
-    # Prepare data
-    data = {category: [] for category in categories}
-    for job_name in job_names:
-        for category in categories:
-            if category in performance_data[job_name]:
-                data[category].append(performance_data[job_name][category].get(metric, 0))
-            else:
-                data[category].append(0)
+        # Assuming single job per file
+        job = fio_result['jobs'][0]
 
-    x = np.arange(num_jobs)  # the label locations
-    width = 0.35  # the width of the bars
+        # Check both 'read' and 'write' sections for non-zero io_bytes
+        read_io_bytes = job.get('read', {}).get('io_bytes', 0)
+        write_io_bytes = job.get('write', {}).get('io_bytes', 0)
 
-    plt.figure(figsize=(12, 6))
-    fig, ax = plt.subplots()
-    rects_list = []
+        if read_io_bytes > 0:
+            io_type = 'read'
+            io_data = job['read']
+        elif write_io_bytes > 0:
+            io_type = 'write'
+            io_data = job['write']
+        else:
+            print(f"Skipping file {json_file} because it doesn't contain read or write data")
+            continue  # Skip if neither read nor write data is present
 
-    # Plot bars for each category
-    for idx, category in enumerate(categories):
-        offset = (idx - (num_categories - 1) / 2) * width
-        rects = ax.bar(x + offset, data[category], width, label=category)
-        rects_list.append(rects)
+        # Check if bandwidth is present and greater than zero
+        bw_kb_s = io_data.get('bw', 0)  # Bandwidth in KB/s, default to 0 if missing
+        if bw_kb_s == 0:
+            print(f"Skipping file {json_file} because bandwidth is zero")
+            continue  # Skip if bandwidth is zero
 
-    # Add labels, title, and custom x-axis tick labels, etc.
-    ax.set_xlabel('FIO Jobs')
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.set_xticks(x)
-    ax.set_xticklabels(job_names, rotation=45, ha='right')
-    ax.legend()
+        bw_mb_s = bw_kb_s / 1024  # Convert KB/s to MB/s
 
-    # Attach a text label above each bar in rects, displaying its height
-    def autolabel(rects):
-        for rect in rects:
-            height = rect.get_height()
-            if height != 0:
-                ax.annotate('{}'.format(int(height)),
-                            xy=(rect.get_x() + rect.get_width() / 2, height),
-                            xytext=(0, 3),  # 3 points vertical offset
-                            textcoords="offset points",
-                            ha='center', va='bottom')
+        # Extract median latency from percentiles
+        clat_ns = io_data.get('clat_ns', {})
+        if 'percentile' in clat_ns and '50.000000' in clat_ns['percentile']:
+            median_lat_ns = clat_ns['percentile']['50.000000']
+        else:
+            median_lat_ns = clat_ns.get('mean', 0)
 
-    for rects in rects_list:
-        autolabel(rects)
+        lat_ms = median_lat_ns / 1e6  # Convert nanoseconds to milliseconds
 
-    plt.tight_layout()
-    plt.savefig(output_file)
-    plt.close()
-    print(f"Saved grouped bar graph to {output_file}")
+        # Append to data list
+        data.append({
+            'config': config_name,
+            'num_threads': num_threads,
+            'throughput_mb_s': bw_mb_s,
+            'latency_ms': lat_ms,
+            'io_type': io_type
+        })
 
-def main():
-    # Directory where the FIO JSON results are stored
-    results_dir = './results'  # Adjust this path if needed
+    # Convert data to a DataFrame
+    df = pd.DataFrame(data)
+    return df
 
-    # Read the FIO JSON results
-    results = read_fio_json_results(results_dir)
+def organize_data(df):
+    # Sort the DataFrame for consistent plotting
+    df_sorted = df.sort_values(by=['config', 'num_threads'])
+    return df_sorted
 
-    if not results:
-        print("No FIO JSON result files found in the directory.")
-        return
-
-    # Extract performance data
-    performance_data = extract_performance_data(results)
-    print("Performance Data:")
-    for job_name, data in performance_data.items():
-        print(f"{job_name}: {data}")
-
-    # Create an output directory for graphs
-    output_dir = './graphs'
+def plot_throughput_latency_per_config(df, output_dir='plots'):
+    # Create the output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
-    # Plot Read IOPS
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='read_iops',
-        title='Read IOPS per FIO Job',
-        ylabel='IOPS',
-        output_file=os.path.join(output_dir, 'read_iops_grouped_bar_graph.png')
-    )
+    # Get unique configurations
+    configs = df['config'].unique()
 
-    # Plot Write IOPS
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_iops',
-        title='Write IOPS per FIO Job',
-        ylabel='IOPS',
-        output_file=os.path.join(output_dir, 'write_iops_grouped_bar_graph.png')
-    )
+    for config in configs:
+        df_config = df[df['config'] == config]
 
-    # Plot Read Bandwidth
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='read_bw',
-        title='Read Bandwidth per FIO Job',
-        ylabel='Bandwidth (KB/s)',
-        output_file=os.path.join(output_dir, 'read_bandwidth_grouped_bar_graph.png')
-    )
+        plt.figure(figsize=(10, 6))
 
-    # Plot Write Bandwidth
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_bw',
-        title='Write Bandwidth per FIO Job',
-        ylabel='Bandwidth (KB/s)',
-        output_file=os.path.join(output_dir, 'write_bandwidth_grouped_bar_graph.png')
-    )
+        # Plot throughput vs. latency for different thread counts
+        plt.plot(
+            df_config['throughput_mb_s'],
+            df_config['latency_ms'],
+            marker='o',
+            linestyle='-',
+            label=f'Threads: {sorted(df_config["num_threads"].unique())}'
+        )
 
-    # Plot Read Latency
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='read_lat_us',
-        title='Read Latency per FIO Job',
-        ylabel='Latency (μs)',
-        output_file=os.path.join(output_dir, 'read_latency_grouped_bar_graph.png')
-    )
+        plt.xlabel('Throughput (MB/s)')
+        plt.ylabel('Median Latency (ms)')
+        plt.title(f'Throughput vs. Median Latency for {config}')
+        plt.grid(True)
 
-    # Plot Write Latency
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_lat_us',
-        title='Write Latency per FIO Job',
-        ylabel='Latency (μs)',
-        output_file=os.path.join(output_dir, 'write_latency_grouped_bar_graph.png')
-    )
+        # Save the plot to a file
+        safe_config_name = config.replace('/', '_')  # Replace any slashes to make a safe filename
+        plot_filename = os.path.join(output_dir, f'{safe_config_name}_throughput_latency.png')
+        plt.savefig(plot_filename)
 
-    # Plot Read Throughput
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='read_throughput_mbs',
-        title='Read Throughput per FIO Job',
-        ylabel='Throughput (MB/s)',
-        output_file=os.path.join(output_dir, 'read_throughput_grouped_bar_graph.png')
-    )
+        plt.close()  # Close the figure to free memory
 
-    # Plot Write Throughput
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_throughput_mbs',
-        title='Write Throughput per FIO Job',
-        ylabel='Throughput (MB/s)',
-        output_file=os.path.join(output_dir, 'write_throughput_grouped_bar_graph.png')
-    )
+        print(f"Plot saved to {plot_filename}")
 
 if __name__ == "__main__":
-    main()
+    # Directory where FIO result JSON files are stored
+    result_directory = 'results'
+
+    # Parse FIO results
+    df_results = parse_fio_results(result_directory)
+
+    if df_results.empty:
+        print("No data found to plot.")
+    else:
+        # Organize data (sorting)
+        df_results_sorted = df_results.sort_values(by=['config', 'num_threads'])
+
+        # Generate and save plots for each configuration
+        plot_throughput_latency_per_config(df_results_sorted)

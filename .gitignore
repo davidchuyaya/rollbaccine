@@ -118,5 +118,4 @@ Thumbs.db
 azure_vm_setup.py
 vm_ips.json
 
-# results and graphs
-graphs/
+# FIO results

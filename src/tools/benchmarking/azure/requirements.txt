@@ -5,4 +5,5 @@ azure-mgmt-resource
 paramiko
 python-dotenv
 matplotlib
+pandas
 numpy
