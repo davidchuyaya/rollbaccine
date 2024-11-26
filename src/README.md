@@ -360,7 +360,24 @@ When you're done with the VMs, delete them, replacing `rollbaccine` with the nam
 
 ## Setup
 
-Before we run the scripts in tools/benchmarking/azure, we need to create a `.env` file at the root of the repository and fill in the following variables:
+Install `azd` by following directions [here](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/install-azd).
+Log into your Azure account (twice):
+```bash
+az login
+azd auth login
+```
+
+Install Python dependencies:
+```bash
+pip install -r tools/benchmarking/requirements.txt
+```
+
+Create password-less SSH keys (clicking Enter on all options):
+```bash
+ssh-keygen -t rsa -b 4096
+```
+
+Before we run the scripts in tools/benchmarking, we need to create a `.env` file at the root of the repository and fill in the following variables:
 
 ```bash
 AZURE_USERNAME="" # Your Azure username
@@ -370,24 +387,13 @@ PRIVATE_KEY_PATH="" # The path to your SSH private key
 BASE_PATH="" # The path to the root directory of this repository
 ```
 
-
 ## Launching VMs
 
 To launch VMs, run the following command:
 
 ```bash
-cd tools/benchmarking/azure
-python3 setup_azure_vm.py
-```
-
-This will create a resource group, a proximity placement group, and two VMs. The VMs will be named `rollbaccineNum0` and `rollbaccineNum1`.
-
-## Running FIO benchmarks
-
-To run FIO benchmarks, run the following command:
-
-```bash
-python3 ssh_azure_vm.py
+cd tools/benchmarking
+python3 run_benchmarks.py
 ```
 
 This will run FIO benchmarks on the two VMs and save the results to the `results` directory.
