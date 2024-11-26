@@ -65,3 +65,58 @@ device_tester
 
 # C library stuff
 compile_commands.json
+
+# Environment variables
+.env
+.env.*
+
+# Virtual environment
+rollbaccine/
+venv/
+env/
+*.venv
+.Python
+pyvenv.cfg
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDEs
+.idea/
+
+# OS generated files
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Azure-related
+azure_vm_setup.py
+vm_ips.json
+
+# results and graphs
+graphs/

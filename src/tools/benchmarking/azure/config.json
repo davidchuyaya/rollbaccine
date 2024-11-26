@@ -1,0 +1,17 @@
+{
+    "subscription_id": "$SUBSCRIPTION_ID",
+    "resource_group_name": "rollbaccine_{username}",
+    "proximity_placement_group_name": "rollbaccine_placement_group",
+    "username": "adit",
+    "vm_size": "Standard_DC16ads_v5",
+    "num_vms": 1,
+    "location": "eastus",
+    "zone": 2,
+    "nsg_name": "rollbaccine_{username}_nsg",
+    "vnet_name": "rollbaccine_{username}_vnet",
+    "subnet_name": "rollbaccine_{username}_subnet",
+    "interface_name": "rollbaccine_{username}_interface",
+    "ssh_key_path": "$PRIVATE_KEY_PATH",
+    "install_script_path": "install_rollbaccine.sh",
+    "fio_utils_path": "src/tools/benchmarking/azure/fio_utils.py"
+}
