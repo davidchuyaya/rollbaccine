@@ -42,7 +42,7 @@ class Benchmark(ABC):
         pass
 
     @abstractmethod
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System) -> bool:
+    def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System) -> bool:
         """
         Installs the benchmarking tool on the remote machine if necessary.
         By convention, the first connection is the Rollbaccine primary, if any.

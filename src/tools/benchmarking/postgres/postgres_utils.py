@@ -28,7 +28,7 @@ class PostgresBenchmark(Benchmark):
     def benchmarking_vm(self):
         return 1 # Don't run benchmarking on the primary
 
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System):
+    def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System):
         # Install Postgres on primary
         primary = connections[0]
         primary_private_ip = private_ips[0]

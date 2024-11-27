@@ -16,6 +16,7 @@ from delete_azure_vm import delete_resources
 from fio.fio_utils import FioBenchmark
 from postgres.postgres_utils import PostgresBenchmark
 from filebench.filebench_utils import FileBenchmark
+from hdfs.hdfs_utils import HDFSBenchmark
 
 load_dotenv()
 username = os.getenv('AZURE_USERNAME')
@@ -147,7 +148,7 @@ def run_everything(system_type: System, benchmark: Benchmark):
             
     # Install everything the benchmark needs on the VM
     print(f"Installing {benchmark.name()} on the main VM")
-    benchmark_install_success = benchmark.install(connections, private_ips, system_type)
+    benchmark_install_success = benchmark.install(USERNAME, connections, private_ips, system_type)
     if not benchmark_install_success:
         print(f"Failed to install {benchmark.name()} on the VM")
         return False

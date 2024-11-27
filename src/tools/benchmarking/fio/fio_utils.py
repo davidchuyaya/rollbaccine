@@ -100,7 +100,7 @@ class FioBenchmark(Benchmark):
     def benchmarking_vm(self):
         return 0 # Run fio on the primary
 
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System):
+    def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System):
         ssh = connections[self.benchmarking_vm()]
         if not is_installed(ssh, 'which fio'):
             return ssh_execute(ssh, [
