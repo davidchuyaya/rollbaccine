@@ -61,14 +61,14 @@ class PostgresBenchmark(Benchmark):
             print("Installing Benchbase on benchmarking VM, may also take a few minutes")
             success = ssh_execute(benchbase, [
                 "wget https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz"
-                "tar -xvzf v2023.tar.gz",
+                "tar -xzf v2023.tar.gz",
                 # Install Java
                 "sudo apt-get update",
                 "sudo apt-get -y install openjdk-21-jdk",
                 "cd benchbase-2023",
                 "./mvnw clean package -P postgres -DskipTests",
                 "cd target",
-                "tar xvzf benchbase-postgres.tgz"
+                "tar xzf benchbase-postgres.tgz"
             ])
             if not success:
                 return False

@@ -1,11 +1,14 @@
 from paramiko import SSHClient
 from typing import List
+from collections import deque
 from benchmark import *
 import subprocess
+import sys
 
 COLOR_UNIMPORTANT = '\033[90m'
 COLOR_ERROR = '\033[91m'
 COLOR_END = '\033[0m'
+PRINT_BUFFER_SIZE = 20
 
 def is_installed(ssh: SSHClient, command: str) -> bool:
     """
@@ -15,35 +18,36 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     path = stdout.read().decode().strip()
     return path != ''
 
+def print_rolling_stdout(stdout):
+    process = subprocess.Popen(f"tail -n{PRINT_BUFFER_SIZE} -f", stdin=stdout)
+    process.communicate()
+
 def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
+    # Make sure we source the environment variables placed in .profile first
+    commands.insert(0, "source .profile")
     # Join commands with "&&" so we can use "cd" correctly
     separator = " && "
     combined_commands = separator.join(commands)
-    stdin, stdout, stderr = ssh.exec_command(combined_commands)
+    stdin, stdout, stderr = ssh.exec_command(combined_commands, get_pty=True)
     if not silent:
-        for line in iter(stdout.readline, ""):
-                print(f"{COLOR_UNIMPORTANT}{line}{COLOR_END}", end="")
-    exit_status = stdout.channel.recv_exit_status()
-    if exit_status != 0:
-        print(f"Error executing command: {combined_commands}")
-        print(f"{COLOR_ERROR}{stderr.read().decode()}{COLOR_END}")
+        print_rolling_stdout(stdout)
+    error = stderr.read().decode()
+    if error:
+        print(f"Error executing commands: {commands}")
+        print(f"{COLOR_ERROR}{error}{COLOR_END}")
         return False
     return True
 
 def subprocess_execute(commands: List[str], silent=False) -> bool:
     separator = " && "
     combined_commands = separator.join(commands)
-    result = subprocess.run(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    if result.returncode == 0:
-        if result.stdout and not silent:
-            print(f"{COLOR_UNIMPORTANT}{result.stdout.decode()}{COLOR_END}")
-        return True
-    else:
-        if result.stderr:
-            print(f"Error executing commands: {commands}")
-            print(f"{COLOR_ERROR}{result.stderr.decode()}{COLOR_END}")
+    process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process.communicate()
+    if process.stderr:
+        print(f"Error executing commands: {commands}")
+        print(f"{COLOR_ERROR}{process.stderr.decode()}{COLOR_END}")
         return False
+    return True
 
 def upload(ssh: SSHClient, local_path: str, remote_path: str):
     sftp = ssh.open_sftp()

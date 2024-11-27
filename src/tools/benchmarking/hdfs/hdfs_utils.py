@@ -39,13 +39,11 @@ class HDFSBenchmark(Benchmark):
                 commands.extend([
                     f"sudo chown -R `whoami` {MOUNT_DIR}",
                     "wget https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
-                    "tar -xzvf hadoop-3.3.3.tar.gz",
+                    "tar -xzf hadoop-3.3.3.tar.gz",
                     "sudo apt-get update",
                     "sudo apt-get -y install openjdk-8-jdk",
-                    rf'sudo sed -i "s/\"$/:\/home\/{username}\/hadoop-3.3.3\/bin\"/" /etc/environment',
-                    f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .bashrc",
-                    "echo 'JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' >> .bashrc",
-                    "source .bashrc",
+                    f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .profile",
+                    "echo 'export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' >> .profile"
                 ])
                 
                 success = ssh_execute(ssh, commands)
@@ -62,24 +60,22 @@ class HDFSBenchmark(Benchmark):
                 # Replace {namenodeip} in core-site with the actual namenode IP
                 print("Replacing {namenodeip} in core-site.xml")
                 ssh_execute(ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+                print(f"Finished installing HDFS on node {i}")
 
-                # Start the node
-                print("Starting HDFS")
-                if i == 0:
-                    success = ssh_execute(ssh, [
-                        "hdfs namenode -format",
-                        "hdfs --daemon start namenode"
-                    ])
-                    if not success:
-                        return False
-                else:
-                    success = ssh_execute(ssh, [
-                        "hdfs --daemon start datanode"
-                    ])
-                    if not success:
-                        return False
-
-                print(f"Finished installing and starting HDFS on node {i}")
+        # Starting the datanode
+        datanode_ssh = connections[1]
+        success = ssh_execute(datanode_ssh, ["hdfs --daemon start datanode"])
+        if not success:
+            return False
+        
+        # Starting the namenode
+        namenode_ssh = connections[self.benchmarking_vm()]
+        success = ssh_execute(namenode_ssh, [
+            "hdfs namenode -format",
+            "hdfs --daemon start namenode"
+        ])
+        if not success:
+            return False
 
         return True
 

@@ -33,7 +33,7 @@ class FileBenchmark(Benchmark):
             print("Installing Filebench, may take a few minutes")
             success = ssh_execute(ssh, [
                 "wget https://github.com/filebench/filebench/releases/download/1.5-alpha3/filebench-1.5-alpha3.tar.gz",
-                "tar -xvf filebench-1.5-alpha3.tar.gz",
+                "tar -xf filebench-1.5-alpha3.tar.gz",
                 "cd filebench-1.5-alpha3",
                 # Filebench needs to be modified to allow mail-server.f and web-server.f to load so many files: https://github.com/filebench/filebench/issues/90
                 r"sed -i 's/FILEBENCH_NFILESETENTRIES\t(1024 \* 1024)/FILEBENCH_NFILESETENTRIES\t(1024 * 1024 * 10)/g' ipc.h",
