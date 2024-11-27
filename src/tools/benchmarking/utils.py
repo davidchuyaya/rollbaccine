@@ -3,6 +3,10 @@ from typing import List
 from benchmark import *
 import subprocess
 
+COLOR_UNIMPORTANT = '\033[90m'
+COLOR_ERROR = '\033[91m'
+COLOR_END = '\033[0m'
+
 def is_installed(ssh: SSHClient, command: str) -> bool:
     """
     Returns whether the given command produces an output or not
@@ -11,36 +15,39 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     path = stdout.read().decode().strip()
     return path != ''
 
-def ssh_execute(ssh: SSHClient, commands: List[str]) -> bool:
-    # Join commands with ";" so we can use "cd" correctly
-    separator = ";"
+def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
+    # Join commands with "&&" so we can use "cd" correctly
+    separator = " && "
     combined_commands = separator.join(commands)
     stdin, stdout, stderr = ssh.exec_command(combined_commands)
+    if not silent:
+        for line in iter(stdout.readline, ""):
+                print(f"{COLOR_UNIMPORTANT}{line}{COLOR_END}", end="")
     exit_status = stdout.channel.recv_exit_status()
     if exit_status != 0:
         print(f"Error executing command: {combined_commands}")
-        print(stderr.read().decode())
+        print(f"{COLOR_ERROR}{stderr.read().decode()}{COLOR_END}")
         return False
     return True
 
 def subprocess_execute(commands: List[str], silent=False) -> bool:
-    separator = ";"
+    separator = " && "
     combined_commands = separator.join(commands)
     result = subprocess.run(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     if result.returncode == 0:
         if result.stdout and not silent:
-            print(result.stdout.decode())
+            print(f"{COLOR_UNIMPORTANT}{result.stdout.decode()}{COLOR_END}")
         return True
     else:
         if result.stderr:
             print(f"Error executing commands: {commands}")
-            print(f"Error Output:\n{result.stderr.decode()}")
+            print(f"{COLOR_ERROR}{result.stderr.decode()}{COLOR_END}")
         return False
 
 def upload(ssh: SSHClient, local_path: str, remote_path: str):
     sftp = ssh.open_sftp()
-    sftp.put(local_path, remote_path)
+    sftp.put(local_path, remote_path, confirm=False)
     sftp.close()
 
 def download(ssh: SSHClient, remote_path: str, local_path: str):

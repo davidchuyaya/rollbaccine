@@ -4,6 +4,7 @@ import uuid
 import itertools
 import sys
 import time
+from dotenv import load_dotenv
 
 # Add the parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -13,8 +14,6 @@ from utils import *
 
 MOUNT_DIR = '/mnt/hdfs'
 DATA_DIR = f"{MOUNT_DIR}/data"
-CORE_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'core-site.xml')
-HDFS_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'hdfs-site.xml')
 
 class HDFSBenchmark(Benchmark):
     def name(self):
@@ -39,25 +38,33 @@ class HDFSBenchmark(Benchmark):
                 commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
                 commands.extend([
                     f"sudo chown -R `whoami` {MOUNT_DIR}",
-                    "wget https://archive.apache.org/dist/hadoop/common/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
+                    "wget https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
                     "tar -xzvf hadoop-3.3.3.tar.gz",
                     "sudo apt-get update",
                     "sudo apt-get -y install openjdk-8-jdk",
-                    "echo 'export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' | sudo tee -a /etc/environment",
-                    f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' | sudo tee -a /etc/environment",
-                    "source /etc/environment",
+                    rf'sudo sed -i "s/\"$/:\/home\/{username}\/hadoop-3.3.3\/bin\"/" /etc/environment',
+                    f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .bashrc",
+                    "echo 'JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' >> .bashrc",
+                    "source .bashrc",
                 ])
+                
                 success = ssh_execute(ssh, commands)
                 if not success:
                     return False
                 
+                print(f"Uploading configuration file")
+                load_dotenv()
+                CORE_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'core-site.xml')
+                HDFS_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'hdfs-site.xml')
                 upload(ssh, CORE_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml')
                 upload(ssh, HDFS_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/hdfs-site.xml')
 
                 # Replace {namenodeip} in core-site with the actual namenode IP
-                subprocess_execute([f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+                print("Replacing {namenodeip} in core-site.xml")
+                ssh_execute(ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
 
                 # Start the node
+                print("Starting HDFS")
                 if i == 0:
                     success = ssh_execute(ssh, [
                         "hdfs namenode -format",

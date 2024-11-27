@@ -4,6 +4,7 @@ import uuid
 import itertools
 import sys
 import time
+from dotenv import load_dotenv
 
 # Add the parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -13,7 +14,6 @@ from utils import *
 
 MOUNT_DIR = '/mnt/postgres'
 DATA_DIR = f"{MOUNT_DIR}/data"
-TPCC_CONFIG = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'postgres', 'tpcc_config.json')
 
 class PostgresBenchmark(Benchmark):
     def name(self):
@@ -74,6 +74,8 @@ class PostgresBenchmark(Benchmark):
                 return False
             
             print("Copying config file to benchmarking VM")
+            load_dotenv()
+            TPCC_CONFIG = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'postgres', 'tpcc_config.json')
             REMOTE_CONFIG = "benchbase-2023/target/benchbase-postgres/config/tpcc_config.json"
             upload(benchbase, TPCC_CONFIG, REMOTE_CONFIG)
 
