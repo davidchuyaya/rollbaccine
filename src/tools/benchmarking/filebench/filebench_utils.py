@@ -54,14 +54,14 @@ class FileBenchmark(Benchmark):
             subprocess_execute(mount_commands(file_system, mount_point(system_type), MOUNT_DIR), silent=True)
 
             print(f"Running Filebench varmail over {file_system}, may take a few minutes")
-            subprocess_execute([f"sudo filebench -f /home/{username}/rollbaccine/src/tools/benchmarking/filebench/varmail.f \|& tee {output_dir}/{system_type}_{file_system}_varmail.txt"])
+            subprocess_execute([rf"sudo filebench -f /home/{username}/rollbaccine/src/tools/benchmarking/filebench/varmail.f |& tee {output_dir}/{system_type}_{file_system}_varmail.txt"])
 
             print("Unmounting and remounting before next experiment")
             subprocess_execute([f"sudo umount {MOUNT_DIR}"])
             subprocess_execute(mount_commands(file_system, mount_point(system_type), MOUNT_DIR), silent=True)
 
             print(f"Running Filebench webserver over {file_system}, may take a few minutes")
-            subprocess_execute([f"sudo filebench -f /home/{username}/rollbaccine/src/tools/benchmarking/filebench/webserver.f \|& tee {output_dir}/{system_type}_{file_system}_webserver.txt"])
+            subprocess_execute([rf"sudo filebench -f /home/{username}/rollbaccine/src/tools/benchmarking/filebench/webserver.f |& tee {output_dir}/{system_type}_{file_system}_webserver.txt"])
         return True  # Indicate success
 
 if __name__ == "__main__":
