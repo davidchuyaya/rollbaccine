@@ -85,23 +85,21 @@ class PostgresBenchmark(Benchmark):
                 return False
         return True
 
-    def run(self, system_type, output_dir):
+    def run(self, username: str, system_type: System, output_dir: str):
         os.chdir("benchbase-2023/target/benchbase-postgres")
 
         print("Running TPCC, may take a few minutes")
-        result = subprocess.run(f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.json -d ~/{output_dir} --clear=true --create=true --load=true --execute=true", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        success = subprocess_execute([
+            "cd benchbase-2023/target/benchbase-postgres",
+            f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.json -d {output_dir} --clear=true --create=true --load=true --execute=true"
+        ])
 
-        if result.returncode == 0:
+        if success:
             print(f"TPCC benchmark completed successfully")
-            if result.stdout:
-                print(result.stdout.decode())
         else:
             print(f"TPCC benchmark failed")
-            if result.stderr:
-                print(f"Error Output:\n{result.stderr.decode()}")
-            return False
 
-        return True  # Indicate success
+        return success
 
 if __name__ == "__main__":
-    PostgresBenchmark().run(System[sys.argv[1]], sys.argv[2])
+    PostgresBenchmark().run(sys.argv[1], System[sys.argv[2]], sys.argv[3])

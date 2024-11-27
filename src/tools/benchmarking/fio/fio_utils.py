@@ -109,7 +109,7 @@ class FioBenchmark(Benchmark):
             ])
         return True
 
-    def run(self, system_type, output_dir):
+    def run(self, username: str, system_type: System, output_dir: str):
         # Define the list of numjobs (thread counts) to test
         numjobs_list = [1, 2, 4, 8, 16]
         fio_parameters_list = self.build_fio_parameters_list(system_type)
@@ -132,17 +132,12 @@ class FioBenchmark(Benchmark):
 
                 start_time = time.time()
                 # Execute the FIO command locally
-                result = subprocess.run(fio_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-                if result.returncode == 0:
+                success = subprocess_execute(fio_command)
+                if success:
                     print(f"FIO benchmark '{job_name}' completed successfully")
-                    if result.stdout:
-                        print(result.stdout.decode())
                 else:
                     print(f"FIO benchmark '{job_name}' failed")
-                    if result.stderr:
-                        print(f"Error Output:\n{result.stderr.decode()}")
-                    continue  # Proceed to the next benchmark
+                    return False
 
                 current_benchmark += 1
                 end_time = time.time()
@@ -151,4 +146,4 @@ class FioBenchmark(Benchmark):
         return True  # Indicate success
 
 if __name__ == "__main__":
-    FioBenchmark().run(System[sys.argv[1]], sys.argv[2])
+    FioBenchmark().run(sys.argv[1], System[sys.argv[2]], sys.argv[3])
