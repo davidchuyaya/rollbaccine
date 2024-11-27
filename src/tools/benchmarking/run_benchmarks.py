@@ -184,8 +184,7 @@ def run_everything(system_type: System, benchmark: Benchmark):
             print(line, end="")
 
         print("Downloading results")
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        download_dir(ssh, OUTPUT_DIR, OUTPUT_DIR)
+        download_dir(ssh, OUTPUT_DIR, ".")
 
         ssh.close()
         print("Benchmark completed, deleting resources")

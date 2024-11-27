@@ -34,6 +34,7 @@ def subprocess_execute(commands: List[str], silent=False) -> bool:
         return True
     else:
         if result.stderr:
+            print(f"Error executing commands: {commands}")
             print(f"Error Output:\n{result.stderr.decode()}")
         return False
 
