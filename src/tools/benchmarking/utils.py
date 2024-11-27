@@ -23,13 +23,13 @@ def ssh_execute(ssh: SSHClient, commands: List[str]) -> bool:
         return False
     return True
 
-def subprocess_execute(commands: List[str]) -> bool:
+def subprocess_execute(commands: List[str], silent=False) -> bool:
     separator = ";"
     combined_commands = separator.join(commands)
     result = subprocess.run(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     if result.returncode == 0:
-        if result.stdout:
+        if result.stdout and not silent:
             print(result.stdout.decode())
         return True
     else:
@@ -73,8 +73,10 @@ def mount_point(system_type: System) -> str:
         return '/dev/mapper/rollbaccine1'
 
 def mount_commands(file_system: str, mount_path: str, new_dir: str) -> List[str]:
+    # Flag to force mounting file system is -F for ext4 and -f for xfs
+    force_flag = '-F' if file_system == 'ext4' else '-f'
     return [
-        f"sudo mkfs.{file_system} -F {mount_path}",
+        f"sudo mkfs.{file_system} {force_flag} {mount_path}",
         f"sudo mkdir -p {new_dir}",
         f"sudo mount {mount_path} {new_dir}",
     ]
