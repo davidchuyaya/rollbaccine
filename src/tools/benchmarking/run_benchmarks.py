@@ -17,6 +17,7 @@ from fio.fio_utils import FioBenchmark
 from postgres.postgres_utils import PostgresBenchmark
 from filebench.filebench_utils import FileBenchmark
 from hdfs.hdfs_utils import HDFSBenchmark
+from nimble_hdfs.nimble_hdfs_utils import NimbleHDFSBenchmark
 
 load_dotenv()
 username = os.getenv('AZURE_USERNAME')
@@ -201,5 +202,5 @@ def run_everything(system_type: System, benchmark: Benchmark):
     # delete_resources()
 
 # Run benchmarks on Normal Disk
-run_everything(System.UNREPLICATED, FileBenchmark())
+run_everything(System.UNREPLICATED, NimbleHDFSBenchmark())
 

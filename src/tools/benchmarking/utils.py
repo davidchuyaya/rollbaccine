@@ -15,7 +15,7 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     """
     Returns whether the given command produces an output or not
     """
-    stdin, stdout, stderr = ssh.exec_command(command)
+    stdin, stdout, stderr = ssh.exec_command("source .profile && " + command)
     path = stdout.read().decode().strip()
     return path != ''
 

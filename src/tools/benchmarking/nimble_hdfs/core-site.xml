@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://{namenodeip}:9000</value>
+    </property>
+    <property>
+		<name>fs.nimbleURI</name>
+		<value>http://{nimbleip}:8082/</value>
+	</property>
+	<property>
+		<name>fs.nimble.batchSize</name>
+		<value>100</value>
+	</property>
+</configuration>
