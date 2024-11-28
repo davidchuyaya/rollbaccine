@@ -44,7 +44,7 @@ class FioBenchmark(Benchmark):
         if additional_fio_options:
             fio_command += f'{additional_fio_options} '
 
-        fio_command += f'> {output_file}'
+        fio_command += f'| tee {output_file}'
         return fio_command
     
     def build_fio_parameters_list(self, system_type: System):
@@ -132,7 +132,7 @@ class FioBenchmark(Benchmark):
 
                 start_time = time.time()
                 # Execute the FIO command locally
-                success = subprocess_execute(fio_command)
+                success = subprocess_execute([fio_command])
                 if success:
                     print(f"FIO benchmark '{job_name}' completed successfully")
                 else:
@@ -141,7 +141,7 @@ class FioBenchmark(Benchmark):
 
                 current_benchmark += 1
                 end_time = time.time()
-                print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time):.2f} seconds, completed {current_benchmark} of {total_benchmarks} benchmarks***")
+                print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time) / 60:.2f} minutes, completed {current_benchmark} of {total_benchmarks} benchmarks***")
 
         return True  # Indicate success
 

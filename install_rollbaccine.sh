@@ -1,7 +1,7 @@
 #!/bin/bash
 
-sudo apt-get update
-sudo apt-get install -y build-essential
-git clone https://github.com/davidchuyaya/rollbaccine
+sudo apt-get update -qq
+sudo apt-get install -qq -y build-essential
+git clone -q https://github.com/davidchuyaya/rollbaccine
 cd rollbaccine/src
-make
+make --silent
