@@ -39,12 +39,12 @@ class PostgresBenchmark(Benchmark):
                 "sudo apt-get -qq update",
                 "sudo apt-get install -qq -y postgresql-common",
                 # Install to our custom directory
-                f"echo 'data_directory = '\'{DATA_DIR}\' | sudo tee -a /etc/postgresql-common/createcluster.conf",
+                rf"echo 'data_directory = '\'{DATA_DIR}\' | sudo tee -a /etc/postgresql-common/createcluster.conf",
                 f"sudo mkdir -p {DATA_DIR}",
                 f"sudo chown -R postgres:postgres {DATA_DIR}",
                 "sudo apt-get install -qq -y postgresql",
                 # Listens to public addresses
-                "echo 'listen_addresses = '\'*\' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
+                r"echo 'listen_addresses = '\'*\' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
                 # Trust all connections
                 "echo 'host all all 0.0.0.0/0 trust' | sudo tee -a /etc/postgresql/*/main/pg_hba.conf",
                 "sudo systemctl restart postgresql.service",
@@ -57,16 +57,16 @@ class PostgresBenchmark(Benchmark):
 
         # Install Benchbase on the benchmarking VM
         benchbase = connections[self.benchmarking_vm()]
-        if not is_installed(benchbase, "test -d benchbase && echo 1"):
+        if not is_installed(benchbase, "test -d benchbase-2023 && echo 1"):
             print("Installing Benchbase on benchmarking VM, may also take a few minutes")
             success = ssh_execute(benchbase, [
-                "wget -q https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz"
+                "wget -nv https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz",
                 "tar -xzf v2023.tar.gz",
                 # Install Java
                 "sudo apt-get -qq update",
                 "sudo apt-get -y -qq install openjdk-21-jre",
                 "cd benchbase-2023",
-                "./mvnw clean package -P postgres -DskipTests",
+                "./mvnw -q clean package -P postgres -DskipTests",
                 "cd target",
                 "tar xzf benchbase-postgres.tgz"
             ])
@@ -75,8 +75,8 @@ class PostgresBenchmark(Benchmark):
             
             print("Copying config file to benchmarking VM")
             load_dotenv()
-            TPCC_CONFIG = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'postgres', 'tpcc_config.json')
-            REMOTE_CONFIG = "benchbase-2023/target/benchbase-postgres/config/tpcc_config.json"
+            TPCC_CONFIG = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'postgres', 'tpcc_config.xml')
+            REMOTE_CONFIG = "benchbase-2023/target/benchbase-postgres/config/tpcc_config.xml"
             upload(benchbase, TPCC_CONFIG, REMOTE_CONFIG)
 
             print("Modifying config file")
@@ -88,12 +88,10 @@ class PostgresBenchmark(Benchmark):
         return True
 
     def run(self, username: str, system_type: System, output_dir: str):
-        os.chdir("benchbase-2023/target/benchbase-postgres")
-
         print("Running TPCC, may take a few minutes")
         success = subprocess_execute([
-            "cd benchbase-2023/target/benchbase-postgres",
-            f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.json -d {output_dir} --clear=true --create=true --load=true --execute=true"
+            f"cd /home/{username}/benchbase-2023/target/benchbase-postgres",
+            f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {output_dir} --clear=true --create=true --load=true --execute=true"
         ])
 
         if success:

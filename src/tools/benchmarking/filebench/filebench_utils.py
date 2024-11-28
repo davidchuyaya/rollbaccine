@@ -32,7 +32,7 @@ class FileBenchmark(Benchmark):
         if not is_installed(ssh, 'which filebench'):
             print("Installing Filebench, may take a few minutes")
             success = ssh_execute(ssh, [
-                "wget -q https://github.com/filebench/filebench/releases/download/1.5-alpha3/filebench-1.5-alpha3.tar.gz",
+                "wget -nv https://github.com/filebench/filebench/releases/download/1.5-alpha3/filebench-1.5-alpha3.tar.gz",
                 "tar -xf filebench-1.5-alpha3.tar.gz",
                 "cd filebench-1.5-alpha3",
                 # Filebench needs to be modified to allow mail-server.f and web-server.f to load so many files: https://github.com/filebench/filebench/issues/90

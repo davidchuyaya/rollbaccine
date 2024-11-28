@@ -38,7 +38,7 @@ class HDFSBenchmark(Benchmark):
             commands.extend([
                 f"sudo mkdir -p {DATA_DIR}",
                 f"sudo chown -R `whoami` {DATA_DIR}",
-                "wget -q https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
+                "wget -nv https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
                 "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get -qq update",
                 "sudo apt-get -y -qq install openjdk-8-jre-headless",
