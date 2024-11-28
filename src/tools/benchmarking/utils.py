@@ -23,6 +23,10 @@ def clear_output_file():
     open(OUTPUT_FILE, 'w').close()
 
 def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
+    """
+    Execute a list of commands on an SSH connection.
+    DO NOT pass a string into commands!
+    """
     # Make sure we source the environment variables placed in .profile first
     commands.insert(0, "source .profile")
     # Join commands with "&&" so we can use "cd" correctly
@@ -38,21 +42,26 @@ def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
             
     error = stderr.read().decode()
     if error:
-        print(f"Error executing commands: {commands}")
+        print(f"Error executing SSH commands: {combined_commands}")
         print(f"{COLOR_ERROR}{error}{COLOR_END}")
         return False
     return True
 
 def subprocess_execute(commands: List[str], silent=False) -> bool:
+    """
+    Execute a list of commands in a subprocess.
+    DO NOT pass a string into commands!
+    """
     separator = " && "
     combined_commands = separator.join(commands)
     process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    for line in process.stdout:
-        print(line)
+    if not silent:
+        for line in process.stdout:
+            print(line)
     # Necessary for returncode to not be None
     process.wait()
     if process.returncode != 0:
-        print(f"Error executing commands: {commands}")
+        print(f"Error executing subprocess commands: {combined_commands}")
         for line in process.stderr:
             print(f"{COLOR_ERROR}{line}{COLOR_END}")
         return False

@@ -201,5 +201,5 @@ def run_everything(system_type: System, benchmark: Benchmark):
     # delete_resources()
 
 # Run benchmarks on Normal Disk
-run_everything(System.UNREPLICATED, HDFSBenchmark())
+run_everything(System.UNREPLICATED, FileBenchmark())
 
