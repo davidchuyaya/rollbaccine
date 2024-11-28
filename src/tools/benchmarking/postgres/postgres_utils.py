@@ -36,13 +36,13 @@ class PostgresBenchmark(Benchmark):
             print("Installing Postgres on primary, may take a few minutes")
             commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
             commands.extend([
-                "sudo apt-get update",
-                "sudo apt-get install -y postgresql-common",
+                "sudo apt-get -qq update",
+                "sudo apt-get install -qq -y postgresql-common",
                 # Install to our custom directory
                 f"echo 'data_directory = '\'{DATA_DIR}\' | sudo tee -a /etc/postgresql-common/createcluster.conf",
                 f"sudo mkdir -p {DATA_DIR}",
                 f"sudo chown -R postgres:postgres {DATA_DIR}",
-                "sudo apt-get install -y postgresql",
+                "sudo apt-get install -qq -y postgresql",
                 # Listens to public addresses
                 "echo 'listen_addresses = '\'*\' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
                 # Trust all connections
@@ -60,11 +60,11 @@ class PostgresBenchmark(Benchmark):
         if not is_installed(benchbase, "test -d benchbase && echo 1"):
             print("Installing Benchbase on benchmarking VM, may also take a few minutes")
             success = ssh_execute(benchbase, [
-                "wget https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz"
+                "wget -q https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz"
                 "tar -xzf v2023.tar.gz",
                 # Install Java
-                "sudo apt-get update",
-                "sudo apt-get -y install openjdk-21-jdk",
+                "sudo apt-get -qq update",
+                "sudo apt-get -y -qq install openjdk-21-jre",
                 "cd benchbase-2023",
                 "./mvnw clean package -P postgres -DskipTests",
                 "cd target",

@@ -32,7 +32,7 @@ class FileBenchmark(Benchmark):
         if not is_installed(ssh, 'which filebench'):
             print("Installing Filebench, may take a few minutes")
             success = ssh_execute(ssh, [
-                "wget https://github.com/filebench/filebench/releases/download/1.5-alpha3/filebench-1.5-alpha3.tar.gz",
+                "wget -q https://github.com/filebench/filebench/releases/download/1.5-alpha3/filebench-1.5-alpha3.tar.gz",
                 "tar -xf filebench-1.5-alpha3.tar.gz",
                 "cd filebench-1.5-alpha3",
                 # Filebench needs to be modified to allow mail-server.f and web-server.f to load so many files: https://github.com/filebench/filebench/issues/90
@@ -40,11 +40,11 @@ class FileBenchmark(Benchmark):
                 # Modification to avoid buffer overflow error.
                 r"sed -i 's/s = malloc(strlen(path) + 1);/s = malloc(MAXPATHLEN);/g' fileset.c",
                 # Install dependencies: https://github.com/filebench/filebench/wiki/Building-Filebench#building-filebench-from-the-git-repository
-                "sudo apt-get update",
-                "sudo apt-get -y install bison flex build-essential",
+                "sudo apt-get -qq update",
+                "sudo apt-get -qq -y install bison flex build-essential",
                 "./configure",
-                "make",
-                "sudo make install"
+                "make --silent",
+                "sudo make --silent install"
             ])
             if not success:
                 return False

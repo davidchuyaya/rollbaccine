@@ -104,8 +104,8 @@ class FioBenchmark(Benchmark):
         ssh = connections[self.benchmarking_vm()]
         if not is_installed(ssh, 'which fio'):
             return ssh_execute(ssh, [
-                "sudo apt-get update",
-                "sudo apt-get install -y fio"
+                "sudo apt-get update -qq",
+                "sudo apt-get install -y -qq fio"
             ])
         return True
 
