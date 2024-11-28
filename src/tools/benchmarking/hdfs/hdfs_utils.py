@@ -76,7 +76,7 @@ class HDFSBenchmark(Benchmark):
 
         for op in ["create", "open", "delete", "fileStatus", "rename"]:
             print(f"Running {op}")
-            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
+            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} -useExisting 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
             if not success:
                 return False
             
