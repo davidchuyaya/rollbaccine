@@ -47,6 +47,21 @@ def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
         return False
     return True
 
+def ssh_execute_background(ssh: SSHClient, commands: List[str]):
+    """
+    Execute the last command in a list of commands on an SSH connection in the background, allowing it to keep running even when the SSH connection is closed.
+    DO NOT pass a string into commands!
+    """
+    # Make sure we source the environment variables placed in .profile first
+    commands.insert(0, "source .profile")
+    # Join commands with "&&" so we can use "cd" correctly
+    separator = " && "
+    # Use tmux to run the last command and detach it
+    commands[-1] = f"tmux new -d {commands[-1]}"
+    combined_commands = separator.join(commands)
+    ssh.exec_command(combined_commands, get_pty=True)
+    return
+
 def subprocess_execute(commands: List[str], silent=False) -> bool:
     """
     Execute a list of commands in a subprocess.

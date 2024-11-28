@@ -61,8 +61,7 @@ class NimbleHDFSBenchmark(Benchmark):
             commands.extend([
                 f"sudo mkdir -p {DATA_DIR}",
                 f"sudo chown -R `whoami` {DATA_DIR}",
-                "wget -nv https://github.com/IceCoooola/hadoop-nimble/archive/refs/tags/3.3.3.tar.gz",
-                "mv 3.3.3.tar.gz hadoop-3.3.3.tar.gz",
+                "wget -nv https://github.com/IceCoooola/hadoop-nimble/releases/download/3.3.3/hadoop-3.3.3.tar.gz",
                 "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get -qq update",
                 "sudo apt-get -y -qq install openjdk-8-jre-headless",
@@ -99,33 +98,27 @@ class NimbleHDFSBenchmark(Benchmark):
         for thread in threads:
             thread.join()
                 
-        # TODO: Don't put processes in the background, use another approach
         print("Starting the endorsers")
         for (i, ssh) in enumerate(endorser_sshs):
             print(f"Starting endorser {i}")
-            success = ssh_execute(ssh, [
+            success = ssh_execute_background(ssh, [
                 "cd Nimble",
-                f"target/release/endorser -p {ENDORSER_PORT} -t {endorser_ips[i]} &",
+                f"target/release/endorser -p {ENDORSER_PORT} -t {endorser_ips[i]}",
             ])
-            if not success:
-                return False
-        
+
         # TODO: Switch from memory to Azure tables once this works 
         print("Starting the coordinator")
-        success = ssh_execute(coordinator_ssh, [
+        ssh_execute_background(coordinator_ssh, [
             "cd Nimble",
             f"target/release/coordinator -t {coordinator_ip} -p {COORDINATOR_PORT} -e 'http://{endorser_ips[0]}:{ENDORSER_PORT},http://{endorser_ips[1]}:{ENDORSER_PORT},http://{endorser_ips[2]}:{ENDORSER_PORT}' -s 'memory'",
         ])
-        if not success:
-            return False
         
         print("Starting the endpoint (still on the coordinator)")
-        success = ssh_execute(coordinator_ssh, [
+        success = ssh_execute_background(coordinator_ssh, [
             "cd Nimble",
             f"target/release/endpoint_rest -t {coordinator_ip} -p {ENDPOINT_PORT} -c 'http://{coordinator_ip}:{COORDINATOR_PORT}'",
         ])
-        if not success:
-            return False
+        
         return True
 
     def run(self, username: str, system_type: System, output_dir: str):

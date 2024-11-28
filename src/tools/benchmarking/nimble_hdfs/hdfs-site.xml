@@ -3,10 +3,10 @@
 <configuration>
     <property>
         <name>dfs.name.dir</name>
-        <value>/mnt/hdfs/data/namenode</value>
+        <value>/mnt/nimble-hdfs/data/namenode</value>
     </property>
     <property>
         <name>dfs.data.dir</name>
-        <value>/mnt/hdfs/data/datanode</value>
+        <value>/mnt/nimble-hdfs/data/datanode</value>
     </property>
 </configuration>
