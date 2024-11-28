@@ -117,6 +117,8 @@ Thumbs.db
 # Azure-related
 azure_vm_setup.py
 vm_ips.json
+vms.json
 
 # results and graphs
 graphs/
+stdout.txt

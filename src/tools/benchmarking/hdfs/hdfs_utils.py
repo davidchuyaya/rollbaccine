@@ -37,8 +37,8 @@ class HDFSBenchmark(Benchmark):
             commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
             commands.extend([
                 f"sudo chown -R `whoami` {MOUNT_DIR}",
-                # "wget https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
-                # "tar -xzf hadoop-3.3.3.tar.gz",
+                "wget https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
+                "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get update",
                 "sudo apt-get -y install openjdk-8-jdk",
                 f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .profile",

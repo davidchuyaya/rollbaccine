@@ -5,9 +5,8 @@ from benchmark import *
 import subprocess
 import sys
 import time
-from rich.live import Live
-from rich.table import Table
 
+OUTPUT_FILE = "stdout.txt"
 COLOR_UNIMPORTANT = '\033[90m'
 COLOR_ERROR = '\033[91m'
 COLOR_END = '\033[0m'
@@ -20,6 +19,9 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     path = stdout.read().decode().strip()
     return path != ''
 
+def clear_output_file():
+    open(OUTPUT_FILE, 'w').close()
+
 def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
     # Make sure we source the environment variables placed in .profile first
     commands.insert(0, "source .profile")
@@ -27,18 +29,13 @@ def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
     separator = " && "
     combined_commands = separator.join(commands)
     stdin, stdout, stderr = ssh.exec_command(combined_commands, get_pty=True)
+    # Write outputs to OUTPUT_FILE
     if not silent:
-        # Continuously print the last 10 lines, updating every second. Updating too fast means it won't work.
-        buffer = deque(maxlen=10)
-        table = Table()
-        table.add_column("Output")
-        with Live(table, refresh_per_second=10) as live:
-            for line in iter(stdout.readline, ""):
-                buffer.append(line.strip())
-                table.rows.clear()
-                for line in buffer:
-                    table.add_row(line)
-
+        with open(OUTPUT_FILE, "a") as stdout_file:
+            for line in stdout:
+                stdout_file.write(line)
+                stdout_file.flush()
+            
     error = stderr.read().decode()
     if error:
         print(f"Error executing commands: {commands}")
@@ -49,9 +46,11 @@ def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
 def subprocess_execute(commands: List[str], silent=False) -> bool:
     separator = " && "
     combined_commands = separator.join(commands)
-    process = subprocess.Popen(combined_commands, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     for line in process.stdout:
         print(line)
+    # Necessary for returncode to not be None
+    process.wait()
     if process.returncode != 0:
         print(f"Error executing commands: {commands}")
         for line in process.stderr:

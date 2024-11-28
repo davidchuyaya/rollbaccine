@@ -128,6 +128,8 @@ def run_everything(system_type: System, benchmark: Benchmark):
     # For rollbaccine, the primary is always the 1st VM, the backup is always the 2nd
     # The backup is not exposed to the benchmark, so we don't add it to connections
     print("Connecting to VMs and setting up")
+    print(f"\033[92mPlease run `tail -f {OUTPUT_FILE}` to see the execution log on the servers.\033[0m")
+    clear_output_file()
     connections = []
     private_ips = []
     i = 0
@@ -147,11 +149,11 @@ def run_everything(system_type: System, benchmark: Benchmark):
         i += 1
             
     # Install everything the benchmark needs on the VM
-    # print(f"Installing {benchmark.name()} on the main VM")
-    # benchmark_install_success = benchmark.install(USERNAME, connections, private_ips, system_type)
-    # if not benchmark_install_success:
-    #     print(f"Failed to install {benchmark.name()} on the VM")
-    #     return False
+    print(f"Installing {benchmark.name()} on the main VM")
+    benchmark_install_success = benchmark.install(USERNAME, connections, private_ips, system_type)
+    if not benchmark_install_success:
+        print(f"Failed to install {benchmark.name()} on the VM")
+        return False
     
     # Close all SSH connections except for the one running the benchmark
     for (index, ssh) in enumerate(connections):
