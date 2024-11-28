@@ -74,7 +74,12 @@ class HDFSBenchmark(Benchmark):
             print("Failed to format and start the namenode")
             return False
 
-        for op in ["create", "open", "delete", "fileStatus", "rename"]:
+        print(f"Running create")
+        success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op create -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_create.txt"])
+        if not success:
+            return False
+
+        for op in ["open", "delete", "fileStatus", "rename"]:
             print(f"Running {op}")
             success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} -useExisting 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
             if not success:

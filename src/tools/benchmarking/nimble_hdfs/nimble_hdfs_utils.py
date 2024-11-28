@@ -56,7 +56,7 @@ class NimbleHDFSBenchmark(Benchmark):
 
         print(f"Checking if namenode has HDFS")
         if not is_installed(name_node_ssh, 'which hdfs'):
-            print("Installing HDFS on the namenode, may take around 10 minutes")
+            print("Installing HDFS on the namenode")
             commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
             commands.extend([
                 f"sudo mkdir -p {DATA_DIR}",
@@ -131,10 +131,15 @@ class NimbleHDFSBenchmark(Benchmark):
         if not success:
             print("Failed to format and start the namenode")
             return False
+        
+        print(f"Running create")
+        success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op create -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_create.txt"])
+        if not success:
+            return False
 
-        for op in ["create", "open", "delete", "fileStatus", "rename"]:
+        for op in ["open", "delete", "fileStatus", "rename"]:
             print(f"Running {op}")
-            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
+            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} -useExisting 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
             if not success:
                 return False
             
