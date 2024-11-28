@@ -139,13 +139,12 @@ class FioBenchmark(Benchmark):
                     print(f"FIO benchmark '{job_name}' completed successfully")
                 else:
                     print(f"FIO benchmark '{job_name}' failed")
-                    return False
+                    sys.exit(1)
+                    return
 
                 current_benchmark += 1
                 end_time = time.time()
                 print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time) / 60:.2f} minutes, completed {current_benchmark} of {total_benchmarks} benchmarks***")
-
-        return True  # Indicate success
 
 if __name__ == "__main__":
     FioBenchmark().run(System[sys.argv[1]], sys.argv[2])

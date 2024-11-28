@@ -18,5 +18,6 @@ done
 az group delete \
     -n $NAME-group \
     --yes --no-wait
-rm storage.json
+# Use -f because storage.json may or may not exist, depending on whether the benchmark required it
+rm -f storage.json
 rm vms.json

@@ -129,7 +129,8 @@ def run_everything(system_type: System, benchmark_name: str):
         num_vms += 1
     
     # Create resources
-    subprocess_execute([f"./launch.sh -i {benchmark_name} -n {benchmark.num_vms()} {'-s' if benchmark.needs_storage() else ''}"])
+    subprocess_execute([f"./launch.sh -i {benchmark_name} -n {num_vms} {'-s' if benchmark.needs_storage() else ''}"])
+    
     with open('vms.json') as f:
         vm_ip_data = json.load(f)
     storage_name = f"rollbaccine{benchmark_name}"
@@ -141,8 +142,6 @@ def run_everything(system_type: System, benchmark_name: str):
             print(f"Found storage key: {storage_key}")
 
     # Setup all VMs and add SSH connections to the list
-    # For rollbaccine, the primary is always the 1st VM, the backup is always the 2nd
-    # The backup is not exposed to the benchmark, so we don't add it to connections
     print("Connecting to VMs and setting up")
     print(f"\033[92mPlease run `tail -f {OUTPUT_FILE}` to see the execution log on the servers.\033[0m")
     clear_output_file()
@@ -150,19 +149,28 @@ def run_everything(system_type: System, benchmark_name: str):
     private_ips = []
     i = 0
     primary_private_ip = ''
-    for vm in vm_ip_data:
-        ssh = ssh_and_setup(vm['publicIps'], system_type, i, primary_private_ip)
-        private_ip = vm['privateIps']
+    # Special handling if there is only 1 VM, since the JSON output looks different
+    if num_vms == 1:
+        ssh = ssh_and_setup(vm_ip_data['publicIpAddress'], system_type, i, primary_private_ip)
+        private_ip = vm_ip_data['privateIpAddress']
         private_ips.append(private_ip)
-        if system_type == System.ROLLBACCINE:
-            if i == 0:
-                primary_private_ip = private_ip
-            elif i == 1:
-                ssh.close()
-                i += 1
-                continue
         connections.append(ssh)
-        i += 1
+    else:
+        for vm in vm_ip_data:
+            ssh = ssh_and_setup(vm['publicIps'], system_type, i, primary_private_ip)
+            private_ip = vm['privateIps']
+            private_ips.append(private_ip)
+            # For rollbaccine, the primary is always the 1st VM, the backup is always the 2nd
+            if system_type == System.ROLLBACCINE:
+                if i == 0:
+                    primary_private_ip = private_ip
+                elif i == 1:
+                    # The backup is not exposed to the benchmark, so we don't add it to connections
+                    ssh.close()
+                    i += 1
+                    continue
+            connections.append(ssh)
+            i += 1
             
     # Install everything the benchmark needs on the VM
     print(f"Installing {benchmark_name} on the main VM")

@@ -81,7 +81,7 @@ def subprocess_execute(commands: List[str], silent=False) -> bool:
     process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if not silent:
         for line in process.stdout:
-            print(line)
+            print(line.decode().strip())
     # Necessary for returncode to not be None
     process.wait()
     if process.returncode != 0:

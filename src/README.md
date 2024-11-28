@@ -356,7 +356,7 @@ python3 src/tools/benchmarking/run_benchmarks.py <system type> <benchmark name>
 ```
 `<system type>` is one of `UNREPLICATED`, `DM`, `REPLICATED`, or `ROLLBACCINE`.  
 `<benchmark name>` is one of `fio`, `filebench`, `postgres`, `hdfs`, or `nimble_hdfs`.  
-Outputs will be saved to the `results` folder.
+Outputs will be saved to the root of this directory.
 
 If the script does not complete successfully, you will have to manually clean up resources when you are done debugging. To do so, run the following command:
 ```bash

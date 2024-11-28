@@ -60,21 +60,21 @@ class HDFSBenchmark(Benchmark):
         success = subprocess_execute(["hdfs namenode -format", "hdfs --daemon start namenode"])
         if not success:
             print("Failed to format and start the namenode")
-            return False
+            sys.exit(1)
+            return
 
         for op in ["create", "open", "delete", "fileStatus", "rename"]:
             print(f"Running {op}")
             success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
             if not success:
-                return False
+                sys.exit(1)
+                return
             
         print(f"Running mkdirs")
         subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op mkdirs -threads {THREADS} -dirs {DIRS} 2>&1 | tee {output_dir}/{system_type}_mkdirs.txt"])
 
         print(f"Cleaning up")
         subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
-        
-        return True  # Indicate success
 
 if __name__ == "__main__":
     HDFSBenchmark().run(System[sys.argv[1]], sys.argv[2])

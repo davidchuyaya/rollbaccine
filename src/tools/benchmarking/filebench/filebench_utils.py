@@ -65,7 +65,6 @@ class FileBenchmark(Benchmark):
 
             print(f"Running Filebench webserver over {file_system}, will take 60 seconds")
             subprocess_execute([rf"sudo filebench -f /home/{getuser()}/rollbaccine/src/tools/benchmarking/filebench/webserver.f 2>&1 | tee {output_dir}/{system_type}_{file_system}_webserver.txt"])
-        return True  # Indicate success
 
 if __name__ == "__main__":
     FileBenchmark().run(System[sys.argv[1]], sys.argv[2])

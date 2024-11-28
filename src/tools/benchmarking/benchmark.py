@@ -58,7 +58,7 @@ class Benchmark(ABC):
         pass
 
     @abstractmethod
-    def run(self, system_type: System, output_dir: str) -> bool:
+    def run(self, system_type: System, output_dir: str):
         """
         Executes benchmarks locally and retrieves the results.
         """

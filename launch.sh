@@ -50,6 +50,11 @@ if [ $STORAGE ]; then
     az storage account keys list -n rollbaccine$NAME -g $NAME-group > storage.json
 fi
 
+# Only use the --count parameter if there is more than 1 VM, otherwise the script will fail.
+if [ $NUM_VMS -gt 1 ]; then
+    COUNT_NUM_VMS='--count '$NUM_VMS
+fi
+
 # echo "Launching $NUM_VMS Confidential VMs"
 # az vm create \
 #     --resource-group $NAME-group \
@@ -69,8 +74,7 @@ fi
 #     --security-type ConfidentialVM \
 #     --os-disk-security-encryption-type VMGuestStateOnly \
 #     --enable-secure-boot false \
-#     --enable-vtpm \
-#     --count $NUM_VMS > vms.json
+#     --enable-vtpm $COUNT_NUM_VMS > vms.json
 
 echo "Launching $NUM_VMS VMs"
 az vm create \
@@ -87,6 +91,5 @@ az vm create \
     --location $LOCATION \
     --zone $ZONE \
     --size $VM_SIZE \
-    --image Canonical:ubuntu-24_04-lts:server:latest \
-    --count $NUM_VMS > vms.json
+    --image Canonical:ubuntu-24_04-lts:server:latest $COUNT_NUM_VMS > vms.json
 
