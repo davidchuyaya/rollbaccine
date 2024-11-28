@@ -170,17 +170,16 @@ def run_everything(system_type: System, benchmark: Benchmark):
         # Install python and the requirements, create output folder
         print("Install python for benchmarking")
         OUTPUT_DIR = f"/home/{USERNAME}/results"
-        if not is_installed(ssh, 'which python3'):
-            python_installed_success = ssh_execute(ssh, [
-                "sudo apt-get update",
-                "sudo apt-get install -y python3 python3-pip",
-                f"cd /home/{USERNAME}/rollbaccine/src/tools/benchmarking",
-                f"pip3 install --break-system-packages -r cloud-requirements.txt",
-                f"mkdir -p {OUTPUT_DIR}"
-            ])
-            if not python_installed_success:
-                ssh.close()
-                return False
+        python_installed_success = ssh_execute(ssh, [
+            "sudo apt-get update",
+            "sudo apt-get install -y python3 python3-pip",
+            f"cd /home/{USERNAME}/rollbaccine/src/tools/benchmarking",
+            f"pip3 install --break-system-packages -r cloud-requirements.txt",
+            f"mkdir -p {OUTPUT_DIR}"
+        ])
+        if not python_installed_success:
+            ssh.close()
+            return False
         
         print("Running benchmark")
         ssh_execute(ssh, [

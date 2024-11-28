@@ -36,11 +36,12 @@ class HDFSBenchmark(Benchmark):
         if not is_installed(ssh, 'which hdfs'):
             commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
             commands.extend([
-                f"sudo chown -R `whoami` {MOUNT_DIR}",
+                f"sudo mkdir -p {DATA_DIR}",
+                f"sudo chown -R `whoami` {DATA_DIR}",
                 "wget https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
                 "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get update",
-                "sudo apt-get -y install openjdk-8-jdk",
+                "sudo apt-get -y install openjdk-8-jre-headless",
                 f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .profile",
                 "echo 'export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' >> .profile"
             ])
@@ -60,23 +61,18 @@ class HDFSBenchmark(Benchmark):
             print("Replacing {namenodeip} in core-site.xml")
             ssh_execute(ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
             print(f"Finished installing HDFS")
-
-        print("Starting the namenode")
-        success = ssh_execute(ssh, ["hdfs namenode -format"])
-        if not success:
-            return False
-        print("Pause a bit so it can successfully start")
-        time.sleep(5)
-        success = ssh_execute(ssh, ["hdfs --daemon start namenode"])
-        if not success:
-            return False
-
         return True
 
     def run(self, username: str, system_type: System, output_dir: str):
         THREADS = 16
         FILES = 500000
         DIRS = 500000
+
+        print("Starting the namenode")
+        success = subprocess_execute(["hdfs namenode -format", "hdfs --daemon start namenode"])
+        if not success:
+            print("Failed to format and start the namenode")
+            return False
 
         for op in ["create", "open", "delete", "fileStatus", "rename"]:
             print(f"Running {op}")
