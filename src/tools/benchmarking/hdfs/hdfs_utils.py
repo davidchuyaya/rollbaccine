@@ -23,57 +23,51 @@ class HDFSBenchmark(Benchmark):
         return "hdfs/hdfs_utils.py"
     
     def num_vms(self):
-        return 2 # Namenode, Datanode
+        return 1
     
     def benchmarking_vm(self):
-        return 0 # Run NNThroughputBenchmark on the namenode
+        return 0
 
     def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System):
         name_node_ip = private_ips[self.benchmarking_vm()]
+        ssh = connections[self.benchmarking_vm()]
 
-        print("Installing HDFS on both namenode and datanode, may take a few minutes")
-        for (i, ssh) in enumerate(connections):
-            if not is_installed(ssh, 'which hdfs'):
-                print(f"Installing HDFS on node {i}")
-                commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
-                commands.extend([
-                    f"sudo chown -R `whoami` {MOUNT_DIR}",
-                    "wget https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
-                    "tar -xzf hadoop-3.3.3.tar.gz",
-                    "sudo apt-get update",
-                    "sudo apt-get -y install openjdk-8-jdk",
-                    f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .profile",
-                    "echo 'export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' >> .profile"
-                ])
-                
-                success = ssh_execute(ssh, commands)
-                if not success:
-                    return False
-                
-                print(f"Uploading configuration file")
-                load_dotenv()
-                CORE_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'core-site.xml')
-                HDFS_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'hdfs-site.xml')
-                upload(ssh, CORE_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml')
-                upload(ssh, HDFS_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/hdfs-site.xml')
+        print("Installing HDFS, may take a few minutes")
+        if not is_installed(ssh, 'which hdfs'):
+            commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
+            commands.extend([
+                f"sudo chown -R `whoami` {MOUNT_DIR}",
+                # "wget https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
+                # "tar -xzf hadoop-3.3.3.tar.gz",
+                "sudo apt-get update",
+                "sudo apt-get -y install openjdk-8-jdk",
+                f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .profile",
+                "echo 'export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' >> .profile"
+            ])
+            
+            success = ssh_execute(ssh, commands)
+            if not success:
+                return False
+            
+            print(f"Uploading configuration file")
+            load_dotenv()
+            CORE_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'core-site.xml')
+            HDFS_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'hdfs', 'hdfs-site.xml')
+            upload(ssh, CORE_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml')
+            upload(ssh, HDFS_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/hdfs-site.xml')
 
-                # Replace {namenodeip} in core-site with the actual namenode IP
-                print("Replacing {namenodeip} in core-site.xml")
-                ssh_execute(ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
-                print(f"Finished installing HDFS on node {i}")
+            # Replace {namenodeip} in core-site with the actual namenode IP
+            print("Replacing {namenodeip} in core-site.xml")
+            ssh_execute(ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+            print(f"Finished installing HDFS")
 
-        # Starting the datanode
-        datanode_ssh = connections[1]
-        success = ssh_execute(datanode_ssh, ["hdfs --daemon start datanode"])
+        print("Starting the namenode")
+        success = ssh_execute(ssh, ["hdfs namenode -format"])
         if not success:
             return False
-        
-        # Starting the namenode
-        namenode_ssh = connections[self.benchmarking_vm()]
-        success = ssh_execute(namenode_ssh, [
-            "hdfs namenode -format",
-            "hdfs --daemon start namenode"
-        ])
+        print("Pause a bit so it can successfully start")
+        time.sleep(5)
+        success = ssh_execute(ssh, ["hdfs --daemon start namenode"])
         if not success:
             return False
 

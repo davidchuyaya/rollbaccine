@@ -4,11 +4,13 @@ from collections import deque
 from benchmark import *
 import subprocess
 import sys
+import time
+from rich.live import Live
+from rich.table import Table
 
 COLOR_UNIMPORTANT = '\033[90m'
 COLOR_ERROR = '\033[91m'
 COLOR_END = '\033[0m'
-PRINT_BUFFER_SIZE = 20
 
 def is_installed(ssh: SSHClient, command: str) -> bool:
     """
@@ -18,10 +20,6 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     path = stdout.read().decode().strip()
     return path != ''
 
-def print_rolling_stdout(stdout):
-    process = subprocess.Popen(f"tail -n{PRINT_BUFFER_SIZE} -f", stdin=stdout)
-    process.communicate()
-
 def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
     # Make sure we source the environment variables placed in .profile first
     commands.insert(0, "source .profile")
@@ -30,7 +28,17 @@ def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
     combined_commands = separator.join(commands)
     stdin, stdout, stderr = ssh.exec_command(combined_commands, get_pty=True)
     if not silent:
-        print_rolling_stdout(stdout)
+        # Continuously print the last 10 lines, updating every second. Updating too fast means it won't work.
+        buffer = deque(maxlen=10)
+        table = Table()
+        table.add_column("Output")
+        with Live(table, refresh_per_second=10) as live:
+            for line in iter(stdout.readline, ""):
+                buffer.append(line.strip())
+                table.rows.clear()
+                for line in buffer:
+                    table.add_row(line)
+
     error = stderr.read().decode()
     if error:
         print(f"Error executing commands: {commands}")
@@ -41,11 +49,13 @@ def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
 def subprocess_execute(commands: List[str], silent=False) -> bool:
     separator = " && "
     combined_commands = separator.join(commands)
-    process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    process.communicate()
-    if process.stderr:
+    process = subprocess.Popen(combined_commands, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for line in process.stdout:
+        print(line)
+    if process.returncode != 0:
         print(f"Error executing commands: {commands}")
-        print(f"{COLOR_ERROR}{process.stderr.decode()}{COLOR_END}")
+        for line in process.stderr:
+            print(f"{COLOR_ERROR}{line}{COLOR_END}")
         return False
     return True
 
