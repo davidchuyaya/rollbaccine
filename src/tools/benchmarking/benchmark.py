@@ -42,7 +42,14 @@ class Benchmark(ABC):
         pass
 
     @abstractmethod
-    def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System) -> bool:
+    def needs_storage(self) -> bool:
+        """
+        Returns whether the benchmark requires Azure storage.
+        """
+        pass
+
+    @abstractmethod
+    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str) -> bool:
         """
         Installs the benchmarking tool on the remote machine if necessary.
         By convention, the first connection is the Rollbaccine primary, if any.
@@ -51,7 +58,7 @@ class Benchmark(ABC):
         pass
 
     @abstractmethod
-    def run(self, username: str, system_type: System, output_dir: str) -> bool:
+    def run(self, system_type: System, output_dir: str) -> bool:
         """
         Executes benchmarks locally and retrieves the results.
         """

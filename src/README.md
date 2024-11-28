@@ -328,8 +328,9 @@ Read from file: Hello, world!
 ```
 
 
-# Running in the cloud
-We will create an Azure VM with a Ubuntu 24.04 image and at least 8 cores, with secure boot turned off so we can load kernel modules. 
+# Running on Azure
+
+## Setup
 
 If you haven't already, install the Azure CLI and log in:
 ```bash
@@ -337,66 +338,30 @@ curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 az login
 ```
 
-TODO: Should run ssh-agent in script so we don't have to enter the password so many times.
-
-In the root directory (`~/rollbaccine`), launch the VMs in a new resource group. Replace the `-n` name `rollbaccine` with whatever name you wish:
-```bash
-ssh-add ~/.ssh/id_rsa
-./launch.sh -n rollbaccine
-```
-Then follow the instructions outputted by [launch.sh](launch.sh) to SSH into the VM and launch rollbaccine.
-
-On each machine restart, run the following script:
-```bash
-./on_restart.sh
-```
-
-When you're done with the VMs, delete them, replacing `rollbaccine` with the name you used above:
-```bash
-./cleanup -n rollbaccine
-```
-
-# Running on Azure
-
-## Setup
-
-Install `azd` by following directions [here](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/install-azd).
-Log into your Azure account (twice):
-```bash
-az login
-azd auth login
-```
-
 Install Python dependencies:
 ```bash
 pip install -r tools/benchmarking/requirements.txt
 ```
-
-Create password-less SSH keys (clicking Enter on all options):
+If your keys in `~/.ssh/id_rsa` are password-protected, create password-less SSH keys (clicking Enter on all options):
 ```bash
+cd ~/.ssh
 ssh-keygen -t rsa -b 4096
 ```
 
-Before we run the scripts in tools/benchmarking, we need to create a `.env` file at the root of the repository and fill in the following variables:
+## Launching VMs and cleaning up
 
+To launch VMs, run the following command **from the root of this directory**:
 ```bash
-AZURE_USERNAME="" # Your Azure username
-SUBSCRIPTION_ID="" # Your Azure subscription ID
-SSH_KEY="" # Your SSH public key
-PRIVATE_KEY_PATH="" # The path to your SSH private key
-BASE_PATH="" # The path to the root directory of this repository
+python3 src/tools/benchmarking/run_benchmarks.py <system type> <benchmark name>
 ```
+`<system type>` is one of `UNREPLICATED`, `DM`, `REPLICATED`, or `ROLLBACCINE`.  
+`<benchmark name>` is one of `fio`, `filebench`, `postgres`, `hdfs`, or `nimble_hdfs`.  
+Outputs will be saved to the `results` folder.
 
-## Launching VMs
-
-To launch VMs, run the following command:
-
+If the script does not complete successfully, you will have to manually clean up resources when you are done debugging. To do so, run the following command:
 ```bash
-cd tools/benchmarking
-python3 run_benchmarks.py
+./cleanup.h -i <benchmark name>
 ```
-
-This will run FIO benchmarks on the two VMs and save the results to the `results` directory.
 
 ## Plotting results
 

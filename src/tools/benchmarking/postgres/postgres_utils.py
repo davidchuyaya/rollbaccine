@@ -1,19 +1,12 @@
 import os
-import subprocess
-import uuid
-import itertools
 import sys
-import time
-from dotenv import load_dotenv
+from getpass import getuser
 
 # Add the parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from benchmark import *
 from utils import *
-
-MOUNT_DIR = '/mnt/postgres'
-DATA_DIR = f"{MOUNT_DIR}/data"
 
 class PostgresBenchmark(Benchmark):
     def name(self):
@@ -27,20 +20,21 @@ class PostgresBenchmark(Benchmark):
     
     def benchmarking_vm(self):
         return 1 # Don't run benchmarking on the primary
+    
+    def needs_storage(self) -> bool:
+        return False
 
-    def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System):
+    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         # Install Postgres on primary
         primary = connections[0]
         primary_private_ip = private_ips[0]
         if not is_installed(primary, 'which psql'):
             print("Installing Postgres on primary, may take a few minutes")
-            commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
-            commands.extend([
+            success = ssh_execute(primary, [
                 "sudo apt-get -qq update",
                 "sudo apt-get install -qq -y postgresql-common",
                 # Install to our custom directory
                 rf"echo 'data_directory = '\'{DATA_DIR}\' | sudo tee -a /etc/postgresql-common/createcluster.conf",
-                f"sudo mkdir -p {DATA_DIR}",
                 f"sudo chown -R postgres:postgres {DATA_DIR}",
                 "sudo apt-get install -qq -y postgresql",
                 # Listens to public addresses
@@ -51,7 +45,6 @@ class PostgresBenchmark(Benchmark):
                 "sudo -u postgres /usr/lib/postgresql/*/bin/createuser -s -i -d -r -l -w admin",
                 "sudo -u postgres /usr/lib/postgresql/*/bin/createdb benchbase",
             ])
-            success = ssh_execute(primary, commands)
             if not success:
                 return False
 
@@ -74,26 +67,21 @@ class PostgresBenchmark(Benchmark):
                 return False
             
             print("Copying config file to benchmarking VM")
-            load_dotenv()
-            TPCC_CONFIG = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'postgres', 'tpcc_config.xml')
             REMOTE_CONFIG = "benchbase-2023/target/benchbase-postgres/config/tpcc_config.xml"
-            upload(benchbase, TPCC_CONFIG, REMOTE_CONFIG)
+            upload(benchbase, "src/tools/benchmarking/postgres/tpcc_config.xml", REMOTE_CONFIG)
 
             print("Modifying config file")
-            success = ssh_execute(benchbase, [
-                f"sed -i 's/localhost/{primary_private_ip}/g' {REMOTE_CONFIG}"
-            ])
+            success = ssh_execute(benchbase, [f"sed -i 's/localhost/{primary_private_ip}/g' {REMOTE_CONFIG}"])
             if not success:
                 return False
         return True
 
-    def run(self, username: str, system_type: System, output_dir: str):
+    def run(self, system_type: System, output_dir: str):
         print("Running TPCC, may take a few minutes")
         success = subprocess_execute([
-            f"cd /home/{username}/benchbase-2023/target/benchbase-postgres",
+            "cd benchbase-2023/target/benchbase-postgres",
             f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {output_dir} --clear=true --create=true --load=true --execute=true"
         ])
-
         if success:
             print(f"TPCC benchmark completed successfully")
         else:
@@ -102,4 +90,4 @@ class PostgresBenchmark(Benchmark):
         return success
 
 if __name__ == "__main__":
-    PostgresBenchmark().run(sys.argv[1], System[sys.argv[2]], sys.argv[3])
+    PostgresBenchmark().run(System[sys.argv[1]], sys.argv[2])

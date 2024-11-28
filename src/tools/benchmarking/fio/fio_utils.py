@@ -1,5 +1,4 @@
 import os
-import subprocess
 import uuid
 import itertools
 import sys
@@ -99,8 +98,11 @@ class FioBenchmark(Benchmark):
     
     def benchmarking_vm(self):
         return 0 # Run fio on the primary
+    
+    def needs_storage(self) -> bool:
+        return False
 
-    def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System):
+    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         ssh = connections[self.benchmarking_vm()]
         if not is_installed(ssh, 'which fio'):
             return ssh_execute(ssh, [
@@ -109,7 +111,7 @@ class FioBenchmark(Benchmark):
             ])
         return True
 
-    def run(self, username: str, system_type: System, output_dir: str):
+    def run(self, system_type: System, output_dir: str):
         # Define the list of numjobs (thread counts) to test
         numjobs_list = [1, 2, 4, 8, 16]
         fio_parameters_list = self.build_fio_parameters_list(system_type)
@@ -146,4 +148,4 @@ class FioBenchmark(Benchmark):
         return True  # Indicate success
 
 if __name__ == "__main__":
-    FioBenchmark().run(sys.argv[1], System[sys.argv[2]], sys.argv[3])
+    FioBenchmark().run(System[sys.argv[1]], sys.argv[2])

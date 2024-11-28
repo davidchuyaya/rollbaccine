@@ -1,15 +1,15 @@
 from paramiko import SSHClient
 from typing import List
-from collections import deque
 from benchmark import *
 import subprocess
-import sys
-import time
 
 OUTPUT_FILE = "stdout.txt"
 COLOR_UNIMPORTANT = '\033[90m'
 COLOR_ERROR = '\033[91m'
 COLOR_END = '\033[0m'
+
+MOUNT_DIR = '/mnt/newfs'
+DATA_DIR = f"{MOUNT_DIR}/data"
 
 def is_installed(ssh: SSHClient, command: str) -> bool:
     """
@@ -25,8 +25,11 @@ def clear_output_file():
 def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
     """
     Execute a list of commands on an SSH connection.
-    DO NOT pass a string into commands!
     """
+    if isinstance(commands, str):
+        print("Please pass a list of commands to ssh_execute, not a string")
+        return False
+
     # Make sure we source the environment variables placed in .profile first
     commands.insert(0, "source .profile")
     # Join commands with "&&" so we can use "cd" correctly
@@ -50,8 +53,11 @@ def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
 def ssh_execute_background(ssh: SSHClient, commands: List[str]):
     """
     Execute the last command in a list of commands on an SSH connection in the background, allowing it to keep running even when the SSH connection is closed.
-    DO NOT pass a string into commands!
     """
+    if isinstance(commands, str):
+        print("Please pass a list of commands to ssh_execute_background, not a string")
+        return False
+
     # Make sure we source the environment variables placed in .profile first
     commands.insert(0, "source .profile")
     # Join commands with "&&" so we can use "cd" correctly
@@ -65,8 +71,11 @@ def ssh_execute_background(ssh: SSHClient, commands: List[str]):
 def subprocess_execute(commands: List[str], silent=False) -> bool:
     """
     Execute a list of commands in a subprocess.
-    DO NOT pass a string into commands!
     """
+    if isinstance(commands, str):
+        print("Please pass a list of commands to subprocess_execute, not a string")
+        return False
+
     separator = " && "
     combined_commands = separator.join(commands)
     process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

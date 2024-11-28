@@ -1,11 +1,7 @@
 import os
-import subprocess
-import uuid
-import itertools
 import sys
-import time
 import threading
-from dotenv import load_dotenv
+from getpass import getuser
 
 # Add the parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -13,16 +9,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from benchmark import *
 from utils import *
 
-MOUNT_DIR = '/mnt/nimble-hdfs'
-DATA_DIR = f"{MOUNT_DIR}/data"
-
 ENDPOINT_PORT = 8082 # Must match port in hdfs-site.xml
 COORDINATOR_PORT = 8080
 ENDORSER_PORT = 9091
 
 class NimbleHDFSBenchmark(Benchmark):
     def name(self):
-        return "nimble-hdfs"
+        return "nimble_hdfs"
     
     def filename(self):
         return "nimble_hdfs/nimble_hdfs_utils.py"
@@ -32,6 +25,9 @@ class NimbleHDFSBenchmark(Benchmark):
     
     def benchmarking_vm(self):
         return 0
+    
+    def needs_storage(self) -> bool:
+        return True
     
     def install_nimble_on_vm(self, ssh: SSHClient):
         success = ssh_execute(ssh, [
@@ -46,7 +42,7 @@ class NimbleHDFSBenchmark(Benchmark):
         if not success:
             return False
 
-    def install(self, username: str, connections: List[SSHClient], private_ips: List[str], system_type: System):
+    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         name_node_ip = private_ips[self.benchmarking_vm()]
         name_node_ssh = connections[self.benchmarking_vm()]
         coordinator_ip = private_ips[1]
@@ -57,34 +53,26 @@ class NimbleHDFSBenchmark(Benchmark):
         print(f"Checking if namenode has HDFS")
         if not is_installed(name_node_ssh, 'which hdfs'):
             print("Installing HDFS on the namenode")
-            commands = mount_ext4_commands(mount_point(system_type), MOUNT_DIR)
-            commands.extend([
-                f"sudo mkdir -p {DATA_DIR}",
-                f"sudo chown -R `whoami` {DATA_DIR}",
+            success = ssh_execute(ssh, [
                 "wget -nv https://github.com/IceCoooola/hadoop-nimble/releases/download/3.3.3/hadoop-3.3.3.tar.gz",
                 "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get -qq update",
                 "sudo apt-get -y -qq install openjdk-8-jre-headless",
-                f"echo 'PATH=$PATH:/home/{username}/hadoop-3.3.3/bin' >> .profile",
+                f"echo 'PATH=$PATH:/home/{getuser()}/hadoop-3.3.3/bin' >> .profile",
                 "echo 'export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64' >> .profile",
             ])
-            
-            success = ssh_execute(name_node_ssh, commands)
             if not success:
                 return False
             
             print(f"Uploading configuration file")
-            load_dotenv()
-            CORE_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'nimble_hdfs', 'core-site.xml')
-            HDFS_SITE_PATH = os.path.join(os.getenv('BASE_PATH'), 'src', 'tools', 'benchmarking', 'nimble_hdfs', 'hdfs-site.xml')
-            upload(name_node_ssh, CORE_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml')
-            upload(name_node_ssh, HDFS_SITE_PATH, f'/home/{username}/hadoop-3.3.3/etc/hadoop/hdfs-site.xml')
+            upload(name_node_ssh, "src/tools/benchmarking/nimble_hdfs/core-site.xml", f'/home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml')
+            upload(name_node_ssh, "src/tools/benchmarking/nimble_hdfs/hdfs-site.xml", f'/home/{getuser()}/hadoop-3.3.3/etc/hadoop/hdfs-site.xml')
 
             # Replace {namenodeip} in core-site with the actual namenode IP
             print("Replacing {namenodeip} in core-site.xml")
-            ssh_execute(name_node_ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+            ssh_execute(name_node_ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
             print("Replacing {nimbleip} in core-site.xml")
-            ssh_execute(name_node_ssh, [f"sed -i 's/{{nimbleip}}/{coordinator_ip}/g' /home/{username}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+            ssh_execute(name_node_ssh, [f"sed -i 's/{{nimbleip}}/{coordinator_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
             print(f"Finished installing HDFS")
 
         print("Installing Nimble on the coordinator and endorsers (in parallel)")
@@ -106,11 +94,10 @@ class NimbleHDFSBenchmark(Benchmark):
                 f"target/release/endorser -p {ENDORSER_PORT} -t {endorser_ips[i]}",
             ])
 
-        # TODO: Switch from memory to Azure tables once this works 
         print("Starting the coordinator")
         ssh_execute_background(coordinator_ssh, [
             "cd Nimble",
-            f"target/release/coordinator -t {coordinator_ip} -p {COORDINATOR_PORT} -e 'http://{endorser_ips[0]}:{ENDORSER_PORT},http://{endorser_ips[1]}:{ENDORSER_PORT},http://{endorser_ips[2]}:{ENDORSER_PORT}' -s 'memory'",
+            f"target/release/coordinator -t {coordinator_ip} -p {COORDINATOR_PORT} -e 'http://{endorser_ips[0]}:{ENDORSER_PORT},http://{endorser_ips[1]}:{ENDORSER_PORT},http://{endorser_ips[2]}:{ENDORSER_PORT}' -s 'table' -n nimbledb -a {storage_name} -k {storage_key}",
         ])
         
         print("Starting the endpoint (still on the coordinator)")
@@ -121,10 +108,11 @@ class NimbleHDFSBenchmark(Benchmark):
         
         return True
 
-    def run(self, username: str, system_type: System, output_dir: str):
+    def run(self, system_type: System, output_dir: str):
         THREADS = 16
-        FILES = 500000
-        DIRS = 500000
+        # Use fewer files and directories since Nimble is very slow
+        FILES = 100000
+        DIRS = 100000
 
         print("Starting the namenode")
         success = subprocess_execute(["hdfs namenode -format", "hdfs --daemon start namenode"])
@@ -147,4 +135,4 @@ class NimbleHDFSBenchmark(Benchmark):
         return True  # Indicate success
 
 if __name__ == "__main__":
-    NimbleHDFSBenchmark().run(sys.argv[1], System[sys.argv[2]], sys.argv[3])
+    NimbleHDFSBenchmark().run(System[sys.argv[1]], sys.argv[2])
