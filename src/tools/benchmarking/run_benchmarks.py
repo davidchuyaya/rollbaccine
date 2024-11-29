@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+from typing import Tuple
 import paramiko
 from getpass import getuser
 # Custom imports
@@ -81,28 +83,34 @@ def get_backup_commands(private_ip_0):
     ]
     return commands
 
-def ssh_and_setup(public_ip, system_type: System, index, primary_private_ip):
-    try:
-        ssh = connect_ssh(public_ip)
+def setup_main_nodes(system_type: System, connections: List[SSHClient], private_ips: List[str]):
+    for i in range(len(connections)):
+        ssh = connections[i]
+
         if not is_installed(ssh, f"test -d {DATA_DIR} && echo 1"):
-            print(f"Unmounting {DATA_DIR} then mounting with what we want")
+            print(f"Unmounting {DATA_DIR} then mounting with what we want on VM {i}")
 
             if system_type == System.UNREPLICATED:
                 ssh_execute(ssh, ["sudo umount /dev/sdb1"])
             elif system_type == System.DM:
-                print("Setting up dm-crypt and dm-integrity, may take a while")
+                print("Setting up dm-crypt and dm-integrity")
                 ssh_execute(ssh, [
                     "sudo umount /dev/sdb1",
-                    "sudo cryptsetup luksFormat /dev/sdb1 --integrity aead --cipher aes-gcm-random",
-                    "sudo cryptsetup open --perf-no_read_workqueue --perf-no_write_workqueue --type luks /dev/sdb1 secure",
+                    # Create an empty file to use as the key
+                    "touch emptykey.txt",
+                    # Kill the disk formatting after 10 seconds, since it'll take 10 minutes otherwise, and we don't actually need to format the disk (integrity errors don't affect performance).
+                    "timeout 10s sudo cryptsetup luksFormat /dev/sdb1 --integrity aead --cipher aes-gcm-random --key-file emptykey.txt -q",
+                    "sudo cryptsetup open --perf-no_read_workqueue --perf-no_write_workqueue --type luks /dev/sdb1 secure --key-file emptykey.txt",
                 ])
+            elif system_type == System.REPLICATED:
+                ssh_execute(ssh, ["sudo umount /dev/sda"])
             elif system_type == System.ROLLBACCINE:
                 install_rollbaccine(ssh)
                 # Setup primary and backup
-                if index == 0:
+                if i == 0:
                     ssh_execute(ssh, get_leader_commands())
-                elif index == 1:
-                    ssh_execute(ssh, get_backup_commands(primary_private_ip))
+                elif i == 1:
+                    ssh_execute(ssh, get_backup_commands(private_ips[0]))
 
             print(f"Installing ext4 at {MOUNT_DIR}")
             ssh_execute(ssh, mount_ext4_commands(mount_point(system_type), MOUNT_DIR))
@@ -112,11 +120,18 @@ def ssh_and_setup(public_ip, system_type: System, index, primary_private_ip):
                 f"sudo chown -R `whoami` {DATA_DIR}"
             ])
 
-        # Create directories
-    except Exception as e:
-        print(f"Connection failed {public_ip}: {e}")
-        return
-    return ssh
+def ssh_vm_json(vm_json) -> Tuple[List[SSHClient], List[str]]:
+    connections = []
+    private_ips = []
+    # Different json formats based on whether we launched 1 or more VMs
+    if isinstance(vm_json, dict):
+        connections.append(connect_ssh(vm_json['publicIpAddress']))
+        private_ips.append(vm_json['privateIpAddress'])
+    else:
+        for vm in vm_json:
+            connections.append(connect_ssh(vm['publicIps']))
+            private_ips.append(vm['privateIps'])
+    return connections, private_ips
 
 def run_everything(system_type: System, benchmark_name: str):
     """
@@ -129,48 +144,33 @@ def run_everything(system_type: System, benchmark_name: str):
         num_vms += 1
     
     # Create resources
-    subprocess_execute([f"./launch.sh -i {benchmark_name} -n {num_vms} {'-s' if benchmark.needs_storage() else ''}"])
+    subprocess_execute([f"./launch.sh -b {benchmark_name} -s {system_type} -n {num_vms}"])
     
-    with open('vms.json') as f:
-        vm_ip_data = json.load(f)
-    storage_name = "rollbaccineNimble"
+    storage_name = "rollbaccinenimble" # Must match storage name in ./launch.sh
     storage_key = ""
     if benchmark.needs_storage():
+        print("Extracting storage key")
         with open ('storage.json') as f:
             storage_data = json.load(f)
             storage_key = storage_data[0].get("value")
             print(f"Found storage key: {storage_key}")
 
     # Setup all VMs and add SSH connections to the list
-    print("Connecting to VMs and setting up")
+    print("Connecting to VMs and setting up main VMs")
     print(f"\033[92mPlease run `tail -f {OUTPUT_FILE}` to see the execution log on the servers.\033[0m")
     clear_output_file()
     connections = []
     private_ips = []
-    i = 0
-    primary_private_ip = ''
-    # Special handling if there is only 1 VM, since the JSON output looks different
-    if num_vms == 1:
-        ssh = ssh_and_setup(vm_ip_data['publicIpAddress'], system_type, i, primary_private_ip)
-        private_ip = vm_ip_data['privateIpAddress']
-        private_ips.append(private_ip)
-        connections.append(ssh)
-    else:
-        for vm in vm_ip_data:
-            ssh = ssh_and_setup(vm['publicIps'], system_type, i, primary_private_ip)
-            private_ip = vm['privateIps']
-            private_ips.append(private_ip)
-            # For rollbaccine, the primary is always the 1st VM, the backup is always the 2nd
-            if system_type == System.ROLLBACCINE:
-                if i == 0:
-                    primary_private_ip = private_ip
-                elif i == 1:
-                    # The backup is not exposed to the benchmark, so we don't add it to connections
-                    ssh.close()
-                    i += 1
-                    continue
-            connections.append(ssh)
-            i += 1
+    with open('vm1.json') as f:
+        vm_json = json.load(f)
+        connections, private_ips = ssh_vm_json(vm_json)
+        setup_main_nodes(system_type, connections, private_ips)
+    if os.path.isfile('vm2.json'):
+        with open('vm2.json') as f:
+            vm_json = json.load(f)
+            vm2_connections, vm2_private_ips = ssh_vm_json(vm_json)
+            connections += vm2_connections
+            private_ips += vm2_private_ips
             
     # Install everything the benchmark needs on the VM
     print(f"Installing {benchmark_name} on the main VM")
@@ -221,7 +221,7 @@ def run_everything(system_type: System, benchmark_name: str):
         return False
 
     # Run delete_azure_vm.py to delete resources
-    subprocess_execute([f"./cleanup.sh -i {benchmark_name}"])
+    subprocess_execute([f"./cleanup.sh -b {benchmark_name} -s {system_type}"])
 
 if __name__ == "__main__":
     run_everything(System[sys.argv[1]], sys.argv[2])

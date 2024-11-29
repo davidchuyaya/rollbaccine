@@ -360,7 +360,7 @@ Outputs will be saved to the root of this directory.
 
 If the script does not complete successfully, you will have to manually clean up resources when you are done debugging. To do so, run the following command:
 ```bash
-./cleanup.h -i <benchmark name>
+./cleanup.h -s <system type> -b <benchmark name> 
 ```
 
 ## Plotting results
