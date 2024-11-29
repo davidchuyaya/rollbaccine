@@ -9,9 +9,6 @@ from benchmark import *
 from utils import *
 
 class FileBenchmark(Benchmark):
-    def name(self):
-        return "filebench"
-    
     def filename(self):
         return "filebench/filebench_utils.py"
     

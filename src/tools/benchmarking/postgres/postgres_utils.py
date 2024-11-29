@@ -9,9 +9,6 @@ from benchmark import *
 from utils import *
 
 class PostgresBenchmark(Benchmark):
-    def name(self):
-        return "postgres"
-    
     def filename(self):
         return "postgres/postgres_utils.py"
     

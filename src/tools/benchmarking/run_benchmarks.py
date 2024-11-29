@@ -133,7 +133,7 @@ def run_everything(system_type: System, benchmark_name: str):
     
     with open('vms.json') as f:
         vm_ip_data = json.load(f)
-    storage_name = f"rollbaccine{benchmark_name}"
+    storage_name = "rollbaccineNimble"
     storage_key = ""
     if benchmark.needs_storage():
         with open ('storage.json') as f:

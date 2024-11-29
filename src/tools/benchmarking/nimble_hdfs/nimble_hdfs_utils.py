@@ -14,9 +14,6 @@ COORDINATOR_PORT = 8080
 ENDORSER_PORT = 9091
 
 class NimbleHDFSBenchmark(Benchmark):
-    def name(self):
-        return "nimble_hdfs"
-    
     def filename(self):
         return "nimble_hdfs/nimble_hdfs_utils.py"
     

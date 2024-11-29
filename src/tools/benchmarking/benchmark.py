@@ -14,13 +14,6 @@ class System(Enum):
 
 class Benchmark(ABC):
     @abstractmethod
-    def name(self) -> str:
-        """
-        Returns the print-friendly name of the benchmark.
-        """
-        pass
-
-    @abstractmethod
     def filename(self) -> str:
         """
         Returns the filename of the benchmarking tool, from the src/tools/benchmarking directory.

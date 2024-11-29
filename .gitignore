@@ -115,9 +115,8 @@ Thumbs.db
 *.log
 
 # Azure-related
-azure_vm_setup.py
-vm_ips.json
 vms.json
+storage.json
 
 # results and graphs
 graphs/

@@ -9,9 +9,6 @@ from benchmark import *
 from utils import *
 
 class HDFSBenchmark(Benchmark):
-    def name(self):
-        return "hdfs"
-    
     def filename(self):
         return "hdfs/hdfs_utils.py"
     

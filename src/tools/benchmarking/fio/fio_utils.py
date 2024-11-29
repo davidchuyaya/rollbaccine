@@ -86,10 +86,6 @@ class FioBenchmark(Benchmark):
 
             fio_parameters_list.append(fio_param)
         return fio_parameters_list
-    
-    def name(self):
-        return "fio"
-    
     def filename(self):
         return "fio/fio_utils.py"
     
