@@ -1044,6 +1044,11 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         return DM_MAPIO_REMAPPED;
     }
 
+    // Split up bios that are too big
+    if (bio->bi_iter.bi_size / PAGE_SIZE > BIO_MAX_VECS) {
+        dm_accept_partial_bio(bio, BIO_MAX_VECS * SECTORS_PER_PAGE);
+    }
+
     // Copy bio if it's a write
     if (device->is_leader) {
         is_cloned = true;
