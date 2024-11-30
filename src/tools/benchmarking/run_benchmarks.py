@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from time import sleep
 from typing import Tuple
 import paramiko
 from getpass import getuser
@@ -83,6 +84,15 @@ def get_backup_commands(private_ip_0):
     ]
     return commands
 
+def install_ext4(ssh, system_type: System):
+    print(f"Installing ext4 at {MOUNT_DIR}")
+    ssh_execute(ssh, mount_ext4_commands(mount_point(system_type), MOUNT_DIR))
+    print(f"Creating {MOUNT_DIR} and giving the user permissions")
+    ssh_execute(ssh, [
+        f"sudo mkdir -p {DATA_DIR}",
+        f"sudo chown -R `whoami` {DATA_DIR}"
+    ])
+
 def setup_main_nodes(system_type: System, connections: List[SSHClient], private_ips: List[str]):
     for i in range(len(connections)):
         ssh = connections[i]
@@ -93,13 +103,12 @@ def setup_main_nodes(system_type: System, connections: List[SSHClient], private_
             if system_type == System.UNREPLICATED:
                 ssh_execute(ssh, ["sudo umount /dev/sdb1"])
             elif system_type == System.DM:
-                print("Setting up dm-crypt and dm-integrity")
+                print("Setting up dm-crypt and dm-integrity, will take 10 minutes to format the disk")
                 ssh_execute(ssh, [
                     "sudo umount /dev/sdb1",
                     # Create an empty file to use as the key
                     "touch emptykey.txt",
-                    # Kill the disk formatting after 10 seconds, since it'll take 10 minutes otherwise, and we don't actually need to format the disk (integrity errors don't affect performance).
-                    "timeout 10s sudo cryptsetup luksFormat /dev/sdb1 --integrity aead --cipher aes-gcm-random --key-file emptykey.txt -q",
+                    "sudo cryptsetup luksFormat /dev/sdb1 --integrity aead --cipher aes-gcm-random --key-file emptykey.txt -q",
                     "sudo cryptsetup open --perf-no_read_workqueue --perf-no_write_workqueue --type luks /dev/sdb1 secure --key-file emptykey.txt",
                 ])
             elif system_type == System.REPLICATED:
@@ -112,13 +121,16 @@ def setup_main_nodes(system_type: System, connections: List[SSHClient], private_
                 elif i == 1:
                     ssh_execute(ssh, get_backup_commands(private_ips[0]))
 
-            print(f"Installing ext4 at {MOUNT_DIR}")
-            ssh_execute(ssh, mount_ext4_commands(mount_point(system_type), MOUNT_DIR))
-            print(f"Creating {MOUNT_DIR} and giving the user permissions")
-            ssh_execute(ssh, [
-                f"sudo mkdir -p {DATA_DIR}",
-                f"sudo chown -R `whoami` {DATA_DIR}"
-            ])
+            # If this isn't rollbaccine, then we're immediately to mount the file system.
+            # If this is rollbaccine, we'll need to set up the backup first (so they can sync).
+            if not system_type == System.ROLLBACCINE:
+                install_ext4(ssh, system_type)
+
+    if system_type == System.ROLLBACCINE:
+        # Wait for the backup to finish setting up
+        sleep(10)
+        install_ext4(connections[0], system_type)
+                
 
 def ssh_vm_json(vm_json) -> Tuple[List[SSHClient], List[str]]:
     connections = []

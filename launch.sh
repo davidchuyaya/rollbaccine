@@ -77,6 +77,7 @@ launch_vm () {
         --location $LOCATION \
         --zone $ZONE \
         --size $2 \
+        --enable-secure-boot false \
         --image Canonical:ubuntu-24_04-lts:server:latest $COUNT $4 > $3
 
     # Confidential VMs, once our subscription has access to them:
