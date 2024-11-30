@@ -46,13 +46,6 @@
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 // #define LATENCY_TRACKING
 
-void mutex_lock_and_debug(struct mutex* lock, const char* func) {
-    printk(KERN_INFO "Locking mutex in %s\n", func);
-    mutex_lock(lock);
-}
-
-// #define mutex_lock(lock) mutex_lock_and_debug(lock, __func__)
-
 // Used to compare against checksums to see if they have been set yet (or if they're all 0)
 static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
 
@@ -93,7 +86,7 @@ struct additional_hash_msg {
     uint64_t recipient_id;
     uint64_t msg_index;
     char checksum_and_iv[];
-};
+} __attribute__((packed));
 
 // Used to return a pair from handshake_ids()
 struct multithreaded_handshake_pair {
@@ -147,7 +140,6 @@ struct rollbaccine_device {
     int write_index;
     struct mutex index_lock;  // Must be obtained for any operation modifying write_index
 
-    // TODO: Support with RB tree once the ring is full
     atomic_long_t *pending_bio_ring; // Ring buffer of bios received but not yet write-able (because some prefix has not arrived)
     atomic_t pending_bio_ring_head; // Position of next bio to submit in pending_bio_ring
 
@@ -311,13 +303,12 @@ int start_server(struct rollbaccine_device *device, ushort port);
 int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
 
-inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
-    return kmalloc(sizeof(struct additional_hash_msg) + checksum_and_iv_size, GFP_KERNEL);
-}
 
 inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg) + checksum_and_iv_size; }
 
-inline size_t additional_hash_msg_size_no_hash(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg); }
+inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
+    return kmalloc(additional_hash_msg_size(checksum_and_iv_size), GFP_KERNEL);
+}
 
 inline bool has_checksum(unsigned char *checksum) {
     return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
@@ -348,11 +339,11 @@ inline unsigned char *alloc_bio_checksum_and_iv(struct rollbaccine_device *devic
 }
 
 inline unsigned char *get_bio_checksum(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return &checksum_and_iv[(current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+    return checksum_and_iv + (current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
 }
 
 inline unsigned char *get_bio_iv(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return &checksum_and_iv[(current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
+    return checksum_and_iv + (current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE;
 }
 
 inline void update_global_checksum_and_iv(struct rollbaccine_device *device, unsigned char *checksum_and_iv, sector_t start_sector, int num_sectors) {
@@ -855,7 +846,7 @@ void broadcast_bio(struct work_struct *work) {
     metadata.bi_opf = clone->bi_opf;
     metadata.sector = clone->bi_iter.bi_sector;
     // Copy checksum and IV into metadata
-    memcpy(metadata.checksum_and_iv, checksum_and_iv, checksum_and_iv_size);
+    memcpy(metadata.checksum_and_iv, checksum_and_iv, min(checksum_and_iv_size, ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE));
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
     WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
@@ -1049,7 +1040,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
     // Big problems if the write is smaller than a page
     if (!is_empty && bio_sectors(bio) < SECTORS_PER_PAGE) {
-        printk(KERN_ERR "Write size is smaller than smallest write we can handle");
+        printk(KERN_ERR "Write size is smaller than smallest write we can handle: %d", bio_sectors(bio));
         return DM_MAPIO_REMAPPED;
     }
 
@@ -1074,16 +1065,16 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 bio_data->is_fsync = requires_fsync(bio);
                 bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
 
-                // Encrypt
-                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
-                print_and_update_latency("leader_process_write: encryption", &time);
-
                 // Create the network clone
                 bio_data->deep_clone = deep_bio_clone(device, bio);
                 if (!bio_data->deep_clone) {
                     printk(KERN_ERR "Could not create deep clone");
                     return DM_MAPIO_REMAPPED;
                 }
+
+                // Encrypt
+                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
+                print_and_update_latency("leader_process_write: encryption", &time);
 
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
                 bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
@@ -1212,6 +1203,7 @@ void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char
 
 unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
     int ret = 0;
+    struct bio *bio;
     struct bio_vec bv;
     uint64_t curr_sector;
     struct aead_request *req;
@@ -1235,8 +1227,10 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
 
     switch (enc_or_dec) {
         case ROLLBACCINE_ENCRYPT:
+            // Operate on the deep clone, since otherwise we may overwrite buffers from the user and can cause a crash
+            bio = bio_data->deep_clone;
             // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio_data->bio_src));
+            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio));
             if (!bio_checksum_and_iv) {
                 printk(KERN_ERR "Could not allocate checksum and iv for bio");
                 goto free_and_return;
@@ -1244,9 +1238,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
             print_and_update_latency("enc_or_dec_bio: ENCRYPT alloc_bio_checksum_and_iv", &time);
             break;
         case ROLLBACCINE_DECRYPT:
+            bio = bio_data->bio_src;
             break;
         case ROLLBACCINE_VERIFY:
-        // Allocate a free page to store decrypted data into. We'll discard this page since we're just verifying
+            bio = bio_data->bio_src;
+            // Allocate a free page to store decrypted data into. We'll discard this page since we're just verifying
             page_verify = page_cache_alloc(bio_data->device);
             if (!page_verify) {
                 printk(KERN_ERR "Could not allocate page for verification");
@@ -1255,11 +1251,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
             print_and_update_latency("enc_or_dec_bio: VERIFY page_cache_alloc", &time);
             break;
     }
-
-    while (bio_data->bio_src->bi_iter.bi_size) {
+	
+    while (bio->bi_iter.bi_size) {
         // printk(KERN_INFO "enc/dec starting");
-        curr_sector = bio_data->bio_src->bi_iter.bi_sector;
-        bv = bio_iter_iovec(bio_data->bio_src, bio_data->bio_src->bi_iter);
+        curr_sector = bio->bi_iter.bi_sector;
+        bv = bio_iter_iovec(bio, bio->bi_iter);
 
         switch (enc_or_dec) {
             case ROLLBACCINE_ENCRYPT:
@@ -1353,7 +1349,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         }
 
         enc_or_dec_next_sector:
-        bio_advance_iter(bio_data->bio_src, &bio_data->bio_src->bi_iter, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+        bio_advance_iter(bio, &bio->bi_iter, ROLLBACCINE_ENCRYPTION_GRANULARITY);
         reinit_completion(&wait.completion);
     }
 
@@ -1363,9 +1359,9 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         page_cache_free(bio_data->device, page_verify);
     }
     // Reset bio to start after iterating for encryption
-    bio_data->bio_src->bi_iter.bi_sector = bio_data->start_sector;
-    bio_data->bio_src->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
-    bio_data->bio_src->bi_iter.bi_idx = 0;
+    bio->bi_iter.bi_sector = bio_data->start_sector;
+    bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
+    bio->bi_iter.bi_idx = 0;
     print_and_update_latency("enc_or_dec_bio", &total_time);
     return bio_checksum_and_iv; // NOTE: This will be NULL for reads
 }
@@ -2015,6 +2011,13 @@ int start_server(struct rollbaccine_device *device, ushort port) {
     return 0;
 }
 
+static void rollbaccine_io_hints(struct dm_target *ti, struct queue_limits *limits) {
+    limits->logical_block_size = max_t(unsigned int, limits->logical_block_size, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+    limits->physical_block_size = max_t(unsigned int, limits->physical_block_size, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+    limits->io_min = max_t(unsigned int, limits->io_min, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+    limits->dma_alignment = limits->logical_block_size - 1;
+}
+
 static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigned int status_flags, char *result, unsigned int maxlen) {
     struct rollbaccine_device *device = ti->private;
     unsigned int sz = 0;  // Required by DMEMIT
@@ -2338,12 +2341,12 @@ static void rollbaccine_destructor(struct dm_target *ti) {
 static struct target_type rollbaccine_target = {
     .name = MODULE_NAME,
     .version = {0, 1, 0},
-    .features = DM_TARGET_INTEGRITY,  // TODO: Figure out what this means
     .module = THIS_MODULE,
     .ctr = rollbaccine_constructor,
     .dtr = rollbaccine_destructor,
     .map = rollbaccine_map,
     .status = rollbaccine_status,
+    .io_hints = rollbaccine_io_hints,
 };
 
 int __init rollbaccine_init_module(void) {
