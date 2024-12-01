@@ -53,17 +53,11 @@ static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
 enum MsgType { ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, FOLLOWER_ACK };
 enum EncDecType { ROLLBACCINE_ENCRYPT, ROLLBACCINE_DECRYPT, ROLLBACCINE_VERIFY };
 
-// Note: These message types are sent over network, so they need to be packed & int sizes need to be specific
-struct ballot {
-    uint64_t id;
-    uint64_t num;
-} __attribute__((packed));
-
 struct metadata_msg {
     char msg_hash[SHA256_SIZE];
 
     enum MsgType type;
-    struct ballot bal;
+    uint64_t ballot;
     uint64_t sender_id;
     uint64_t sender_socket_id;
     uint64_t recipient_id;
@@ -116,6 +110,13 @@ struct multisocket {
     struct list_head list;
 };
 
+// Size = 2 for each field because 1 primary and 1 backup (f = 1).
+struct configuration {
+    uint64_t ids[2];
+    uint64_t ballots[2];
+    uint64_t write_indices[2];
+};
+
 struct rollbaccine_device {
     struct dm_dev *dev;
     struct bio_set bs;
@@ -126,11 +127,12 @@ struct rollbaccine_device {
 
     bool is_leader;
     bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
-    int f;
-    int n;
-    uint64_t id;
+    uint64_t id; // Unique to each Rollbaccine instance
+    uint64_t seen_ballot; // Starts at 0, increments whenever we get a message with a higher ballot
+    uint64_t ballot; // Starts at 0, set equal to seen_ballot once we complete initialization or reconfiguration
 
-    struct ballot bal;
+    struct configuration *prior_confs;
+
     // TODO: Track last msg index per unique sender (since the primary may change)
     int write_index;
     struct mutex index_lock;  // Must be obtained for any operation modifying write_index
@@ -141,7 +143,6 @@ struct rollbaccine_device {
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
     struct mutex replica_fsync_lock;
-    int *replica_fsync_indices;  // Len = n
     int max_replica_fsync_index;
     struct bio_list fsyncs_pending_replication;  // List of all fsyncs waiting for replication. Ordered by write index.
 
@@ -237,6 +238,7 @@ struct client_thread_params {
     struct socket *sock;
     struct sockaddr_in addr;
     struct rollbaccine_device *device;
+    uint64_t server_id; // Expected ID of the server
     uint64_t socket_id;
 };
 
@@ -260,7 +262,7 @@ struct page *page_cache_alloc(struct rollbaccine_device *device);
 void atomic_max(atomic_t *old, int new);
 struct bio_data *alloc_bio_data(struct rollbaccine_device * device);
 void ack_bio_to_user_without_executing(struct bio * bio);
-void process_follower_fsync_index(struct rollbaccine_device * device, int follower_id, int follower_fsync_index);
+void process_follower_fsync_index(struct rollbaccine_device * device, int follower_fsync_index);
 bool requires_fsync(struct bio * bio);
 unsigned int remove_fsync_flags(unsigned int bio_opf);
 void free_pages_end_io(struct bio * received_bio);
@@ -290,7 +292,7 @@ void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, u
 struct multithreaded_handshake_pair receive_handshake_id(struct rollbaccine_device *device, struct socket *sock);
 bool add_sender_socket_id_if_unique(struct rollbaccine_device *device, struct multisocket *multisocket, uint64_t sender_socket_id);
 int connect_to_server(void *args);
-int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port);
+int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id, char *addr, ushort port);
 int listen_to_accepted_socket(void *args);
 int listen_for_connections(void *args);
 int start_server(struct rollbaccine_device *device, ushort port);
@@ -596,8 +598,7 @@ void ack_bio_to_user_without_executing(struct bio *bio) {
 
 // Returns the max int that a quorum agrees to. Note that since the leader itself must have fsync index >= followers' fsync index, the quorum size is f (not f+1).
 // Assumes that the bio->bi_private field stores the write index
-void process_follower_fsync_index(struct rollbaccine_device *device, int follower_id, int follower_fsync_index) {
-    int i, j, num_geq_replica_fsync_indices = 0;
+void process_follower_fsync_index(struct rollbaccine_device *device, int follower_fsync_index) {
     bool max_index_changed = false;
     struct bio *bio;
     int bio_write_index;
@@ -605,65 +606,40 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
     mutex_lock(&device->replica_fsync_lock);
     // Special case for f = 1, n <= 3.
     // What the quorum agrees on = max of what any 1 follower has (plus the leader's fsync index, which must be higher).
-    if (device->f == 1 && device->n <= 3) {
-        if (device->max_replica_fsync_index < follower_fsync_index) {
-            device->max_replica_fsync_index = follower_fsync_index;
-            max_index_changed = true;
+    if (device->max_replica_fsync_index < follower_fsync_index) {
+        device->max_replica_fsync_index = follower_fsync_index;
+        max_index_changed = true;
 #ifdef MEMORY_TRACKING
-            device->last_acked_fsync_index = follower_fsync_index;
+        device->last_acked_fsync_index = follower_fsync_index;
 #endif
-        }
-    }
-    // Otherwise, find the largest fsync index that a quorum agrees to
-    else {
-        device->replica_fsync_indices[follower_id] = follower_fsync_index;
-        for (i = 0; i < device->n; i++) {
-            if (device->max_replica_fsync_index >= device->replica_fsync_indices[i]) {
-                continue;
-            }
-
-            // Count the number of followers with an index >= this index
-            num_geq_replica_fsync_indices = 0;
-            for (j = 0; j < device->n; j++) {
-                if (device->replica_fsync_indices[j] >= device->replica_fsync_indices[i]) {
-                    num_geq_replica_fsync_indices++;
-                }
-            }
-            // If a quorum (including the leader) is reached on this index, store it
-            if (num_geq_replica_fsync_indices >= device->f) {
-                device->max_replica_fsync_index = device->replica_fsync_indices[i];
-                max_index_changed = true;
-            }
-        }
     }
 
     // Loop through all blocked fsyncs if the max index has changed
     if (max_index_changed) {
         // printk(KERN_INFO "New max quorum write index: %d", device->max_replica_fsync_index);
 #ifdef MEMORY_TRACKING
-        device->max_outstanding_fsyncs_pending_replication = umax(device->max_outstanding_fsyncs_pending_replication, device->num_fsyncs_pending_replication);
+    device->max_outstanding_fsyncs_pending_replication = umax(device->max_outstanding_fsyncs_pending_replication, device->num_fsyncs_pending_replication);
 #endif
-        while (!bio_list_empty(&device->fsyncs_pending_replication)) {
-            bio = bio_list_peek(&device->fsyncs_pending_replication);
-            bio_write_index = bio->bi_private;
-            if (bio_write_index <= device->max_replica_fsync_index) {
-                // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
-                // Remove from queue
-                bio_list_pop(&device->fsyncs_pending_replication);
-                // Ack the fsync to the user
-                ack_bio_to_user_without_executing(bio);
+    while (!bio_list_empty(&device->fsyncs_pending_replication)) {
+        bio = bio_list_peek(&device->fsyncs_pending_replication);
+        bio_write_index = bio->bi_private;
+        if (bio_write_index <= device->max_replica_fsync_index) {
+            // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
+            // Remove from queue
+            bio_list_pop(&device->fsyncs_pending_replication);
+            // Ack the fsync to the user
+            ack_bio_to_user_without_executing(bio);
 #ifdef MEMORY_TRACKING
-                device->num_fsyncs_pending_replication -= 1;
+            device->num_fsyncs_pending_replication -= 1;
 #endif
-            } else {
-                break;
-            }
+        } else {
+            break;
         }
     }
+    }
     mutex_unlock(&device->replica_fsync_lock);
-}
+    }
 
-// TODO: Replace with op_is_sync() to handle REQ_SYNC?
 bool requires_fsync(struct bio *bio) { return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA); }
 
 unsigned int remove_fsync_flags(unsigned int bio_opf) { return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA; }
@@ -833,7 +809,7 @@ void broadcast_bio(struct work_struct *work) {
     cycles_t total_time = get_cycles_if_flag_on();
 
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
-    metadata.bal = device->bal;
+    metadata.ballot = device->ballot;
     metadata.sender_id = device->id;
     metadata.write_index = clone_bio_data->write_index;
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
@@ -1495,7 +1471,7 @@ int ack_fsync(void *args) {
             socket_data = &multisocket->socket_data[socket_id];
 
             metadata.type = FOLLOWER_ACK;
-            metadata.bal = device->bal;
+            metadata.ballot = device->ballot;
             metadata.sender_id = device->id;
             metadata.sender_socket_id = socket_data->sender_socket_id;
             metadata.recipient_id = multisocket->sender_id;
@@ -1572,7 +1548,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         // Received ack for fsync
         if (metadata.type == FOLLOWER_ACK && device->is_leader) {
             // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
-            process_follower_fsync_index(device, metadata.sender_id, metadata.write_index);
+            process_follower_fsync_index(device, metadata.write_index);
             continue;
         }
 
@@ -1840,6 +1816,12 @@ int connect_to_server(void *args) {
     // handshake to get id
     send_handshake_id(thread_params->device, thread_params->sock, thread_params->socket_id); 
     handshake_pair = receive_handshake_id(thread_params->device, thread_params->sock);
+    if (thread_params->server_id != handshake_pair.sender_id) {
+        // Note: Since we don't hash handshakes, a man-in-the-middle attacker could spoof the handshake and pass this test.
+        // However, because blocking_read DOES check the hash, the attacker would not be able to send any messages, so this would just be a liveness attack equivalent to dropping messages.
+        printk(KERN_ERR "Error: Server ID %llu does not match handshake ID %llu, man-in-the-middle attack", thread_params->server_id, handshake_pair.sender_id);
+        goto cleanup;
+    }
     multisocket = create_connected_socket_list_if_null(thread_params->device, handshake_pair.sender_id);
     // Check that each socket has a unique ID
     if (!add_sender_socket_id_if_unique(thread_params->device, multisocket, handshake_pair.sender_socket_id)) {
@@ -1856,7 +1838,7 @@ cleanup:
     return 0;
 }
 
-int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort port) {
+int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id, char *addr, ushort port) {
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
     int i, error;
@@ -1869,6 +1851,7 @@ int start_client_to_server(struct rollbaccine_device *device, char *addr, ushort
             return -1;
         }
         thread_params->device = device;
+        thread_params->server_id = server_id;
         thread_params->socket_id = i;
 
         error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
@@ -2073,12 +2056,14 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     }
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = key, 6= listen port. 7+ = server addr & ports
-// Note: Keys on the replicas are not used, since they cannot encrypt or decrypt
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = id, 2 = seen_ballot, 3 = is_leader, 4 = key, 5 = listen port, 6 = server id, 7 = server addr, 8 = server port
+// 9+ = additional configs' server id, server addr, server port, etc.
+// Primary does not connect to backup if this is the first configuration (no additional configs)
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
+    uint64_t server_id;
     ushort port;
-    int error, i;
+    int error, i, num_prior_confs;
     unsigned long projected_bytes_used = 0;
     unsigned long checksum_and_iv_size;
 
@@ -2140,28 +2125,20 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
 
-    error = kstrtoint(argv[1], 10, &device->f);
-    if (error < 0) {
-        printk(KERN_ERR "Error parsing f");
-        return error;
-    }
-    printk(KERN_INFO "f: %i", device->f);
-
-    error = kstrtoint(argv[2], 10, &device->n);
-    if (error < 0) {
-        printk(KERN_ERR "Error parsing n");
-        return error;
-    }
-    printk(KERN_INFO "n: %i", device->n);
-
-    error = kstrtou64(argv[3], 10, &device->id);
+    error = kstrtou64(argv[1], 10, &device->id);
     if (error < 0) {
         printk(KERN_ERR "Error parsing id");
         return error;
     }
     printk(KERN_INFO "id: %llu", device->id);
-    device->bal.id = 0;
-    device->bal.num = 0;
+
+    error = kstrtou64(argv[2], 10, &device->seen_ballot);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing seen ballot");
+        return error;
+    }
+    printk(KERN_INFO "seen ballot: %llu", device->seen_ballot);
+
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->index_lock);
 
@@ -2175,13 +2152,12 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->replica_fsync_lock);
-    device->replica_fsync_indices = kzalloc(sizeof(int) * device->n, GFP_KERNEL);
     bio_list_init(&device->fsyncs_pending_replication);
 
     device->outstanding_ops = RB_ROOT;
     INIT_LIST_HEAD(&device->pending_ops);
 
-    device->is_leader = strcmp(argv[4], "true") == 0;
+    device->is_leader = strcmp(argv[3], "true") == 0;
 
     if (!device->is_leader) {
         sema_init(&device->replica_submit_bio_sema, 0);
@@ -2192,14 +2168,14 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     // Set up hashing
     device->hash_alg = crypto_alloc_shash("hmac(sha256)", 0, 0);
-    crypto_shash_setkey(device->hash_alg, argv[6], KEY_SIZE);
+    crypto_shash_setkey(device->hash_alg, argv[4], KEY_SIZE);
     if (IS_ERR(device->hash_alg)) {
         printk(KERN_ERR "Error allocating hash");
         return PTR_ERR(device->hash_alg);
     }
 
     // Start server
-    error = kstrtou16(argv[7], 10, &port);
+    error = kstrtou16(argv[5], 10, &port);
     if (error < 0) {
         printk(KERN_ERR "Error parsing port");
         return error;
@@ -2213,15 +2189,31 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
 
-    // Connect to other servers. argv[7], argv[8], etc are all server addresses and ports to connect to.
-    for (i = 8; i < argc; i += 2) {
-        error = kstrtou16(argv[i + 1], 10, &port);
-        if (error < 0) {
-            printk(KERN_ERR "Error parsing port");
-            return error;
+    // Connect to other servers
+    if (argc <= 9) {
+        printk(KERN_INFO "No prior configs detected, can start execution");
+        device->ballot = device->seen_ballot;
+
+        // If we're the backup, we need to connect to the primary
+        if (!device->is_leader) {
+            error = kstrtou64(argv[6], 10, &server_id);
+            if (error < 0) {
+                printk(KERN_ERR "Error parsing primary id");
+                return error;
+            }
+            error = kstrtou16(argv[8], 10, &port);
+            if (error < 0) {
+                printk(KERN_ERR "Error parsing primary port");
+                return error;
+            }
+            printk(KERN_INFO "Starting thread to connect to primary %llu at %s:%u", server_id, argv[7], port);
+            start_client_to_server(device, server_id, argv[7], port);
         }
-        printk(KERN_INFO "Starting thread to connect to servers at port: %u", port);
-        start_client_to_server(device, argv[i], port);
+    }
+    // Connect to machines in prior configs if possible and send them messages
+    else {
+        num_prior_confs = (argc - 9) / 6;  // 6 args per prior config (primary id, addr, port, backup id, addr, port)
+        printk(KERN_INFO "Num prior confs: %d", num_prior_confs);
     }
 
     // Set up AEAD
@@ -2232,7 +2224,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
     crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
 
-    error = crypto_aead_setkey(device->tfm, argv[6], KEY_SIZE);
+    error = crypto_aead_setkey(device->tfm, argv[4], KEY_SIZE);
     if (error < 0) {
         printk(KERN_ERR "Error setting key");
         return error;
@@ -2283,7 +2275,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     ti->private = device;
 
-    printk(KERN_INFO "Server %llu constructed, projected to use %luMB", device->bal.id, projected_bytes_used >> 20);
+    printk(KERN_INFO "Server %llu constructed, projected to use %luMB", device->id, projected_bytes_used >> 20);
     return 0;
 }
 
