@@ -118,3 +118,6 @@ fi
 if [ $REMAINING_VMS -gt 0 ]; then
     launch_vm $REMAINING_VMS $VM_SIZE "vm2.json"
 fi
+
+echo "Sleeping for 10 seconds to make sure the VMs are ready by the time this script finishes"
+sleep 10

@@ -66,7 +66,7 @@ def get_leader_commands():
     """
     commands = [
         "sudo umount /dev/sdb1",
-        f"cd rollbaccine/src",
+        "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
         'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 0 true 250000 abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1'
     ]
@@ -78,7 +78,7 @@ def get_backup_commands(private_ip_0):
     """
     commands = [
         "sudo umount /dev/sdb1",
-        f"cd rollbaccine/src",
+        "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
         f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 1 false 250000 abcdefghijklmnop 12350 {private_ip_0} 12340" | sudo dmsetup create rollbaccine2'
     ]
@@ -232,7 +232,6 @@ def run_everything(system_type: System, benchmark_name: str):
         print(f"Failed to run benchmark: {e}")
         return False
 
-    # Run delete_azure_vm.py to delete resources
     subprocess_execute([f"./cleanup.sh -b {benchmark_name} -s {system_type}"])
 
 if __name__ == "__main__":
