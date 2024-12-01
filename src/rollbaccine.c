@@ -49,8 +49,12 @@
 // Used to compare against checksums to see if they have been set yet (or if they're all 0)
 static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
 
-// TODO: Expand with protocol message types
-enum MsgType { ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, FOLLOWER_ACK };
+enum MsgType { 
+    // Critical path messages
+    ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, ROLLBACCINE_ACK,
+    // Initialization/reconfiguration messages
+    ROLLBACCINE_P1A, ROLLBACCINE_P1B, ROLLBACCINE_HASH_REQ, ROLLBACCINE_HASH, ROLLBACCINE_DISK_REQ, ROLLBACCINE_DISK
+};
 enum EncDecType { ROLLBACCINE_ENCRYPT, ROLLBACCINE_DECRYPT, ROLLBACCINE_VERIFY };
 
 struct metadata_msg {
@@ -248,6 +252,9 @@ struct accepted_thread_params {
     struct socket_data *socket_data;
 };
 
+bool send_msg(struct kvec vec, struct socket *sock);
+bool receive_msg(struct kvec vec, struct socket *sock);
+bool send_page(struct bio_vec vec, struct socket *sock);
 void disconnect(struct rollbaccine_device *device, struct multisocket *multisocket);
 void alert_client_of_liveness_problem(struct rollbaccine_device *device, struct multisocket *multisocket);
 void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
@@ -356,6 +363,73 @@ inline cycles_t get_cycles_if_flag_on(void) {
 #else
     return 0;
 #endif
+}
+
+bool send_msg(struct kvec vec, struct socket *sock) {
+    struct msghdr msg_header;
+    int sent;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    // Keep retrying send until the whole message is sent
+    while (vec.iov_len > 0) {
+        sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
+        if (sent <= 0) {
+            printk(KERN_ERR "Error sending message, aborting");
+            return false;
+        } else {
+            vec.iov_base += sent;
+            vec.iov_len -= sent;
+        }
+    }
+    return true;
+}
+
+bool receive_msg(struct kvec vec, struct socket *sock) {
+    struct msghdr msg_header;
+    int received;
+
+    msg_header.msg_name = 0;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+
+    received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
+    if (received <= 0) {
+        printk(KERN_ERR "Error receiving message, aborting");
+        return false;
+    }
+    return true;
+}
+
+bool send_page(struct bio_vec bvec, struct socket *sock) {
+    struct msghdr msg_header;
+    int sent;
+
+    msg_header.msg_name = NULL;
+    msg_header.msg_namelen = 0;
+    msg_header.msg_control = NULL;
+    msg_header.msg_controllen = 0;
+    msg_header.msg_flags = 0;
+
+    while (bvec.bv_len > 0) {
+        iov_iter_bvec(&msg_header.msg_iter, ITER_SOURCE, &bvec, 1, bvec.bv_len);
+
+        sent = sock_sendmsg(sock, &msg_header);
+        if (sent <= 0) {
+            printk(KERN_ERR "Error broadcasting pages");
+            return false;
+        } else {
+            bvec.bv_offset += sent;
+            bvec.bv_len -= sent;
+        }
+    }
+    return true;
 }
 
 void disconnect(struct rollbaccine_device *device, struct multisocket *multisocket) {
@@ -791,13 +865,12 @@ int lock_on_next_free_socket(struct rollbaccine_device *device, struct multisock
 
 void broadcast_bio(struct work_struct *work) {
     struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
-    int sent, socket_id;
+    int socket_id;
     struct bio *clone = clone_bio_data->deep_clone;
     unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
     size_t checksum_and_iv_size = bio_checksum_and_iv_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
     size_t remaining_checksum_and_iv_size;
     struct rollbaccine_device *device = clone_bio_data->device;
-    struct msghdr msg_header;
     struct kvec vec;
     struct multisocket *multisocket, *next_multisocket, *should_disconnect_from_multisocket;
     struct socket_data *socket_data;
@@ -805,6 +878,7 @@ void broadcast_bio(struct work_struct *work) {
     struct additional_hash_msg *additional_hash_msg;
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
+    bool success;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
@@ -823,12 +897,6 @@ void broadcast_bio(struct work_struct *work) {
 
     // Note: If bi_size is not a multiple of PAGE_SIZE, we have to send by sector chunks
     WARN_ON(metadata.num_pages * PAGE_SIZE != clone->bi_iter.bi_size);
-
-    msg_header.msg_name = NULL;
-    msg_header.msg_namelen = 0;
-    msg_header.msg_control = NULL;
-    msg_header.msg_controllen = 0;
-    msg_header.msg_flags = 0;
 
     // Create message for additional hash & IVs if they exceed what could be sent with the metadata
     if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
@@ -860,17 +928,11 @@ void broadcast_bio(struct work_struct *work) {
         print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
 
         // 1. Send metadata
-        // Keep retrying send until the whole message is sent
-        while (vec.iov_len > 0) {
-            sent = kernel_sendmsg(socket_data->sock, &msg_header, &vec, 1, vec.iov_len);
-            if (sent <= 0) {
-                printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
-                should_disconnect_from_multisocket = multisocket;
-                goto finish_sending_to_socket;
-            } else {
-                vec.iov_base += sent;
-                vec.iov_len -= sent;
-            }
+        success = send_msg(vec, socket_data->sock);
+        if (!success) {
+            printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
+            should_disconnect_from_multisocket = multisocket;
+            goto finish_sending_to_socket;
         }
         print_and_update_latency("broadcast_bio: Send metadata", &time);
 
@@ -883,17 +945,11 @@ void broadcast_bio(struct work_struct *work) {
 
             vec.iov_base = additional_hash_msg;
             vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
-            while (vec.iov_len > 0) {
-                // printk(KERN_INFO "Sending checksums and IVs, size: %lu", vec.iov_len);
-                sent = kernel_sendmsg(socket_data->sock, &msg_header, &vec, 1, vec.iov_len);
-                if (sent <= 0) {
-                    printk(KERN_ERR "Error broadcasting checksums and IVs");
-                    should_disconnect_from_multisocket = multisocket;
-                    goto finish_sending_to_socket;
-                } else {
-                    vec.iov_base += sent;
-                    vec.iov_len -= sent;
-                }
+            success = send_msg(vec, socket_data->sock);
+            if (!success) {
+                printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+                should_disconnect_from_multisocket = multisocket;
+                goto finish_sending_to_socket;
             }
             print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
         }
@@ -901,20 +957,11 @@ void broadcast_bio(struct work_struct *work) {
         // 3. Send bios
         bio_for_each_segment(bvec, clone, iter) {
             bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
-
-            // Keep retrying send until the whole message is sent
-            while (chunked_bvec.bv_len > 0) {
-                iov_iter_bvec(&msg_header.msg_iter, ITER_SOURCE, &chunked_bvec, 1, chunked_bvec.bv_len);
-
-                sent = sock_sendmsg(socket_data->sock, &msg_header);
-                if (sent <= 0) {
-                    printk(KERN_ERR "Error broadcasting message pages");
-                    should_disconnect_from_multisocket = multisocket;
-                    goto finish_sending_to_socket;
-                } else {
-                    chunked_bvec.bv_offset += sent;
-                    chunked_bvec.bv_len -= sent;
-                }
+            success = send_page(chunked_bvec, socket_data->sock);
+            if (!success) {
+                printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
+                should_disconnect_from_multisocket = multisocket;
+                goto finish_sending_to_socket;
             }
         }
         print_and_update_latency("broadcast_bio: Send pages", &time);
@@ -1438,11 +1485,11 @@ int submit_pending_bio_ring_prefix(void *args) {
 int ack_fsync(void *args) {
     struct rollbaccine_device *device = args;
     struct metadata_msg metadata;
-    struct msghdr msg_header;
     struct kvec vec;
     struct multisocket *multisocket, *next_multisocket;
     struct socket_data *socket_data;
-    int sent, last_sent_fsync, socket_id, signal;
+    int last_sent_fsync, socket_id, signal;
+    bool success;
 
     while (!device->shutting_down) {
         // Block until someone indicates there's an fsync to send
@@ -1470,7 +1517,7 @@ int ack_fsync(void *args) {
             socket_id = lock_on_next_free_socket(device, multisocket);
             socket_data = &multisocket->socket_data[socket_id];
 
-            metadata.type = FOLLOWER_ACK;
+            metadata.type = ROLLBACCINE_ACK;
             metadata.ballot = device->ballot;
             metadata.sender_id = device->id;
             metadata.sender_socket_id = socket_data->sender_socket_id;
@@ -1479,25 +1526,12 @@ int ack_fsync(void *args) {
             metadata.write_index = last_sent_fsync;
             hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
 
-            msg_header.msg_name = NULL;
-            msg_header.msg_namelen = 0;
-            msg_header.msg_control = NULL;
-            msg_header.msg_controllen = 0;
-            msg_header.msg_flags = 0;
-
             vec.iov_base = &metadata;
             vec.iov_len = sizeof(struct metadata_msg);
 
-            // Keep retrying send until the whole message is sent
-            while (vec.iov_len > 0) {
-                sent = kernel_sendmsg(socket_data->sock, &msg_header, &vec, 1, vec.iov_len);
-                if (sent <= 0) {
-                    printk(KERN_ERR "Error replying to fsync, aborting");
-                    break;
-                } else {
-                    vec.iov_base += sent;
-                    vec.iov_len -= sent;
-                }
+            success = send_msg(vec, socket_data->sock);
+            if (!success) {
+                printk_ratelimited(KERN_ERR "Error sending fsync ack");
             }
             mutex_unlock(&socket_data->socket_mutex);
         }
@@ -1513,26 +1547,20 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
     struct bio *received_bio;
     struct bio_data *bio_data;
     struct page *page;
-    struct msghdr msg_header;
     struct kvec vec;
-    int received, i, num_sectors, index_offset, bio_distance;
+    bool success;
+    int i, num_sectors, index_offset, bio_distance;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
     struct additional_hash_msg *additional_hash_msg;
     long replaced_bio_data;
-
-    msg_header.msg_name = 0;
-    msg_header.msg_namelen = 0;
-    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
-    msg_header.msg_control = NULL;
-    msg_header.msg_controllen = 0;
 
     while (!device->shutting_down && !atomic_read(&multisocket->disconnected)) {
         // 1. Receive metadata message
         vec.iov_base = &metadata;
         vec.iov_len = sizeof(struct metadata_msg);
 
-        received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
-        if (received <= 0) {
+        success = receive_msg(vec, socket_data->sock);
+        if (!success) {
             printk(KERN_ERR "Error reading metadata from socket");
             goto disconnect_from_sender;
         }
@@ -1546,7 +1574,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         }
 
         // Received ack for fsync
-        if (metadata.type == FOLLOWER_ACK && device->is_leader) {
+        if (metadata.type == ROLLBACCINE_ACK && device->is_leader) {
             // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
             process_follower_fsync_index(device, metadata.write_index);
             continue;
@@ -1581,9 +1609,9 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
             vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
 
             // printk(KERN_INFO "Receiving checksums and IVs, size: %lu", vec.iov_len);
-            received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
-            if (received <= 0) {
-                printk(KERN_ERR "Error reading checksum and IV, %d", received);
+            success = receive_msg(vec, socket_data->sock);
+            if (!success) {
+                printk(KERN_ERR "Error reading checksum and IV");
                 free_pages_end_io(received_bio);
                 kfree(additional_hash_msg);
                 goto disconnect_from_sender;
@@ -1620,8 +1648,8 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
             vec.iov_base = page_address(page);
             vec.iov_len = PAGE_SIZE;
 
-            received = kernel_recvmsg(socket_data->sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
-            if (received <= 0) {
+            success = receive_msg(vec, socket_data->sock);
+            if (!success) {
                 printk(KERN_ERR "Error reading from socket");
                 free_pages_end_io(received_bio);
                 goto disconnect_from_sender;
@@ -1725,56 +1753,24 @@ unlock_and_return:
 
 void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, uint64_t socket_id) {
     struct multithreaded_handshake_pair handshake_pair = {device->id, socket_id};
-    struct msghdr msg_header;
-    struct kvec vec;
-    int sent;
-
-    msg_header.msg_name = NULL;
-    msg_header.msg_namelen = 0;
-    msg_header.msg_control = NULL;
-    msg_header.msg_controllen = 0;
-    msg_header.msg_flags = 0;
-
-    vec.iov_base = &handshake_pair;
-    vec.iov_len = sizeof(struct multithreaded_handshake_pair);
-
+    struct kvec vec = {
+        .iov_base = &handshake_pair,
+        .iov_len = sizeof(struct multithreaded_handshake_pair)
+    };
     // Keep retrying send until the whole message is sent
     printk(KERN_INFO "Sending handshake ID: %llu, CPU: %llu", device->id, socket_id);
-    while (vec.iov_len > 0) {
-        sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
-        if (sent <= 0) {
-            printk(KERN_ERR "Error sending handshake, aborting");
-            return;
-        } else {
-            vec.iov_base += sent;
-            vec.iov_len -= sent;
-        }
-    }
+    send_msg(vec, sock);
 }
 
 struct multithreaded_handshake_pair receive_handshake_id(struct rollbaccine_device *device, struct socket *sock) {
     struct multithreaded_handshake_pair received_handshake_pair;
-    struct msghdr msg_header;
-    struct kvec vec;
-    int received;
-
-    msg_header.msg_name = 0;
-    msg_header.msg_namelen = 0;
-    msg_header.msg_flags = MSG_WAITALL | MSG_NOSIGNAL;
-    msg_header.msg_control = NULL;
-    msg_header.msg_controllen = 0;
-
-    vec.iov_base = &received_handshake_pair;
-    vec.iov_len = sizeof(struct multithreaded_handshake_pair);
-
+    struct kvec vec = {
+        .iov_base = &received_handshake_pair,
+        .iov_len = sizeof(struct multithreaded_handshake_pair)
+    };
     printk(KERN_INFO "Receiving handshake");
-    received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
-    if (received <= 0) {
-        printk(KERN_ERR "Error receiving handshake, aborting");
-        return received_handshake_pair;
-    }
+    receive_msg(vec, sock);
     printk(KERN_INFO "Handshake complete, talking to ID: %llu, CPU: %llu", received_handshake_pair.sender_id, received_handshake_pair.sender_socket_id);
-
     return received_handshake_pair;
 }
 
@@ -2063,7 +2059,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     struct rollbaccine_device *device;
     uint64_t server_id;
     ushort port;
-    int error, i, num_prior_confs;
+    int error, conf_index, i, num_prior_confs;
     unsigned long projected_bytes_used = 0;
     unsigned long checksum_and_iv_size;
 
@@ -2210,10 +2206,28 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
             start_client_to_server(device, server_id, argv[7], port);
         }
     }
-    // Connect to machines in prior configs if possible and send them messages
+    // Connect to machines in prior configs if they are provided
     else {
         num_prior_confs = (argc - 9) / 6;  // 6 args per prior config (primary id, addr, port, backup id, addr, port)
+        device->prior_confs = kmalloc(sizeof(struct configuration) * num_prior_confs, GFP_KERNEL);
         printk(KERN_INFO "Num prior confs: %d", num_prior_confs);
+
+        for (conf_index = 0; conf_index < num_prior_confs; conf_index++) {
+            for (i = 0; i < 2; i++) {
+                error = kstrtou64(argv[9 + i + conf_index * 6], 10, &device->prior_confs[conf_index].ids[i]);
+                if (error < 0) {
+                    printk(KERN_ERR "Error parsing server id");
+                    return error;
+                }
+                error = kstrtou16(argv[11 + i + conf_index * 6], 10, &port);
+                if (error < 0) {
+                    printk(KERN_ERR "Error parsing port");
+                    return error;
+                }
+                printk(KERN_INFO "Starting thread to connect to server %llu at %s:%u in conf %d", device->prior_confs[conf_index].ids[i], argv[10 + i + conf_index * 6], port, conf_index);
+                start_client_to_server(device, device->prior_confs[conf_index].ids[i], argv[10 + i + conf_index * 6], port);
+            }
+        }
     }
 
     // Set up AEAD
@@ -2317,6 +2331,8 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
     page_cache_destroy(device);
+    if (device->prior_confs != NULL)
+        kfree(device->prior_confs);
     // TODO: Don't free because threads may be attempting to acquire global locks still. Could theoretically gather all threads and wait for them
     // kfree(device);
 
