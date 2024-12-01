@@ -1049,8 +1049,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         dm_accept_partial_bio(bio, BIO_MAX_VECS * SECTORS_PER_PAGE);
     }
 
-    // Copy bio if it's a write
-    if (device->is_leader) {
+    // Copy bio if it's a write. Permit non-leaders to read as well for ACE testing; can turn off in production.
+    if (device->is_leader || bio_data_dir(bio) == READ) {
         is_cloned = true;
 
         bio_data = alloc_bio_data(device);
@@ -1161,6 +1161,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
                 break;
         }
+    }
+    else {
+        printk(KERN_ERR "Unexpected operation, we are not the leader (leader = %d) and the bio is a write (write = %d)", device->is_leader, bio_data_dir(bio) == WRITE);
+        return DM_MAPIO_KILL;
     }
     print_and_update_latency("rollbaccine_map", &total_time);
 
