@@ -124,11 +124,6 @@ struct rollbaccine_device {
     struct page *page_cache;
     int page_cache_size;
 
-    // For limiting the amount of memory used. Do not access ints without obtaining the waitqueue lock.
-    wait_queue_head_t memory_wait_queue;
-    int max_memory_pages;
-    int num_used_memory_pages;
-
     bool is_leader;
     bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     int f;
@@ -207,7 +202,6 @@ struct rollbaccine_device {
     int max_outstanding_num_rb_nodes;
     int max_outstanding_num_bio_sector_ranges;
     int max_outstanding_fsyncs_pending_replication;
-    int max_num_pages_in_memory;
     atomic_t max_bios_in_pending_bio_ring;
     atomic_t max_distance_between_bios_in_pending_bio_ring;
     atomic_t max_submit_bio_queue_size;
@@ -2045,7 +2039,6 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num rb nodes still in tree: %d\n", device->num_rb_nodes);
     DMEMIT("Num bio sectors still in queue: %d\n", device->num_bio_sector_ranges);
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
-    DMEMIT("Num pages still in memory: %d\n", device->num_used_memory_pages);
     DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
     DMEMIT("Num times broadcast queue blocked on sockets in use: %d\n", atomic_read(&device->next_socket_id));
     DMEMIT("Num bios on submit queue: %d\n", atomic_read(&device->submit_bio_queue_size));
@@ -2064,7 +2057,6 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max size of rb tree for outgoing operations: %d\n", device->max_outstanding_num_rb_nodes);
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
-    DMEMIT("Max number of pages in memory: %d\n", device->max_num_pages_in_memory);
     DMEMIT("Max bios on submit queue: %d\n", atomic_read(&device->max_submit_bio_queue_size));
     DMEMIT("Last ACK'd fsync index: %d\n", device->last_acked_fsync_index);
     if (!device->is_leader) {
@@ -2081,7 +2073,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     }
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = max_memory_pages, 6 = key, 7= listen port. 8+ = server addr & ports
+// Arguments: 0 = underlying device name, like /dev/ram0. 1 = f, 2 = n, 3 = id, 4 = is_leader, 5 = key, 6= listen port. 7+ = server addr & ports
 // Note: Keys on the replicas are not used, since they cannot encrypt or decrypt
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
@@ -2197,14 +2189,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         device->replica_submit_bio_thread = kthread_run(submit_pending_bio_ring_prefix, device, "submit pending bio ring");
         device->replica_ack_fsync_thread = kthread_run(ack_fsync, device, "ack fsync");
     }
-
-    error = kstrtoint(argv[5], 10, &device->max_memory_pages);
-    if (error < 0) {
-        printk(KERN_ERR "Error parsing max_memory_pages");
-        return error;
-    }
-    device->num_used_memory_pages = 0;
-    init_waitqueue_head(&device->memory_wait_queue);
 
     // Set up hashing
     device->hash_alg = crypto_alloc_shash("hmac(sha256)", 0, 0);
