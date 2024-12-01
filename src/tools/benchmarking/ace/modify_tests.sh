@@ -21,13 +21,13 @@ sed -i '/_supported_os Linux/d' *
     # before=$(general_stat "$1")
     # after=$(general_stat "$2")
     
-sed -i '' 's/before=.*/before=\$\(general_stat\ \"\$1\"\)/g' *
-sed -i '' '/_flakey_drop_and_remount/d' *
-sed -i '' 's/after=.*/after=\$\(general_stat\ \"\$2\"\)/g' *
+sed -i 's/before=.*/before=\$\(general_stat\ \"\$1\"\)/g' *
+sed -i '/_flakey_drop_and_remount/d' *
+sed -i 's/after=.*/after=\$\(general_stat\ \"\$2\"\)/g' *
 
 # Replace these lines:
     # check_consistency $SCRATCH_MNT/?
 # With the following:
     # check_consistency $SCRATCH_MNT/? /mnt/newfsbackup/?
 # Where we assume that the backup is mounted at /mnt/newfsbackup
-sed -i '' 's/check_consistency \$SCRATCH_MNT\(.*\)/check_consistency \$SCRATCH_MNT\1 \/mnt\/newfsbackup\1/g' *
+sed -i 's/check_consistency \$SCRATCH_MNT\(.*\)/check_consistency \$SCRATCH_MNT\1 \/mnt\/newfsbackup\1/g' *
