@@ -114,6 +114,12 @@ class FioBenchmark(Benchmark):
         total_benchmarks = len(fio_parameters_list) * len(numjobs_list)
         current_benchmark = 0
         print(f"Running {total_benchmarks} FIO benchmarks locally")
+
+        success = subprocess_execute([f"sudo umount {MOUNT_DIR}"])
+        if not success:
+            print("Failed to unmount the mount point")
+            return
+
         for fio_parameters_template in fio_parameters_list:
             for numjobs in numjobs_list:
                 parameters = fio_parameters_template.copy()

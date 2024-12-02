@@ -21,16 +21,16 @@ done
 
 NAME=$BENCHMARK-$SYSTEM
 # Replace the subscription ID with your own; you can find it by going to the Azure Portal and clicking "Subscriptions"
-SUBSCRIPTION_ID=99c3b15b-bec1-49de-85be-849e7a51cce5
+SUBSCRIPTION_ID=ab9141a2-bb86-4f08-bd87-49b164a2ac4b
 # The location is in North Europe, zone 3, because David's initial testing in [tee-benchmark](https://github.com/davidchuyaya/tee-benchmark) in 2023 revealed that it had the lowest network latency between nodes.
-# LOCATION=northeurope
-LOCATION=westus2
+LOCATION=northeurope
+# LOCATION=westus2
 ZONE=3
 # We must specify the sizes of the VMs that we intend to launch under `intent-vm-sizes`. We use the [DCadsv5](https://learn.microsoft.com/en-us/azure/virtual-machines/dcasv5-dcadsv5-series) series, which are general purpose, AMD SEV-SNP machines with temp disk.
-# VM_SIZE=Standard_DC16as_v5
-# VM_SIZE_TEMP_DISK=Standard_DC16ads_v5
-VM_SIZE=Standard_D16as_v5
-VM_SIZE_TEMP_DISK=Standard_D16ads_v5
+VM_SIZE=Standard_DC16as_v5
+VM_SIZE_TEMP_DISK=Standard_DC16ads_v5
+# VM_SIZE=Standard_D16as_v5
+# VM_SIZE_TEMP_DISK=Standard_D16ads_v5
 # Set managed disk size (GB) to same size as temp disk
 MANAGED_DISK_SIZE=600
 USERNAME=$(whoami)
@@ -63,43 +63,42 @@ launch_vm () {
 
     echo "Launching $1 $2 VMs"
 
-    az vm create \
-        --resource-group $NAME-group \
-        --name $NAME \
-        --admin-username $USERNAME \
-        --generate-ssh-keys \
-        --public-ip-sku Standard \
-        --nic-delete-option Delete \
-        --os-disk-delete-option Delete \
-        --data-disk-delete-option Delete \
-        --accelerated-networking false \
-        --ppg $NAME-ppg \
-        --location $LOCATION \
-        --zone $ZONE \
-        --size $2 \
-        --enable-secure-boot false \
-        --image Canonical:ubuntu-24_04-lts:server:latest $COUNT $4 > $3
-
-    # Confidential VMs, once our subscription has access to them:
     # az vm create \
-#     --resource-group $NAME-group \
-#     --name $NAME \
-#     --admin-username $USERNAME \
-#     --generate-ssh-keys \
-#     --public-ip-sku Standard \
-#     --nic-delete-option Delete \
-#     --os-disk-delete-option Delete \
-#     --data-disk-delete-option Delete \
-#     --accelerated-networking false \
-#     --ppg $NAME-ppg \
-#     --location $LOCATION \
-#     --zone $ZONE \
-#     --size $VM_SIZE \
-#     --image Canonical:ubuntu-24_04-lts:cvm:latest \
-#     --security-type ConfidentialVM \
-#     --os-disk-security-encryption-type VMGuestStateOnly \
-#     --enable-secure-boot false \
-#     --enable-vtpm $COUNT $4 > $3
+    #     --resource-group $NAME-group \
+    #     --name $NAME \
+    #     --admin-username $USERNAME \
+    #     --generate-ssh-keys \
+    #     --public-ip-sku Standard \
+    #     --nic-delete-option Delete \
+    #     --os-disk-delete-option Delete \
+    #     --data-disk-delete-option Delete \
+    #     --accelerated-networking false \
+    #     --ppg $NAME-ppg \
+    #     --location $LOCATION \
+    #     --zone $ZONE \
+    #     --size $2 \
+    #     --enable-secure-boot false \
+    #     --image Canonical:ubuntu-24_04-lts:server:latest $COUNT $4 > $3
+
+    az vm create \
+    --resource-group $NAME-group \
+    --name $NAME \
+    --admin-username $USERNAME \
+    --generate-ssh-keys \
+    --public-ip-sku Standard \
+    --nic-delete-option Delete \
+    --os-disk-delete-option Delete \
+    --data-disk-delete-option Delete \
+    --accelerated-networking false \
+    --ppg $NAME-ppg \
+    --location $LOCATION \
+    --zone $ZONE \
+    --size $2 \
+    --image Canonical:ubuntu-24_04-lts:cvm:latest \
+    --security-type ConfidentialVM \
+    --os-disk-security-encryption-type VMGuestStateOnly \
+    --enable-secure-boot false \
+    --enable-vtpm $COUNT $4 > $3
 }
 
 # Launch the right number of VMs with temp/managed disk

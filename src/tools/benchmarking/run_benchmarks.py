@@ -60,7 +60,7 @@ def download_rollbaccine(ssh):
     if not is_installed(ssh, 'test -d ~/rollbaccine && echo 1'):
         ssh_execute(ssh, ["git clone -q https://github.com/davidchuyaya/rollbaccine"])
 
-def get_leader_commands():
+def get_leader_commands(backup_private_ip):
     """
     Returns the list of commands to execute on the leader VM.
     """
@@ -68,11 +68,11 @@ def get_leader_commands():
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 0 true 250000 abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1'
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 1 true abcdefghijklmnop 12340 2 {backup_private_ip} 12350" | sudo dmsetup create rollbaccine1'
     ]
     return commands
 
-def get_backup_commands(private_ip_0):
+def get_backup_commands(primary_private_ip):
     """
     Returns the list of commands to execute on the backup.
     """
@@ -80,7 +80,7 @@ def get_backup_commands(private_ip_0):
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 2 1 false 250000 abcdefghijklmnop 12350 {private_ip_0} 12340" | sudo dmsetup create rollbaccine2'
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 12350 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
     ]
     return commands
 
@@ -117,7 +117,7 @@ def setup_main_nodes(system_type: System, connections: List[SSHClient], private_
                 install_rollbaccine(ssh)
                 # Setup primary and backup
                 if i == 0:
-                    ssh_execute(ssh, get_leader_commands())
+                    ssh_execute(ssh, get_leader_commands(private_ips[1]))
                 elif i == 1:
                     ssh_execute(ssh, get_backup_commands(private_ips[0]))
 
