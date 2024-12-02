@@ -80,7 +80,7 @@ def get_backup_commands(primary_private_ip):
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 12350 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 12350 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
     ]
     return commands
 
