@@ -24,8 +24,7 @@
 #include <linux/rwlock.h>
 #include <net/sock.h>
 
-#define ROLLBACCINE_MAX_CONNECTIONS 10
-#define ROLLBACCINE_RETRY_TIMEOUT 5000  // Number of milliseconds before client attempts to connect to a server again
+#define ROLLBACCINE_MAX_CONNECTIONS 20
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
 #define ROLLBACCINE_ENCRYPTION_GRANULARITY PAGE_SIZE
 #define ROLLBACCINE_MAX_BROADCAST_QUEUE_SIZE 1000000
@@ -41,6 +40,7 @@
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
 #define ROLLBACCINE_PLUG_NUM_BIOS 256 / 4 // Number of bios to allow between to calls to blk_plug for merging. 256K is the largest write we can send to disk, 4K is the size of individual writes
+#define ROLLBACCINE_HASHES_PER_MSG 100
 #define MODULE_NAME "rollbaccine"
 
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
@@ -53,7 +53,7 @@ enum MsgType {
     // Critical path messages
     ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, ROLLBACCINE_ACK,
     // Initialization/reconfiguration messages
-    ROLLBACCINE_P1A, ROLLBACCINE_P1B, ROLLBACCINE_HASH_REQ, ROLLBACCINE_HASH, ROLLBACCINE_DISK_REQ, ROLLBACCINE_DISK
+    ROLLBACCINE_P1A, ROLLBACCINE_P1B, ROLLBACCINE_HASH_REQ, ROLLBACCINE_HASH_BEGIN, ROLLBACCINE_DISK_REQ, ROLLBACCINE_DISK_BEGIN, ROLLBACCINE_RECONFIG_COMPLETE, ROLLBACCINE_RECONFIG_COMPLETE_ACK
 };
 enum EncDecType { ROLLBACCINE_ENCRYPT, ROLLBACCINE_DECRYPT, ROLLBACCINE_VERIFY };
 
@@ -62,6 +62,7 @@ struct metadata_msg {
 
     enum MsgType type;
     uint64_t ballot;
+    uint64_t seen_ballot;
     uint64_t sender_id;
     uint64_t sender_socket_id;
     uint64_t recipient_id;
@@ -84,6 +85,19 @@ struct additional_hash_msg {
     uint64_t recipient_id;
     uint64_t msg_index;
     char checksum_and_iv[];
+} __attribute__((packed));
+
+// Sent during reconfiguration
+struct hash_msg {
+    char msg_hash[SHA256_SIZE];
+    uint64_t seen_ballot;
+    uint64_t sender_id;
+    uint64_t sender_socket_id;
+    uint64_t recipient_id;
+    uint64_t msg_index;
+
+    sector_t start_sector;
+    char checksum_and_ivs[ROLLBACCINE_HASHES_PER_MSG * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
 } __attribute__((packed));
 
 // Used to return a pair from handshake_ids()
@@ -109,7 +123,6 @@ struct multisocket {
     uint64_t sender_id;
     bool sender_socket_id_taken[NUM_NICS]; // Which sender socket IDs have been taken
     struct mutex sender_socket_ids_lock; // Lock on sender_socket_ids to check if the sender is giving us unique socket IDs
-    atomic_t alerted_client_of_liveness_problem;  // Whether we've messaged the client about a liveness problem over this socket, since we don't want to spam the client
     atomic_t disconnected;
     struct list_head list;
 };
@@ -119,7 +132,7 @@ struct configuration {
     uint64_t ids[2];
     uint64_t ballots[2];
     uint64_t write_indices[2];
-};
+} ____cacheline_aligned;
 
 struct rollbaccine_device {
     struct dm_dev *dev;
@@ -128,16 +141,27 @@ struct rollbaccine_device {
     struct mutex page_cache_lock;
     struct page *page_cache;
     int page_cache_size;
+    sector_t num_sectors;
 
     bool is_leader;
     bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     uint64_t id; // Unique to each Rollbaccine instance
-    uint64_t seen_ballot; // Starts at 0, increments whenever we get a message with a higher ballot
-    uint64_t ballot; // Starts at 0, set equal to seen_ballot once we complete initialization or reconfiguration
+    atomic_t seen_ballot; // Starts at 0, increments whenever we get a message with a higher ballot
+    atomic_t ballot; // Starts at 0, set equal to seen_ballot once we complete initialization or reconfiguration
 
+    // Reconfiguration
+    atomic_t num_verified_sectors;
+    int num_prior_confs;
+    struct mutex prior_confs_lock; // Must be obtained for any variable below in this section
     struct configuration *prior_confs;
+    bool sent_hash_req; // Whether we've sent a hash request (after P1b) yet. After this is set to true, the 3 variables below will never change and can be obtained without a lock
+    uint64_t designated_ballot;
+    uint64_t designated_write_index;
+    uint64_t designated_id;
+    struct mutex reconfig_complete_lock;
+    uint64_t reconfig_complete_ballot;
+    uint64_t reconfig_complete_write_index;
 
-    // TODO: Track last msg index per unique sender (since the primary may change)
     int write_index;
     struct mutex index_lock;  // Must be obtained for any operation modifying write_index
 
@@ -161,13 +185,19 @@ struct rollbaccine_device {
     struct workqueue_struct *leader_read_disk_end_io_queue;
     struct workqueue_struct *replica_disk_end_io_queue;
     struct workqueue_struct *replica_insert_bio_queue;
+    struct workqueue_struct *verify_disk_end_io_queue;
+    struct workqueue_struct *fetch_disk_end_io_queue;
+    struct workqueue_struct *reconfig_write_disk_end_io_queue;
 
     // Sockets, tracked so we can kill them on exit.
     struct socket *server_socket;
-    // Connected sockets. Should be a subset of the sockets above, stored as a multisocket. Handy for broadcasting
-    // TODO: Sending thread should block on another signal (like finish init) instead of connected threads
+    // Connected sockets, stored as a multisocket. Handy for broadcasting
     struct rw_semaphore connected_sockets_sem;
     struct list_head connected_sockets;
+    struct rw_semaphore counterpart_sem; // Must be used to lock counterpart and counterpart_id, because they may change after reconfiguration. Must obtain connected_sockets_sem first.
+    struct multisocket *counterpart; // Pointer to the primary/backup multisocket in the current configuration.
+    uint64_t counterpart_id;         // ID of our primary/backup counterpart
+    struct multisocket *designated_node; // Pointer to the multisocket we're recovering from. Will only be set once so no need to lock
     atomic_t next_socket_id; // Used to load balance the socket to send messages on
 
     // AEAD
@@ -234,6 +264,7 @@ struct bio_data {
     struct rb_node tree_node;           // So this bio can be inserted into a tree
     struct list_head pending_list;      // So this bio can be inserted into pending_ops
     unsigned char *checksum_and_iv;     // Checksums and IVs for each sector or page, if this is a write
+    struct multisocket *requester;      // The node that requested this block of disk from this node (for reconfiguration)
 };
 
 // Thread params: Parameters passed into threads. Should be freed by the thread when it exits.
@@ -244,6 +275,7 @@ struct client_thread_params {
     struct rollbaccine_device *device;
     uint64_t server_id; // Expected ID of the server
     uint64_t socket_id;
+    bool send_p1a;
 };
 
 struct accepted_thread_params {
@@ -256,7 +288,7 @@ bool send_msg(struct kvec vec, struct socket *sock);
 bool receive_msg(struct kvec vec, struct socket *sock);
 bool send_page(struct bio_vec vec, struct socket *sock);
 void disconnect(struct rollbaccine_device *device, struct multisocket *multisocket);
-void alert_client_of_liveness_problem(struct rollbaccine_device *device, struct multisocket *multisocket);
+void alert_client_of_liveness_problem(struct rollbaccine_device *device, uint64_t id);
 void print_and_update_latency(char *text, cycles_t *prev_time);  // Also updates prev_time
 void submit_bio_task(struct work_struct *work);
 void add_to_pending_ops_tail(struct rollbaccine_device *device, struct bio_data *bio_data);
@@ -266,7 +298,8 @@ void remove_from_outstanding_ops_and_unblock(struct rollbaccine_device *device, 
 void page_cache_free(struct rollbaccine_device *device, struct page *page_to_free);
 void page_cache_destroy(struct rollbaccine_device *device);
 struct page *page_cache_alloc(struct rollbaccine_device *device);
-void atomic_max(atomic_t *old, int new);
+// Returns the old value
+int atomic_max(atomic_t *old, int new);
 struct bio_data *alloc_bio_data(struct rollbaccine_device * device);
 void ack_bio_to_user_without_executing(struct bio * bio);
 void process_follower_fsync_index(struct rollbaccine_device * device, int follower_fsync_index);
@@ -274,6 +307,19 @@ bool requires_fsync(struct bio * bio);
 unsigned int remove_fsync_flags(unsigned int bio_opf);
 void free_pages_end_io(struct bio * received_bio);
 void try_free_clones(struct bio * clone);
+void begin_critical_path(struct rollbaccine_device *device);
+void send_reconfig_complete_ack(struct rollbaccine_device *device);
+void handle_reconfig_complete(struct rollbaccine_device *device, struct multisocket *counterpart, struct metadata_msg *metadata);
+void send_reconfig_complete(struct rollbaccine_device *device, struct multisocket *counterpart);
+void inc_verified_pages(struct rollbaccine_device *device);
+void reconfig_write_disk_end_io_task(struct work_struct *work);
+void reconfig_write_disk_end_io(struct bio *bio);
+bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *socket_data, sector_t sector); void fetch_disk_end_io_task(struct work_struct *work);
+void fetch_disk_end_io(struct bio *bio);
+void handle_disk_req(struct rollbaccine_device *device, struct multisocket *multisocket, sector_t sector);
+void send_disk_req(struct rollbaccine_device *device, sector_t sector);
+void verify_disk_end_io_task(struct work_struct *work);
+void verify_disk_end_io(struct bio *bio);
 void leader_write_disk_end_io_task(struct work_struct *work);
 void leader_read_disk_end_io_task(struct work_struct *work);
 void replica_disk_end_io_task(struct work_struct *work);
@@ -287,11 +333,16 @@ struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * b
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_socket_id, uint64_t intended_recipient_id,
                 uint64_t my_id, uint64_t msg_index);
+void hash_metadata(struct socket_data *socket_data, struct metadata_msg *metadata);
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out);
-// Returns array of checksums and IVs for writes, NULL for reads
-unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
+// Returns array of checksums and IVs for writes, NULL for reads. Sets error = true if there's an error
+unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type, bool *error);
 int submit_pending_bio_ring_prefix(void *args);
 int ack_fsync(void *args);
+bool handle_p1a(struct rollbaccine_device *device, struct multisocket *multisocket, struct metadata_msg p1a);
+bool handle_p1b(struct rollbaccine_device *device, struct metadata_msg p1b);
+bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *multisocket);
+bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data);
 void blocking_read(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data);
 void init_socket_data(struct rollbaccine_device *device, struct socket_data *socket_data, struct socket *sock, uint64_t sender_id, uint64_t sender_socket_id);
 struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id);
@@ -299,7 +350,7 @@ void send_handshake_id(struct rollbaccine_device *device, struct socket *sock, u
 struct multithreaded_handshake_pair receive_handshake_id(struct rollbaccine_device *device, struct socket *sock);
 bool add_sender_socket_id_if_unique(struct rollbaccine_device *device, struct multisocket *multisocket, uint64_t sender_socket_id);
 int connect_to_server(void *args);
-int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id, char *addr, ushort port);
+int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id, char *addr, ushort port, bool send_p1a);
 int listen_to_accepted_socket(void *args);
 int listen_for_connections(void *args);
 int start_server(struct rollbaccine_device *device, ushort port);
@@ -454,7 +505,7 @@ void disconnect(struct rollbaccine_device *device, struct multisocket *multisock
     up_write(&device->connected_sockets_sem);
 
     // If this is the replica, zero out the pending bio ring. This is ok because anything this replica ACKed must've already been popped off the ring
-    if (!device->shutting_down && !device->is_leader) {
+    if (!device->shutting_down && !device->is_leader && multisocket == device->counterpart) {
         printk(KERN_INFO "Replica zeroing out pending bio ring");
         for (i = 0; i < ROLLBACCINE_PENDING_BIO_RING_SIZE; i++) {
             bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[i], 0);
@@ -469,11 +520,9 @@ void disconnect(struct rollbaccine_device *device, struct multisocket *multisock
     printk(KERN_INFO "Disconnected from sender");
 }
 
-void alert_client_of_liveness_problem(struct rollbaccine_device *device, struct multisocket *multisocket) {
-    if (atomic_cmpxchg(&multisocket->alerted_client_of_liveness_problem, 0, 1) == 0) {
-        printk(KERN_ERR "Liveness problem detected, alerting client");
-        // TODO: Telling client about liveness problem
-    }
+void alert_client_of_liveness_problem(struct rollbaccine_device *device, uint64_t id) {
+    printk(KERN_ERR "Liveness problem detected for id %llu, alerting client", id);
+    // TODO: Telling client about liveness problem
 }
 
 void print_and_update_latency(char *text, cycles_t *prev_time) {
@@ -644,11 +693,12 @@ struct page *page_cache_alloc(struct rollbaccine_device *device) {
 }
 
 // If the new value is greater than the old value, swap the old for the new. While loop necessary because the old value may have been concurrently updated, in which case no swap happens.
-void atomic_max(atomic_t *old, int new) {
+int atomic_max(atomic_t *old, int new) {
     int old_val;
     do {
         old_val = atomic_read(old);
     } while (old_val < new &&atomic_cmpxchg(old, old_val, new) != old_val);
+    return old_val;
 }
 
 struct bio_data *alloc_bio_data(struct rollbaccine_device *device) {
@@ -664,7 +714,6 @@ struct bio_data *alloc_bio_data(struct rollbaccine_device *device) {
     return data;
 }
 
-// TODO: Make super sure that bios ended this way actually don't go to disk
 void ack_bio_to_user_without_executing(struct bio *bio) {
     bio->bi_status = BLK_STS_OK;
     bio_endio(bio);
@@ -772,12 +821,414 @@ void try_free_clones(struct bio *clone) {
     }
 }
 
+void begin_critical_path(struct rollbaccine_device *device) {
+    struct bio *bio;
+
+    printk(KERN_INFO "Beginning critical path");
+
+    printk(KERN_INFO "Setting write index");
+    mutex_lock(&device->index_lock);
+    // If we're orchestrating this reconfiguration
+    if (atomic_read(&device->seen_ballot) == device->id) {
+        device->write_index = device->designated_write_index;
+    }
+    else {
+        mutex_lock(&device->reconfig_complete_lock);
+        device->write_index = device->reconfig_complete_write_index;
+        mutex_unlock(&device->reconfig_complete_lock);
+    }
+        
+    if (device->is_leader) {
+        printk(KERN_INFO "Flushing all fsyncs");
+        // Flush all fsyncs if we are the leader, because we know the backup must have it
+        mutex_lock(&device->replica_fsync_lock);
+        device->max_replica_fsync_index = device->write_index;
+        while (!bio_list_empty(&device->fsyncs_pending_replication)) {
+            bio = bio_list_pop(&device->fsyncs_pending_replication);
+            ack_bio_to_user_without_executing(bio);
+        }
+#ifdef MEMORY_TRACKING
+        device->num_fsyncs_pending_replication = 0;
+#endif
+        mutex_unlock(&device->replica_fsync_lock);
+    }
+    mutex_unlock(&device->index_lock);
+
+    // Set ballot = seen_ballot
+    printk(KERN_INFO "Setting ballot = seen_ballot");
+    atomic_set(&device->ballot, atomic_read(&device->seen_ballot));
+
+    // TODO: Tell the user that we're ready
+}
+
+void send_reconfig_complete_ack(struct rollbaccine_device *device) {
+    struct multisocket *counterpart;
+    struct metadata_msg metadata;
+    struct kvec vec;
+    int socket_id;
+    struct socket_data *socket_data;
+    bool success;
+
+    printk(KERN_INFO "Sending reconfig complete ACK");
+
+    metadata.type = ROLLBACCINE_RECONFIG_COMPLETE_ACK;
+    metadata.seen_ballot = atomic_read(&device->seen_ballot);
+    metadata.sender_id = device->id;
+
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    down_read(&device->connected_sockets_sem);
+    down_read(&device->counterpart_sem);
+    counterpart = device->counterpart;
+    socket_id = lock_on_next_free_socket(device, counterpart);
+    socket_data = &counterpart->socket_data[socket_id];
+
+    metadata.recipient_id = counterpart->sender_id;
+    metadata.sender_socket_id = socket_data->sender_socket_id;
+    metadata.msg_index = socket_data->last_sent_msg_index++;
+    hash_metadata(socket_data, &metadata);
+
+    success = send_msg(vec, socket_data->sock);
+    if (!success) {
+        printk(KERN_ERR "Error sending reconfig complete ACK message");
+    }
+
+    mutex_unlock(&socket_data->socket_mutex);
+    up_read(&device->counterpart_sem);
+    up_read(&device->connected_sockets_sem);
+}
+
+void handle_reconfig_complete(struct rollbaccine_device *device, struct multisocket *counterpart, struct metadata_msg *metadata) {
+    uint64_t senders_designated_node;
+    
+    mutex_lock(&device->reconfig_complete_lock);
+    printk(KERN_INFO "Received reconfig complete");
+
+    if (device->reconfig_complete_ballot >= metadata->seen_ballot) {
+        printk(KERN_INFO "Received duplicate reconfig complete, dropping");
+        mutex_unlock(&device->reconfig_complete_lock);
+        return;
+    }
+
+    device->reconfig_complete_ballot = metadata->seen_ballot;
+    device->reconfig_complete_write_index = metadata->write_index;
+    mutex_unlock(&device->reconfig_complete_lock);
+
+    // The sender must be our new counterpart. Modify it
+    down_write(&device->connected_sockets_sem);
+    down_write(&device->counterpart_sem);
+    device->counterpart_id = metadata->sender_id;
+    device->counterpart = counterpart;
+    up_write(&device->counterpart_sem);
+    up_write(&device->connected_sockets_sem);
+
+    // If we are also the designated node, immediately ACK
+    senders_designated_node = metadata->bi_opf;
+    if (senders_designated_node == device->id) {
+        printk(KERN_INFO "Immediately ACKing reconfig complete because we are also the designated node");
+        send_reconfig_complete_ack(device);
+        begin_critical_path(device);
+    }
+}
+
+void send_reconfig_complete(struct rollbaccine_device *device, struct multisocket *counterpart) {
+    struct metadata_msg metadata;
+    struct kvec vec;
+    int socket_id;
+    struct socket_data *socket_data;
+    bool success;
+
+    printk(KERN_INFO "Sending reconfig complete message");
+
+    metadata.type = ROLLBACCINE_RECONFIG_COMPLETE;
+    metadata.seen_ballot = atomic_read(&device->seen_ballot);
+    metadata.sender_id = device->id;
+    metadata.recipient_id = counterpart->sender_id;
+    metadata.write_index = device->designated_write_index;
+    metadata.bi_opf = device->designated_id; // Abuse bi_opf to also send designated_id
+
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    down_read(&device->connected_sockets_sem);
+    socket_id = lock_on_next_free_socket(device, counterpart);
+    socket_data = &counterpart->socket_data[socket_id];
+
+    metadata.sender_socket_id = socket_data->sender_socket_id;
+    metadata.msg_index = socket_data->last_sent_msg_index++;
+    hash_metadata(socket_data, &metadata);
+
+    success = send_msg(vec, socket_data->sock);
+    if (!success) {
+        printk(KERN_ERR "Error sending reconfig complete message");
+    }
+
+    mutex_unlock(&socket_data->socket_mutex);
+    up_read(&device->connected_sockets_sem);
+}
+
+void inc_verified_pages(struct rollbaccine_device *device) {
+    uint64_t counterpart_id, reconfig_complete_ballot;
+    struct multisocket *counterpart;
+    int num_verified_sectors = atomic_add_return(SECTORS_PER_PAGE, &device->num_verified_sectors);
+
+    // Tell the counterpart that we're ready to start!
+    if (num_verified_sectors >= device->num_sectors) {
+        printk(KERN_INFO "All sectors verified!");
+
+        // If we're orchestrating this reconfiguration
+        if (atomic_read(&device->seen_ballot) == device->id) {
+            // If counterpart != designated node, then send hashes to counterpart
+            down_read(&device->connected_sockets_sem);
+            down_read(&device->counterpart_sem);
+            counterpart_id = device->counterpart_id;
+            counterpart = device->counterpart;
+            up_read(&device->counterpart_sem);
+            up_read(&device->connected_sockets_sem);
+            if (counterpart_id != device->designated_id) {
+                printk(KERN_INFO "Counterpart %llu is not designated node %llu, sending hashes to counterpart", counterpart_id, device->designated_id);
+                handle_hash_req(device, counterpart);
+            }
+            
+            // Set our write_index and tell our counterpart we're done
+            mutex_lock(&device->index_lock);
+            device->write_index = device->designated_write_index;
+            mutex_unlock(&device->index_lock);
+            send_reconfig_complete(device, counterpart);
+        }
+        // If we're the counterpart to the reconfiguring node
+        else {
+            // If we already got the RECONFIG_COMPLETE message, then send an ACK
+            mutex_lock(&device->reconfig_complete_lock);
+            reconfig_complete_ballot = device->reconfig_complete_ballot;
+            mutex_unlock(&device->reconfig_complete_lock);
+
+            if (reconfig_complete_ballot == atomic_read(&device->seen_ballot)) {
+                send_reconfig_complete_ack(device);
+                begin_critical_path(device);
+            }
+        }
+    }
+}
+
+void reconfig_write_disk_end_io_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
+    free_pages_end_io(bio_data->bio_src);
+}
+    
+void reconfig_write_disk_end_io(struct bio *bio) {
+    struct bio_data *bio_data = bio->bi_private;
+    INIT_WORK(&bio_data->submit_bio_work, reconfig_write_disk_end_io_task);
+    queue_work(bio_data->device->reconfig_write_disk_end_io_queue, &bio_data->submit_bio_work);
+}
+
+bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *socket_data, sector_t sector) {
+    struct bio_data *bio_data;
+    struct bio *bio;
+    struct page *page;
+    struct kvec vec;
+    unsigned char checksum_and_iv[AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE];
+    bool success, verify_error;
+
+    printk(KERN_INFO "Receiving disk sector %llu", sector);
+
+    bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_WRITE, GFP_NOIO, &device->bs);
+    bio->bi_iter.bi_sector = sector;
+    bio->bi_end_io = reconfig_write_disk_end_io;
+
+    bio_data = alloc_bio_data(device);
+    bio_data->device = device;
+    bio_data->bio_src = bio;
+    bio_data->start_sector = sector;
+    bio_data->end_sector = sector + SECTORS_PER_PAGE;
+    bio_data->checksum_and_iv = checksum_and_iv;
+    bio->bi_private = bio_data;
+
+    page = page_cache_alloc(device);
+#ifdef MEMORY_TRACKING
+    atomic_inc(&device->num_bio_pages_not_freed);
+#endif
+    vec.iov_base = page_address(page);
+    vec.iov_len = PAGE_SIZE;
+
+    success = receive_msg(vec, socket_data->sock);
+    if (!success) {
+        printk(KERN_ERR "Error reading from socket");
+        free_pages_end_io(bio);
+        return false;
+    }
+    __bio_add_page(bio, page, PAGE_SIZE, 0);
+
+    // Fill local checksum_and_iv just for the VERIFY function
+    // We can't use DECRYPT here because it decrypts in place, so we end up writing plaintext to disk
+    memcpy(checksum_and_iv, global_checksum(device, sector), AES_GCM_AUTH_SIZE);
+    memcpy(checksum_and_iv + AES_GCM_AUTH_SIZE, global_iv(device, sector), AES_GCM_IV_SIZE);
+    enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY, &verify_error);
+    bio_data->checksum_and_iv = NULL;
+    if (verify_error) {
+        printk(KERN_ERR "Backup received invalid page");
+        free_pages_end_io(bio);
+        return false;
+    }
+
+    inc_verified_pages(device);
+
+    submit_bio_noacct(bio);
+    return true;
+}
+
+void fetch_disk_end_io_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
+    struct rollbaccine_device *device = bio_data->device;
+    struct multisocket *multisocket = bio_data->requester;
+    struct metadata_msg metadata;
+    struct kvec vec;
+    struct socket_data *socket_data;
+    struct bio_vec bvec, chunked_bvec;
+    struct bvec_iter iter;
+    int socket_id;
+    bool success;
+
+    // Send the page contents to the one who requested this disk
+    printk(KERN_INFO "Sending %llu to the disk requester", bio_data->start_sector);
+
+    // 1. Send a DISK_BEGIN message
+    metadata.type = ROLLBACCINE_DISK_BEGIN;
+    metadata.seen_ballot = atomic_read(&device->seen_ballot);
+    metadata.sender_id = device->id;
+    metadata.recipient_id = multisocket->sender_id;
+    metadata.sector = bio_data->start_sector;
+
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    // Lock the socket and use the same one for all hash messages
+    down_read(&device->connected_sockets_sem);
+    socket_id = lock_on_next_free_socket(device, bio_data->requester);
+    socket_data = &multisocket->socket_data[socket_id];
+
+    metadata.sender_socket_id = socket_data->sender_socket_id;
+    metadata.msg_index = socket_data->last_sent_msg_index++;
+    hash_metadata(socket_data, &metadata);
+
+    success = send_msg(vec, socket_data->sock);
+    if (!success)
+        goto unlock_and_free;
+
+    // 2. Send the actual disk content
+    bio_for_each_segment(bvec, bio_data->bio_src, iter) {
+        bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
+        success = send_page(chunked_bvec, socket_data->sock);
+        if (!success)
+            goto unlock_and_free;
+    }
+
+unlock_and_free:
+    mutex_unlock(&socket_data->socket_mutex);
+    up_read(&device->connected_sockets_sem);
+
+    free_pages_end_io(bio_data->bio_src);
+}
+
+void fetch_disk_end_io(struct bio *bio) {
+    struct bio_data *bio_data = bio->bi_private;
+    INIT_WORK(&bio_data->submit_bio_work, fetch_disk_end_io_task);
+    queue_work(bio_data->device->fetch_disk_end_io_queue, &bio_data->submit_bio_work);
+}
+
+void handle_disk_req(struct rollbaccine_device *device, struct multisocket *multisocket, sector_t sector) {
+    struct bio_data *bio_data;
+    struct bio *bio;
+
+    // Send a bio to disk to read the sector that's requested
+    printk(KERN_INFO "Reading %llu from disk per request", sector);
+
+    bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
+    bio->bi_iter.bi_sector = sector;
+    bio->bi_end_io = fetch_disk_end_io;
+    __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
+#ifdef MEMORY_TRACKING
+    atomic_inc(&device->num_bio_pages_not_freed);
+#endif
+
+    bio_data = alloc_bio_data(device);
+    bio_data->device = device;
+    bio_data->bio_src = bio;
+    bio_data->start_sector = sector;
+    bio_data->end_sector = sector + SECTORS_PER_PAGE;
+    bio_data->requester = multisocket;
+    bio->bi_private = bio_data;
+
+    submit_bio_noacct(bio);
+}
+
+void send_disk_req(struct rollbaccine_device *device, sector_t sector) {
+    struct metadata_msg metadata;
+    struct kvec vec;
+    struct socket_data *socket_data;
+    int socket_id;
+    bool success;
+
+    // Request a good page from the designated backup
+    metadata.type = ROLLBACCINE_DISK_REQ;
+    metadata.seen_ballot = atomic_read(&device->seen_ballot);
+    metadata.sender_id = device->id;
+    metadata.recipient_id = device->designated_id;
+    metadata.sector = sector;
+
+    down_read(&device->connected_sockets_sem);
+    socket_id = lock_on_next_free_socket(device, device->designated_node);
+    metadata.sender_socket_id = socket_id;
+    socket_data = &device->designated_node->socket_data[socket_id];
+    metadata.msg_index = socket_data->last_sent_msg_index++;
+    hash_metadata(socket_data, &metadata);
+
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    printk(KERN_INFO "Requesting disk sector %llu from the designated node", sector);
+    success = send_msg(vec, socket_data->sock);
+    if (!success) {
+        printk(KERN_ERR "Lost connection to designated node?");
+        alert_client_of_liveness_problem(device, device->designated_id);
+    }
+    mutex_unlock(&socket_data->socket_mutex);
+    up_read(&device->connected_sockets_sem);
+}
+
+void verify_disk_end_io_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
+    struct rollbaccine_device *device = bio_data->device;
+    bool error;
+
+    enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT, &error);
+
+    if (error)
+        send_disk_req(device, bio_data->start_sector);
+    else
+        inc_verified_pages(device);
+
+    free_pages_end_io(bio_data->bio_src);
+}
+
+void verify_disk_end_io(struct bio *bio) {
+    struct bio_data *bio_data = bio->bi_private;
+    INIT_WORK(&bio_data->submit_bio_work, verify_disk_end_io_task);
+    queue_work(bio_data->device->verify_disk_end_io_queue, &bio_data->submit_bio_work);
+}
+
 void leader_read_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     struct rollbaccine_device *device = bio_data->device;
+    bool error;
 
     // Decrypt
-    enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT);
+    enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT, &error);
+    if (error) {
+        alert_client_of_liveness_problem(device, device->id);
+        // TODO: Panic and crash
+    }
     // Unblock pending writes
     remove_from_outstanding_ops_and_unblock(device, bio_data->shallow_clone);
     // Return to user
@@ -872,18 +1323,18 @@ void broadcast_bio(struct work_struct *work) {
     size_t remaining_checksum_and_iv_size;
     struct rollbaccine_device *device = clone_bio_data->device;
     struct kvec vec;
-    struct multisocket *multisocket, *next_multisocket, *should_disconnect_from_multisocket;
+    struct multisocket *multisocket;
     struct socket_data *socket_data;
     struct metadata_msg metadata;
     struct additional_hash_msg *additional_hash_msg;
     struct bio_vec bvec, chunked_bvec;
     struct bvec_iter iter;
-    bool success;
+    bool success, should_disconnect = false;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
     metadata.type = clone_bio_data->is_fsync ? ROLLBACCINE_FSYNC : ROLLBACCINE_WRITE;
-    metadata.ballot = device->ballot;
+    metadata.ballot = atomic_read(&device->ballot);
     metadata.sender_id = device->id;
     metadata.write_index = clone_bio_data->write_index;
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
@@ -910,73 +1361,77 @@ void broadcast_bio(struct work_struct *work) {
 #endif
     }
 
-    // Second lock to make sure the list of connected sockets hasn't changed
     down_read(&device->connected_sockets_sem);
-    list_for_each_entry_safe(multisocket, next_multisocket, &device->connected_sockets, list) {
-        socket_id = lock_on_next_free_socket(device, multisocket);
-        socket_data = &multisocket->socket_data[socket_id];
-        
-        metadata.sender_socket_id = socket_id;
-        // Send the recipient its own ID so it can check that this message was intended for them
-        metadata.recipient_id = multisocket->sender_id;
-        // Create a hash of the message after incrementing msg_index
-        metadata.msg_index = socket_data->last_sent_msg_index++;
-        hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+    down_read(&device->counterpart_sem);
+    multisocket = device->counterpart;
+    if (multisocket == NULL) {
+        printk(KERN_ERR "Attempted to send to counterpart before we were connected");
+        goto finish_sending_to_socket;
+    }
+    socket_id = lock_on_next_free_socket(device, multisocket);
+    socket_data = &multisocket->socket_data[socket_id];
+    
+    metadata.sender_socket_id = socket_id;
+    // Send the recipient its own ID so it can check that this message was intended for them
+    metadata.recipient_id = multisocket->sender_id;
+    // Create a hash of the message after incrementing msg_index
+    metadata.msg_index = socket_data->last_sent_msg_index++;
+    hash_metadata(socket_data, &metadata);
 
-        vec.iov_base = &metadata;
-        vec.iov_len = sizeof(struct metadata_msg);
-        print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+    print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
 
-        // 1. Send metadata
+    // 1. Send metadata
+    success = send_msg(vec, socket_data->sock);
+    if (!success) {
+        printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
+        should_disconnect = true;
+        goto finish_sending_to_socket;
+    }
+    print_and_update_latency("broadcast_bio: Send metadata", &time);
+
+    // 2. Send hash & IVs if they exceed what could be sent with the metadata
+    if (additional_hash_msg != NULL) {
+        additional_hash_msg->sender_socket_id = socket_id;
+        additional_hash_msg->recipient_id = multisocket->sender_id;
+        additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
+        hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
+
+        vec.iov_base = additional_hash_msg;
+        vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
         success = send_msg(vec, socket_data->sock);
         if (!success) {
-            printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
-            should_disconnect_from_multisocket = multisocket;
+            printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+            should_disconnect = true;
             goto finish_sending_to_socket;
         }
-        print_and_update_latency("broadcast_bio: Send metadata", &time);
-
-        // 2. Send hash & IVs if they exceed what could be sent with the metadata
-        if (additional_hash_msg != NULL) {
-            additional_hash_msg->sender_socket_id = socket_id;
-            additional_hash_msg->recipient_id = multisocket->sender_id;
-            additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
-            hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
-
-            vec.iov_base = additional_hash_msg;
-            vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
-            success = send_msg(vec, socket_data->sock);
-            if (!success) {
-                printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
-                should_disconnect_from_multisocket = multisocket;
-                goto finish_sending_to_socket;
-            }
-            print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
-        }
-
-        // 3. Send bios
-        bio_for_each_segment(bvec, clone, iter) {
-            bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
-            success = send_page(chunked_bvec, socket_data->sock);
-            if (!success) {
-                printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
-                should_disconnect_from_multisocket = multisocket;
-                goto finish_sending_to_socket;
-            }
-        }
-        print_and_update_latency("broadcast_bio: Send pages", &time);
-        // Label to jump to if socket cannot be written to, so we can iterate the next socket
-    finish_sending_to_socket:
-        mutex_unlock(&socket_data->socket_mutex);
+        print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
     }
+
+    // 3. Send bios
+    bio_for_each_segment(bvec, clone, iter) {
+        bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
+        success = send_page(chunked_bvec, socket_data->sock);
+        if (!success) {
+            printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
+            should_disconnect = true;
+            goto finish_sending_to_socket;
+        }
+    }
+    print_and_update_latency("broadcast_bio: Send pages", &time);
+    // Label to jump to if socket cannot be written to, so we can iterate the next socket
+finish_sending_to_socket:
+    mutex_unlock(&socket_data->socket_mutex);
+    
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
+    up_read(&device->counterpart_sem);
     up_read(&device->connected_sockets_sem);
 
-    if (should_disconnect_from_multisocket != NULL) {
-        // Disconnect from misbehaving replica. Note: This will only disconnect from the *last* misbehaving replica; if multiple misbehave at once, we'll find them eventually.
+    if (should_disconnect) {
         printk(KERN_ERR "Disconnecting from misbehaving replica");
-        alert_client_of_liveness_problem(device, should_disconnect_from_multisocket);
-        disconnect(device, should_disconnect_from_multisocket);
+        alert_client_of_liveness_problem(device, multisocket->sender_id);
+        disconnect(device, multisocket);
     }
     if (additional_hash_msg != NULL) {
         kfree(additional_hash_msg);
@@ -1047,6 +1502,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bool is_cloned = false;
     bool doesnt_conflict_with_other_writes = true;
     bool is_empty = bio_sectors(bio) == 0;
+    bool encrypt_error;
     struct rollbaccine_device *device = ti->private;
     struct bio_data *bio_data;
     cycles_t time = get_cycles_if_flag_on();
@@ -1095,7 +1551,11 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
 
                 // Encrypt
-                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
+                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT, &encrypt_error);
+                if (encrypt_error) {
+                    alert_client_of_liveness_problem(device, device->id);
+                    // TODO: System panic
+                }
                 print_and_update_latency("leader_process_write: encryption", &time);
 
                 // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
@@ -1215,6 +1675,10 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, cha
     return true;
 }
 
+void hash_metadata(struct socket_data *socket_data, struct metadata_msg *metadata) {
+    hash_buffer(socket_data, (char *)metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata->msg_hash);
+}
+
 // Note: Caller must hold socket_data->socket_mutex on the socket_data that owns the hash_desc
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out) {
     cycles_t time = get_cycles_if_flag_on();
@@ -1227,7 +1691,7 @@ void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char
     print_and_update_latency("hash_buffer", &time);
 }
 
-unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
+unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec, bool *error) {
     int ret = 0;
     struct bio *bio;
     struct bio_vec bv;
@@ -1245,6 +1709,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     unsigned char *checksum;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
+    *error = false;
 
     if (bio_data->end_sector == bio_data->start_sector) {
         // printk(KERN_INFO "Skipping encryption/decryption for empty bio");
@@ -1367,10 +1832,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
 
         if (ret) {
             if (ret == -EBADMSG) {
-                printk_ratelimited(KERN_ERR "invalid integrity check");
+                printk_ratelimited(KERN_ERR "%llu invalid integrity check", bio_data->device->id);
             } else {
                 printk_ratelimited(KERN_ERR "encryption/decryption failed with error code %d", ret);
             }
+            *error = true;
             goto free_and_return;
         }
 
@@ -1486,7 +1952,7 @@ int ack_fsync(void *args) {
     struct rollbaccine_device *device = args;
     struct metadata_msg metadata;
     struct kvec vec;
-    struct multisocket *multisocket, *next_multisocket;
+    struct multisocket *multisocket;
     struct socket_data *socket_data;
     int last_sent_fsync, socket_id, signal;
     bool success;
@@ -1512,44 +1978,331 @@ int ack_fsync(void *args) {
 #endif
 
         down_read(&device->connected_sockets_sem);
-        // TODO: Should only ack fsync to the primary
-        list_for_each_entry_safe(multisocket, next_multisocket, &device->connected_sockets, list) {
-            socket_id = lock_on_next_free_socket(device, multisocket);
-            socket_data = &multisocket->socket_data[socket_id];
+        down_read(&device->counterpart_sem);
+        multisocket = device->counterpart;
+        socket_id = lock_on_next_free_socket(device, multisocket);
+        socket_data = &multisocket->socket_data[socket_id];
 
-            metadata.type = ROLLBACCINE_ACK;
-            metadata.ballot = device->ballot;
-            metadata.sender_id = device->id;
-            metadata.sender_socket_id = socket_data->sender_socket_id;
-            metadata.recipient_id = multisocket->sender_id;
-            metadata.msg_index = socket_data->last_sent_msg_index++;
-            metadata.write_index = last_sent_fsync;
-            hash_buffer(socket_data, (char *)&metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata.msg_hash);
+        metadata.type = ROLLBACCINE_ACK;
+        metadata.ballot = atomic_read(&device->ballot);
+        metadata.sender_id = device->id;
+        metadata.sender_socket_id = socket_data->sender_socket_id;
+        metadata.recipient_id = multisocket->sender_id;
+        metadata.msg_index = socket_data->last_sent_msg_index++;
+        metadata.write_index = last_sent_fsync;
+        hash_metadata(socket_data, &metadata);
 
-            vec.iov_base = &metadata;
-            vec.iov_len = sizeof(struct metadata_msg);
+        vec.iov_base = &metadata;
+        vec.iov_len = sizeof(struct metadata_msg);
 
-            success = send_msg(vec, socket_data->sock);
-            if (!success) {
-                printk_ratelimited(KERN_ERR "Error sending fsync ack");
-            }
-            mutex_unlock(&socket_data->socket_mutex);
+        success = send_msg(vec, socket_data->sock);
+        if (!success) {
+            printk_ratelimited(KERN_ERR "Error sending fsync ack");
         }
+        mutex_unlock(&socket_data->socket_mutex);
+        up_read(&device->counterpart_sem);
         up_read(&device->connected_sockets_sem);
     }
 
     return 0;
 }
 
+bool handle_p1a(struct rollbaccine_device *device, struct multisocket *multisocket, struct metadata_msg p1a) {
+    struct metadata_msg p1b;
+    struct kvec vec;
+    struct socket_data *socket_data;
+    int socket_id;
+    bool success;
+
+    printk(KERN_INFO "Received P1A, replying with P1B");
+
+    p1b.type = ROLLBACCINE_P1B;
+    p1b.ballot = atomic_read(&device->ballot);
+    p1b.seen_ballot = atomic_read(&device->seen_ballot);
+    p1b.sender_id = device->id;
+    p1b.recipient_id = multisocket->sender_id;
+    
+    mutex_lock(&device->index_lock);
+    p1b.write_index = device->write_index;
+    mutex_unlock(&device->index_lock);
+
+    vec.iov_base = &p1b;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    down_read(&device->connected_sockets_sem);
+    socket_id = lock_on_next_free_socket(device, multisocket);
+    socket_data = &multisocket->socket_data[socket_id];
+    p1b.sender_socket_id = socket_data->sender_socket_id;
+    p1b.msg_index = socket_data->last_sent_msg_index++;
+    hash_metadata(socket_data, &p1b);
+
+    success = send_msg(vec, socket_data->sock);
+    mutex_unlock(&socket_data->socket_mutex);
+    up_read(&device->connected_sockets_sem);
+    return success;
+}
+
+bool handle_p1b(struct rollbaccine_device *device, struct metadata_msg p1b) {
+    struct configuration *config;
+    int i, j, num_received_in_conf;
+    bool quorum_reached = true;
+    struct multisocket *highest_multisocket;
+    struct socket_data *highest_socket_data;
+    int highest_socket_id;
+    struct metadata_msg metadata;
+    struct kvec vec;
+    bool success;
+
+    printk(KERN_INFO "Received P1B from %llu with ballot %llu and write index %llu", p1b.sender_id, p1b.ballot, p1b.write_index);
+
+    mutex_lock(&device->prior_confs_lock);
+    // If we've already reached quorum and requested hashes, then we're done
+    if (device->sent_hash_req) {
+        mutex_unlock(&device->prior_confs_lock);
+        return true;
+    }
+    // Record the ballot and write index of each node. Also, check if we have quorum
+    for (i = 0; i < device->num_prior_confs; i++) {
+        config = &device->prior_confs[i];
+        num_received_in_conf = 0;
+
+        for (j = 0; j < 2; j++) {
+            if (config->ids[j] == p1b.sender_id) {
+                config->ballots[j] = p1b.ballot;
+                config->write_indices[j] = p1b.write_index;
+            }
+            if (config->ballots[j] != 0) {
+                num_received_in_conf++;
+
+                // Update "highest" values
+                if (config->ballots[j] > device->designated_ballot || (config->ballots[j] == device->designated_ballot && config->write_indices[j] > device->designated_write_index)) {
+                    device->designated_ballot = config->ballots[j];
+                    device->designated_write_index = config->write_indices[j];
+                    device->designated_id = config->ids[j];
+                }
+            }
+        }
+
+        if (num_received_in_conf == 0)
+            quorum_reached = false; 
+    }
+    if (quorum_reached) {
+        printk(KERN_INFO "Reconfiguration quorum reached, highest ballot: %llu, highest write index: %llu, highest id: %llu", device->designated_ballot, device->designated_write_index, device->designated_id);
+        device->sent_hash_req = true;
+    }
+    mutex_unlock(&device->prior_confs_lock);
+
+    // If we have quorum, request hashes from the most up-to-date node
+    if (quorum_reached) {
+        printk(KERN_INFO "P1B quorum reached, requesting hashes from the designated node: %llu", device->designated_id);
+
+        metadata.type = ROLLBACCINE_HASH_REQ;
+        metadata.seen_ballot = atomic_read(&device->seen_ballot);
+        metadata.sender_id = device->id;
+        metadata.recipient_id = device->designated_id;
+
+        // Find the multisocket of the designated node
+        down_read(&device->connected_sockets_sem);
+        list_for_each_entry(highest_multisocket, &device->connected_sockets, list) {
+            if (highest_multisocket->sender_id == device->designated_id) {
+                device->designated_node = highest_multisocket;
+                highest_socket_id = lock_on_next_free_socket(device, highest_multisocket);
+                metadata.sender_socket_id = highest_socket_id;
+                highest_socket_data = &highest_multisocket->socket_data[highest_socket_id];
+                metadata.msg_index = highest_socket_data->last_sent_msg_index++;
+                hash_metadata(highest_socket_data, &metadata);
+
+                vec.iov_base = &metadata;
+                vec.iov_len = sizeof(struct metadata_msg);
+
+                printk(KERN_INFO "Requesting hashes from %llu", device->designated_id);
+                success = send_msg(vec, highest_socket_data->sock);
+
+                mutex_unlock(&highest_socket_data->socket_mutex);
+                // Early return
+                up_read(&device->connected_sockets_sem);
+                return success;
+            }
+        }
+        up_read(&device->connected_sockets_sem);
+        printk(KERN_ERR "Could not find the multisocket of the designated node %llu", device->designated_id);
+    }
+    return true;
+}
+
+bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *multisocket) {
+    struct metadata_msg metadata;
+    struct hash_msg *hash_msg;
+    struct kvec vec;
+    struct socket_data *socket_data;
+    int socket_id;
+    sector_t sector = 0, i;
+    bool success;
+    bool about_to_complete = false;
+
+    hash_msg = kmalloc(sizeof(struct hash_msg), GFP_KERNEL);
+
+    printk(KERN_INFO "Sending HASH_BEGIN message");
+    metadata.type = ROLLBACCINE_HASH_BEGIN;
+    metadata.seen_ballot = atomic_read(&device->seen_ballot);
+    metadata.sender_id = device->id;
+    metadata.recipient_id = multisocket->sender_id;
+
+    vec.iov_base = &metadata;
+    vec.iov_len = sizeof(struct metadata_msg);
+
+    // Lock the socket and use the same one for all hash messages
+    down_read(&device->connected_sockets_sem);
+    socket_id = lock_on_next_free_socket(device, multisocket);
+    socket_data = &multisocket->socket_data[socket_id];
+
+    metadata.sender_socket_id = socket_data->sender_socket_id;
+    metadata.msg_index = socket_data->last_sent_msg_index++;
+    hash_metadata(socket_data, &metadata);
+
+    success = send_msg(vec, socket_data->sock);
+    if (!success)
+        goto unlock_and_return;
+
+    // 2. Send all global hashes and checksums
+    hash_msg->seen_ballot = atomic_read(&device->seen_ballot);
+    hash_msg->sender_id = device->id;
+    hash_msg->sender_socket_id = socket_data->sender_socket_id;
+    hash_msg->recipient_id = multisocket->sender_id;
+
+    printk(KERN_INFO "Sending all hashes");
+    while (!about_to_complete) {
+        hash_msg->msg_index = socket_data->last_sent_msg_index++;
+        hash_msg->start_sector = sector;
+
+        // Copy hashes and IVs into the message
+        for (i = 0; i < ROLLBACCINE_HASHES_PER_MSG; i++) {
+            if (sector + i >= device->num_sectors) {
+                about_to_complete = true;
+                break;
+            }
+            memcpy(hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE), global_checksum(device, sector+i), AES_GCM_AUTH_SIZE);
+            memcpy(hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE, global_iv(device, sector+i), AES_GCM_IV_SIZE);
+        }
+        sector += ROLLBACCINE_HASHES_PER_MSG;
+        
+        hash_buffer(socket_data, (char *)hash_msg + SHA256_SIZE, sizeof(struct hash_msg) - SHA256_SIZE, hash_msg->msg_hash);
+
+        vec.iov_base = hash_msg;
+        vec.iov_len = sizeof(struct hash_msg);
+        success = send_msg(vec, socket_data->sock);
+        if (!success)
+            goto unlock_and_return;
+    }
+    printk(KERN_INFO "Finished sending hashes for %llu sectors", device->num_sectors);
+
+unlock_and_return:
+    mutex_unlock(&socket_data->socket_mutex);
+    up_read(&device->connected_sockets_sem);
+    kfree(hash_msg);
+    return success;
+}
+
+bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data) {
+    struct hash_msg *hash_msg;
+    struct kvec vec;
+    bool success, about_to_complete = false;
+    sector_t i, sector;
+    struct bio_data *bio_data;
+    struct bio *bio;
+    struct blk_plug plug;
+    int bios_between_plug = 0;
+
+    hash_msg = kmalloc(sizeof(struct hash_msg), GFP_KERNEL);
+
+    // 1. Receive all hash messages
+    printk(KERN_INFO "Begin receiving hashes");
+    while (!about_to_complete) {
+        vec.iov_base = hash_msg;
+        vec.iov_len = sizeof(struct hash_msg);
+
+        success = receive_msg(vec, socket_data->sock);
+        if (!success) {
+            printk(KERN_ERR "Error reading hash from socket");
+            kfree(hash_msg);
+            return false;
+        }
+
+        // Verify the message
+        if (!verify_msg(socket_data, (char*) hash_msg + SHA256_SIZE, sizeof(struct hash_msg) - SHA256_SIZE, hash_msg->msg_hash, hash_msg->sender_id, hash_msg->sender_socket_id, hash_msg->recipient_id, device->id, hash_msg->msg_index)) {
+            kfree(hash_msg);
+            return false;
+        }
+
+        // Ignore any messages with a ballot lower than our seen_ballot
+        if (hash_msg->seen_ballot < atomic_read(&device->seen_ballot)) {
+            printk(KERN_ERR "Received hash_msg with lower ballot %llu than seen_ballot %d, ignoring", hash_msg->seen_ballot, atomic_read(&device->seen_ballot));
+            kfree(hash_msg);
+            return false;
+        }
+
+        // Copy hashes and IVs into the global checksum and IV
+        // printk(KERN_INFO "Received hashes from %llu sector to %llu", hash_msg->start_sector, hash_msg->start_sector + ROLLBACCINE_HASHES_PER_MSG - 1);
+        for (i = 0; i < ROLLBACCINE_HASHES_PER_MSG; i++) {
+            sector = hash_msg->start_sector + i;
+            memcpy(global_checksum(device, sector), hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE), AES_GCM_AUTH_SIZE);
+            memcpy(global_iv(device, sector), hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE, AES_GCM_IV_SIZE);
+            
+            if (sector >= device->num_sectors - 1) {
+                about_to_complete = true;
+                break;
+            }
+        }
+    }
+    kfree(hash_msg);
+    printk(KERN_INFO "Finished receiving hashes, beginning disk scan");
+
+    // 2. Scan the disk to verify the hashes
+    atomic_set(&device->num_verified_sectors, 0);
+    sector = 0;
+    blk_start_plug(&plug);
+    while (sector < device->num_sectors) {
+        bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
+        bio->bi_iter.bi_sector = sector;
+        bio->bi_end_io = verify_disk_end_io;
+        __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
+#ifdef MEMORY_TRACKING
+        atomic_inc(&device->num_bio_pages_not_freed);
+#endif
+
+        bio_data = alloc_bio_data(device);
+        bio_data->device = device;
+        bio_data->bio_src = bio;
+        bio_data->start_sector = sector;
+        bio_data->end_sector = sector + SECTORS_PER_PAGE;
+        bio->bi_private = bio_data;
+
+        sector += SECTORS_PER_PAGE;
+        submit_bio_noacct(bio);
+
+        bios_between_plug++;
+        if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+            blk_finish_plug(&plug);
+            blk_start_plug(&plug);
+            bios_between_plug = 0;
+        }
+    }
+    blk_finish_plug(&plug);
+    printk(KERN_INFO "Finished submitting scans to disk");
+    return true;
+}
+
 // Function used by all listening sockets to block and listen to messages
+// IMPORTANT: The socket_data here can ONLY be used to READ, because we're not locking on it, so its last_sent_msg_index can't be changed
 void blocking_read(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data) {
     struct metadata_msg metadata;
     struct bio *received_bio;
     struct bio_data *bio_data;
     struct page *page;
     struct kvec vec;
-    bool success;
-    int i, num_sectors, index_offset, bio_distance;
+    uint64_t msg_ballot;
+    bool success, verify_error;
+    int i, num_sectors, index_offset, bio_distance, old_seen_ballot;
     size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
     struct additional_hash_msg *additional_hash_msg;
     long replaced_bio_data;
@@ -1573,13 +2326,64 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
             goto disconnect_from_sender;
         }
 
-        // Received ack for fsync
-        if (metadata.type == ROLLBACCINE_ACK && device->is_leader) {
-            // printk(KERN_INFO "Received fsync ack for write index: %llu", metadata.write_index);
-            process_follower_fsync_index(device, metadata.write_index);
-            continue;
+        // Ignore any messages with a ballot lower than our seen_ballot and ALSO update our ballot (with atomic_max)
+        msg_ballot = max(metadata.ballot, metadata.seen_ballot);
+        old_seen_ballot = atomic_max(&device->seen_ballot, msg_ballot);
+        if (msg_ballot < old_seen_ballot) {
+            printk(KERN_ERR "Received message with lower ballot %llu than seen_ballot %d, ignoring", msg_ballot, old_seen_ballot);
+            goto disconnect_from_sender;
         }
 
+        // Handle fsyncs or non-critical path messages.
+        // Note that each case ends with "continue" instead of "break" to avoid critical path processing
+        switch (metadata.type) {
+            case ROLLBACCINE_WRITE:
+            case ROLLBACCINE_FSYNC:
+                // Handled by the rest of this method
+                break;
+            case ROLLBACCINE_ACK:
+                if (device->is_leader)
+                    process_follower_fsync_index(device, metadata.write_index);
+                else
+                    printk(KERN_ERR "Backup received fsync ACK");
+                continue;
+            case ROLLBACCINE_P1A:
+                success = handle_p1a(device, multisocket, metadata);
+                if (!success)
+                    goto disconnect_from_sender;
+                continue;
+            case ROLLBACCINE_P1B:
+                success = handle_p1b(device, metadata);
+                if (!success)
+                    goto disconnect_from_sender;
+                continue;
+            case ROLLBACCINE_HASH_REQ:
+                success = handle_hash_req(device, multisocket);
+                if (!success)
+                    goto disconnect_from_sender;
+                continue;
+            case ROLLBACCINE_HASH_BEGIN:
+                success = handle_hash(device, multisocket, socket_data);
+                if (!success)
+                    goto disconnect_from_sender;
+                continue;
+            case ROLLBACCINE_DISK_REQ:
+                handle_disk_req(device, multisocket, metadata.sector);
+                continue;
+            case ROLLBACCINE_DISK_BEGIN:
+                success = handle_disk_sector(device, socket_data, metadata.sector);
+                if (!success)
+                    goto disconnect_from_sender;
+                continue;
+            case ROLLBACCINE_RECONFIG_COMPLETE:
+                handle_reconfig_complete(device, multisocket, &metadata);
+                continue;
+            case ROLLBACCINE_RECONFIG_COMPLETE_ACK:
+                begin_critical_path(device);
+                continue;
+        }
+
+        // Critical path processing
         received_bio = bio_alloc_bioset(device->dev->bdev, metadata.num_pages, metadata.bi_opf, GFP_NOIO, &device->bs);
         received_bio->bi_iter.bi_sector = metadata.sector;
         received_bio->bi_end_io = replica_disk_end_io;
@@ -1659,14 +2463,20 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         }
 
         // 4. Verify against hash
-        enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
+        enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY, &verify_error);
+        if (verify_error) {
+            printk(KERN_ERR "Backup received invalid page");
+            free_pages_end_io(received_bio);
+            alert_client_of_liveness_problem(device, multisocket->sender_id);
+            goto disconnect_from_sender;
+        }
 
         // 5. Add bio to pending_bio_ring
         bio_distance = bio_data->write_index - atomic_read(&device->pending_bio_ring_head);
         if (bio_distance > ROLLBACCINE_PENDING_BIO_RING_SIZE) {
             printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
             free_pages_end_io(received_bio);
-            alert_client_of_liveness_problem(device, multisocket);
+            alert_client_of_liveness_problem(device, multisocket->sender_id);
             goto disconnect_from_sender;
         }
         // Only place the bio if the previous entry there was already processed
@@ -1675,7 +2485,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         if (replaced_bio_data != 0) {
             printk(KERN_ERR "Pending bio ring overflowing, attempted to replace non-NULL element, bio distance: %d", bio_distance);
             free_pages_end_io(received_bio);
-            alert_client_of_liveness_problem(device, multisocket);
+            alert_client_of_liveness_problem(device, multisocket->sender_id);
             goto disconnect_from_sender;
         }
         // Check bio distance again, this time to see if we should wake up the submit thread
@@ -1700,7 +2510,7 @@ disconnect_from_sender:
 cleanup:
     // TODO: Can't release the socket in case another thread calls disconnect and tries to shut down the released socket...
     // sock_release(socket_data->sock);
-    kfree(socket_data->hash_desc);
+    // kfree(socket_data->hash_desc);
 }
 
 void init_socket_data(struct rollbaccine_device *device, struct socket_data *socket_data, struct socket *sock, uint64_t sender_id, uint64_t sender_socket_id) {
@@ -1742,7 +2552,6 @@ struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_devi
     for (i = 0; i < NUM_NICS; i++) {
         multisocket->sender_socket_id_taken[i] = false;
     }
-    atomic_set(&multisocket->alerted_client_of_liveness_problem, 0);
     atomic_set(&multisocket->disconnected, 0);
     list_add(&multisocket->list, &device->connected_sockets);
 
@@ -1789,52 +2598,84 @@ bool add_sender_socket_id_if_unique(struct rollbaccine_device *device, struct mu
 
 int connect_to_server(void *args) {
     struct client_thread_params *thread_params = (struct client_thread_params *)args;
+    struct rollbaccine_device *device = thread_params->device;
     struct multisocket *multisocket;
     struct socket_data *socket_data;
     struct multithreaded_handshake_pair handshake_pair;
     int error = -1;
+    // Reconfiguration messaging
+    struct metadata_msg metadata;
+    struct kvec vec;
 
-    // Retry connecting to server until it succeeds
     printk(KERN_INFO "Attempting to connect for the first time");
-    while (error != 0 && !thread_params->device->shutting_down) {
+    while (error != 0 && !device->shutting_down) {
         error = kernel_connect(thread_params->sock, (struct sockaddr *)&thread_params->addr, sizeof(thread_params->addr), 0);
         if (error != 0) {
-            printk(KERN_ERR "Error connecting to server, retrying...");
-            msleep(ROLLBACCINE_RETRY_TIMEOUT);
+            printk(KERN_ERR "Error connecting to server");
+            goto cleanup;
         }
     }
 
-    if (thread_params->device->shutting_down) {
+    if (device->shutting_down) {
         goto cleanup;
     }
     printk(KERN_INFO "Connected to server");
     
     // handshake to get id
-    send_handshake_id(thread_params->device, thread_params->sock, thread_params->socket_id); 
-    handshake_pair = receive_handshake_id(thread_params->device, thread_params->sock);
+    send_handshake_id(device, thread_params->sock, thread_params->socket_id); 
+    handshake_pair = receive_handshake_id(device, thread_params->sock);
     if (thread_params->server_id != handshake_pair.sender_id) {
         // Note: Since we don't hash handshakes, a man-in-the-middle attacker could spoof the handshake and pass this test.
         // However, because blocking_read DOES check the hash, the attacker would not be able to send any messages, so this would just be a liveness attack equivalent to dropping messages.
         printk(KERN_ERR "Error: Server ID %llu does not match handshake ID %llu, man-in-the-middle attack", thread_params->server_id, handshake_pair.sender_id);
         goto cleanup;
     }
-    multisocket = create_connected_socket_list_if_null(thread_params->device, handshake_pair.sender_id);
+    multisocket = create_connected_socket_list_if_null(device, handshake_pair.sender_id);
     // Check that each socket has a unique ID
-    if (!add_sender_socket_id_if_unique(thread_params->device, multisocket, handshake_pair.sender_socket_id)) {
+    if (!add_sender_socket_id_if_unique(device, multisocket, handshake_pair.sender_socket_id)) {
         printk(KERN_ERR "Error: Sender thread %llu was reused, replay attack", handshake_pair.sender_socket_id);
         goto cleanup;
     }
     socket_data = &multisocket->socket_data[thread_params->socket_id];
-    init_socket_data(thread_params->device, socket_data, thread_params->sock, handshake_pair.sender_id, handshake_pair.sender_socket_id);
+    init_socket_data(device, socket_data, thread_params->sock, handshake_pair.sender_id, handshake_pair.sender_socket_id);
 
-    blocking_read(thread_params->device, multisocket, socket_data);
+    // Logic only to be executed once per endpoint
+    if (thread_params->socket_id == 0) {
+        // Set counterpart, if this is the first connection to our counterpart
+        down_write(&device->connected_sockets_sem);
+        down_write(&device->counterpart_sem);
+        if (handshake_pair.sender_id == device->counterpart_id) {
+            printk(KERN_INFO "Connected to our counterpart, we are the client");
+            device->counterpart = multisocket;
+        }
+        up_write(&device->counterpart_sem);
+        up_write(&device->connected_sockets_sem);
+        
+        // Send P1a to server
+        if (thread_params->send_p1a) {
+            metadata.type = ROLLBACCINE_P1A;
+            metadata.seen_ballot = atomic_read(&device->seen_ballot);
+            metadata.sender_id = device->id;
+            metadata.sender_socket_id = thread_params->socket_id;
+            metadata.recipient_id = handshake_pair.sender_id;
+            metadata.msg_index = socket_data->last_sent_msg_index++;
+            hash_metadata(socket_data, &metadata);
+
+            vec.iov_base = &metadata;
+            vec.iov_len = sizeof(struct metadata_msg);
+            printk(KERN_INFO "Sending P1a to server: %llu", handshake_pair.sender_id);
+            send_msg(vec, thread_params->sock);
+        }
+    }
+
+    blocking_read(device, multisocket, socket_data);
 
 cleanup:
     kfree(thread_params);
     return 0;
 }
 
-int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id, char *addr, ushort port) {
+int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id, char *addr, ushort port, bool send_p1a) {
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
     int i, error;
@@ -1849,6 +2690,7 @@ int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id
         thread_params->device = device;
         thread_params->server_id = server_id;
         thread_params->socket_id = i;
+        thread_params->send_p1a = send_p1a;
 
         error = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &thread_params->sock);
         if (error < 0) {
@@ -1920,6 +2762,17 @@ int listen_for_connections(void *args) {
         if (!add_sender_socket_id_if_unique(device, new_thread_params->multisocket, handshake_pair.sender_socket_id)) {
             printk(KERN_ERR "Error: Sender thread %llu was reused, replay attack", handshake_pair.sender_socket_id);
             continue;
+        }
+        // Check if this is our first connection to our counterpart
+        if (handshake_pair.sender_socket_id == 0) {
+            printk(KERN_INFO "Connected to our counterpart, we are the server");
+            down_write(&device->connected_sockets_sem);
+            down_write(&device->counterpart_sem);
+            if (device->counterpart_id == handshake_pair.sender_id) {
+                device->counterpart = new_thread_params->multisocket;
+            }
+            up_write(&device->counterpart_sem);
+            up_write(&device->connected_sockets_sem);
         }
         new_thread_params->socket_data = &new_thread_params->multisocket->socket_data[handshake_pair.sender_socket_id];
         init_socket_data(device, new_thread_params->socket_data, new_sock, handshake_pair.sender_id, handshake_pair.sender_socket_id);
@@ -2057,13 +2910,14 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
 // Primary does not connect to backup if this is the first configuration (no additional configs)
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
-    uint64_t server_id;
-    ushort port;
-    int error, conf_index, i, num_prior_confs;
+    ushort port, counterpart_port;
+    uint64_t id, seen_ballot;
+    int error, conf_index, i, earlier_conf_index, j;
+    bool should_not_connect_twice;
     unsigned long projected_bytes_used = 0;
     unsigned long checksum_and_iv_size;
 
-    device = kmalloc(sizeof(struct rollbaccine_device), GFP_KERNEL);
+    device = kzalloc(sizeof(struct rollbaccine_device), GFP_KERNEL);
     if (device == NULL) {
         printk(KERN_ERR "Error creating device");
         return -ENOMEM;
@@ -2115,6 +2969,24 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
 
+    device->verify_disk_end_io_queue = alloc_workqueue("verify disk end io queue", 0, 0);
+    if (!device->verify_disk_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate verify disk end io queue");
+        return -ENOMEM;
+    }
+
+    device->fetch_disk_end_io_queue = alloc_workqueue("fetch disk end io queue", 0, 0);
+    if (!device->fetch_disk_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate fetch disk end io queue");
+        return -ENOMEM;
+    }
+
+    device->reconfig_write_disk_end_io_queue = alloc_workqueue("reconfig write disk end io queue", 0, 0);
+    if (!device->reconfig_write_disk_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate reconfig write disk end io queue");
+        return -ENOMEM;
+    }
+
     // Get the device from argv[0] and store it in device->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &device->dev)) {
         printk(KERN_ERR "Error getting device");
@@ -2128,12 +3000,13 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
     printk(KERN_INFO "id: %llu", device->id);
 
-    error = kstrtou64(argv[2], 10, &device->seen_ballot);
+    error = kstrtou64(argv[2], 10, &seen_ballot);
     if (error < 0) {
         printk(KERN_ERR "Error parsing seen ballot");
         return error;
     }
-    printk(KERN_INFO "seen ballot: %llu", device->seen_ballot);
+    printk(KERN_INFO "seen ballot: %llu", seen_ballot);
+    atomic_set(&device->seen_ballot, seen_ballot);
 
     device->write_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->index_lock);
@@ -2170,6 +3043,30 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return PTR_ERR(device->hash_alg);
     }
 
+    // Set up AEAD
+    device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+    if (IS_ERR(device->tfm)) {
+        printk(KERN_ERR "Error allocating AEAD");
+        return PTR_ERR(device->tfm);
+    }
+    crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
+
+    error = crypto_aead_setkey(device->tfm, argv[4], KEY_SIZE);
+    if (error < 0) {
+        printk(KERN_ERR "Error setting key");
+        return error;
+    }
+
+    device->num_sectors = ti->len;
+    checksum_and_iv_size = (unsigned long)(ti->len / ROLLBACCINE_SECTORS_PER_ENCRYPTION) * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
+    printk(KERN_INFO "Checksums and IVs size: %lu", checksum_and_iv_size);
+    device->checksums = vzalloc(checksum_and_iv_size);
+    if (device->checksums == NULL) {
+        printk(KERN_ERR "Error allocating checksums");
+        return -ENOMEM;
+    }
+    projected_bytes_used += checksum_and_iv_size;
+
     // Start server
     error = kstrtou16(argv[5], 10, &port);
     if (error < 0) {
@@ -2185,73 +3082,83 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
 
-    // Connect to other servers
+    // Set counterpart_id
+    init_rwsem(&device->counterpart_sem);
+    error = kstrtou64(argv[6], 10, &device->counterpart_id);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing counterpart id");
+        return error;
+    }
+
+    mutex_init(&device->prior_confs_lock);
+    mutex_init(&device->reconfig_complete_lock);
+
+    // No prior configs = initial launch, can start immediately
     if (argc <= 9) {
         printk(KERN_INFO "No prior configs detected, can start execution");
-        device->ballot = device->seen_ballot;
-
-        // If we're the backup, we need to connect to the primary
-        if (!device->is_leader) {
-            error = kstrtou64(argv[6], 10, &server_id);
-            if (error < 0) {
-                printk(KERN_ERR "Error parsing primary id");
-                return error;
-            }
-            error = kstrtou16(argv[8], 10, &port);
-            if (error < 0) {
-                printk(KERN_ERR "Error parsing primary port");
-                return error;
-            }
-            printk(KERN_INFO "Starting thread to connect to primary %llu at %s:%u", server_id, argv[7], port);
-            start_client_to_server(device, server_id, argv[7], port);
-        }
+        atomic_set(&device->ballot, seen_ballot);
     }
     // Connect to machines in prior configs if they are provided
     else {
-        num_prior_confs = (argc - 9) / 6;  // 6 args per prior config (primary id, addr, port, backup id, addr, port)
-        device->prior_confs = kmalloc(sizeof(struct configuration) * num_prior_confs, GFP_KERNEL);
-        printk(KERN_INFO "Num prior confs: %d", num_prior_confs);
+        mutex_lock(&device->prior_confs_lock);
+        down_read(&device->counterpart_sem);
+        device->num_prior_confs = (argc - 9) / 6;  // 6 args per prior config (primary id, addr, port, backup id, addr, port)
+        device->prior_confs = kzalloc(sizeof(struct configuration) * device->num_prior_confs, GFP_KERNEL);
+        printk(KERN_INFO "Num prior confs: %d", device->num_prior_confs);
 
-        for (conf_index = 0; conf_index < num_prior_confs; conf_index++) {
+        for (conf_index = 0; conf_index < device->num_prior_confs; conf_index++) {
             for (i = 0; i < 2; i++) {
-                error = kstrtou64(argv[9 + i + conf_index * 6], 10, &device->prior_confs[conf_index].ids[i]);
+                error = kstrtou64(argv[9 + i * 3 + conf_index * 6], 10, &id);
                 if (error < 0) {
                     printk(KERN_ERR "Error parsing server id");
                     return error;
                 }
-                error = kstrtou16(argv[11 + i + conf_index * 6], 10, &port);
+
+                // Check if we were already going to connect to this node, or this is ourself
+                should_not_connect_twice = false;
+                if (id == device->counterpart_id || id == device->id) {
+                    should_not_connect_twice = true;
+                    goto earlier_confs_checked;
+                }
+                for (earlier_conf_index = 0; earlier_conf_index <= conf_index; earlier_conf_index++) {
+                    for (j = 0; j < 2; j++) {
+                        if (device->prior_confs[earlier_conf_index].ids[j] == id) {
+                            should_not_connect_twice = true;
+                            goto earlier_confs_checked;
+                        }
+                    }
+                }
+
+            earlier_confs_checked:
+                device->prior_confs[conf_index].ids[i] = id;
+                if (should_not_connect_twice) {
+                    printk(KERN_INFO "Not connecting to server %llu in conf %d because we already did", id, conf_index);
+                    continue;
+                }
+
+                // Otherwise, connect
+                error = kstrtou16(argv[11 + i * 3 + conf_index * 6], 10, &port);
                 if (error < 0) {
                     printk(KERN_ERR "Error parsing port");
                     return error;
                 }
-                printk(KERN_INFO "Starting thread to connect to server %llu at %s:%u in conf %d", device->prior_confs[conf_index].ids[i], argv[10 + i + conf_index * 6], port, conf_index);
-                start_client_to_server(device, device->prior_confs[conf_index].ids[i], argv[10 + i + conf_index * 6], port);
+                printk(KERN_INFO "Starting thread to connect to server %llu at %s:%u in conf %d", device->prior_confs[conf_index].ids[i], argv[10 + i * 3 + conf_index * 6], port, conf_index);
+                start_client_to_server(device, device->prior_confs[conf_index].ids[i], argv[10 + i * 3 + conf_index * 6], port, true);
             }
         }
+        up_read(&device->counterpart_sem);
+        mutex_unlock(&device->prior_confs_lock);
     }
-
-    // Set up AEAD
-    device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
-    if (IS_ERR(device->tfm)) {
-        printk(KERN_ERR "Error allocating AEAD");
-        return PTR_ERR(device->tfm);
+    // If we're the backup or a node in a new config, need to reach out to our counterpart
+    if (!device->is_leader || argc > 9) {
+        error = kstrtou16(argv[8], 10, &counterpart_port);
+        if (error < 0) {
+            printk(KERN_ERR "Error parsing counterpart port");
+            return error;
+        }
+        printk(KERN_INFO "Starting thread to connect to counterpart %llu at %s:%u", device->counterpart_id, argv[7], counterpart_port);
+        start_client_to_server(device, device->counterpart_id, argv[7], counterpart_port, argc > 9);
     }
-    crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
-
-    error = crypto_aead_setkey(device->tfm, argv[4], KEY_SIZE);
-    if (error < 0) {
-        printk(KERN_ERR "Error setting key");
-        return error;
-    }
-
-    checksum_and_iv_size = (unsigned long)(ti->len / ROLLBACCINE_SECTORS_PER_ENCRYPTION) * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
-    printk(KERN_INFO "Checksums and IVs size: %lu", checksum_and_iv_size);
-    device->checksums = vzalloc(checksum_and_iv_size);
-    if (device->checksums == NULL) {
-        printk(KERN_ERR "Error allocating checksums");
-        return -ENOMEM;
-    }
-    projected_bytes_used += checksum_and_iv_size;
 
 #ifdef MEMORY_TRACKING
     atomic_set(&device->num_bio_data_not_freed, 0);
@@ -2327,6 +3234,9 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     destroy_workqueue(device->leader_read_disk_end_io_queue);
     destroy_workqueue(device->replica_disk_end_io_queue);
     destroy_workqueue(device->replica_insert_bio_queue);
+    destroy_workqueue(device->verify_disk_end_io_queue);
+    destroy_workqueue(device->fetch_disk_end_io_queue);
+    destroy_workqueue(device->reconfig_write_disk_end_io_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
