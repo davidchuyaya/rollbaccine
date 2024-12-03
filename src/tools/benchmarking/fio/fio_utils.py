@@ -37,6 +37,7 @@ class FioBenchmark(Benchmark):
             fio_command += '--group_reporting '
         if parameters.get('fsync', 0) == 1:
             fio_command += '--fsync=1 '
+        fio_command += '--end_fsync=1 '
 
         # Include additional FIO options if provided
         additional_fio_options = parameters.get('additional_fio_options')

@@ -1879,6 +1879,8 @@ int submit_pending_bio_ring_prefix(void *args) {
 
         // Store local version of head. Ok since this is the only thread modifying it
         curr_head = atomic_read(&device->pending_bio_ring_head) % ROLLBACCINE_PENDING_BIO_RING_SIZE;
+        bios_between_plug = 0;
+        blk_start_plug(&plug);
         // Pop as much of the bio prefix off the pending bio ring as possible
         while ((curr_bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[curr_head], 0)) != NULL) {
             mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
@@ -1903,7 +1905,19 @@ int submit_pending_bio_ring_prefix(void *args) {
                 if (curr_bio_data->checksum_and_iv != NULL) {
                     update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
                 }
-                bio_list_add(&submit_queue, curr_bio_data->bio_src);
+
+                // If the bio is empty, don't submit, just free it
+                if (bio_sectors(curr_bio_data->bio_src) == 0)
+                    free_pages_end_io(curr_bio_data->bio_src);
+                else {
+                    submit_bio_noacct(curr_bio_data->bio_src);
+                    bios_between_plug++;
+                    if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+                        blk_finish_plug(&plug);
+                        blk_start_plug(&plug);
+                        bios_between_plug = 0;
+                    }
+                }
             }
 
             // Record if we should ack the fsync
@@ -1913,30 +1927,12 @@ int submit_pending_bio_ring_prefix(void *args) {
             curr_head = atomic_inc_return(&device->pending_bio_ring_head) % ROLLBACCINE_PENDING_BIO_RING_SIZE;
             print_and_update_latency("submit_pending_bio_ring_prefix: submitted one bio", &time);
         }
+        blk_finish_plug(&plug);
 
         // Ack the latest fsync
         if (should_ack_fsync) {
             up(&device->replica_ack_fsync_sema);
         }
-
-        // Submit all bios
-        bios_between_plug = 0;
-        blk_start_plug(&plug);
-        while (!bio_list_empty(&submit_queue)) {
-            bio_to_submit = bio_list_pop(&submit_queue);
-            // If the bio is empty, don't submit, just free it
-            if (bio_sectors(bio_to_submit) == 0)
-                free_pages_end_io(bio_to_submit);
-            else
-                submit_bio_noacct(bio_to_submit);
-            bios_between_plug++;
-            if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
-                blk_finish_plug(&plug);
-                blk_start_plug(&plug);
-                bios_between_plug = 0;
-            }
-        }
-        blk_finish_plug(&plug);
 
         print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
     }
