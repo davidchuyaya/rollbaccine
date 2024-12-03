@@ -6,118 +6,139 @@ import numpy as np
 def read_fio_json_results(results_dir):
     """
     Reads all FIO JSON result files in the specified directory.
-    Returns a list of tuples containing the job name, category (normal_disk or rollbaccine), and the FIO result data.
+    Returns a list of tuples containing the job name, category, thread count, and the FIO result data.
     """
     results = []
     for filename in os.listdir(results_dir):
         if filename.endswith('.json'):
             filepath = os.path.join(results_dir, filename)
-            # Determine the category based on filename
-            if filename.startswith('normal_disk_'):
-                category = 'normal_disk'
-                base_job_name = filename[len('normal_disk_'):-len('_fio_results.json')]
-            else:
-                category = 'rollbaccine'
-                base_job_name = filename[:-len('_fio_results.json')]
+            # Example filename: DM_rand_read_direct0_fsync0_threads_16_8ef3_fio_results.json
+            filename_without_extension = filename[:-len('_fio_results.json')]
+            filename_parts = filename_without_extension.split('_')
+            # Extract the category (e.g., 'DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE')
+            category = filename_parts[0]
+            if category not in ['DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE']:
+                print(f"Unknown category '{category}' in filename '{filename}'. Skipping.")
+                continue
+            try:
+                threads_index = filename_parts.index('threads')
+                base_job_name_parts = filename_parts[1:threads_index]
+                base_job_name = '_'.join(base_job_name_parts)
+                thread_count = int(filename_parts[threads_index + 1])
+            except ValueError:
+                print(f"Error parsing filename {filename}")
+                continue
+
             with open(filepath, 'r') as f:
                 data = json.load(f)
                 for job in data['jobs']:
                     job_name = job['jobname']
-                    results.append((base_job_name, category, job))
+                    results.append((base_job_name, category, thread_count, job))
     return results
 
 def extract_performance_data(results):
-    """
-    Extracts performance metrics from FIO results.
-    Returns a nested dictionary with base job names as keys and performance metrics as values for both categories.
-    """
     performance_data = {}
-    for base_job_name, category, job_data in results:
-        read_iops = job_data['read']['iops']
-        read_bw = job_data['read']['bw']  # Bandwidth in KB/s
-        read_lat = job_data['read']['lat_ns']['mean'] / 1000  # Convert to microseconds
-        read_throughput = job_data['read']['bw_bytes'] / (1024 * 1024)  # Convert to MB/s
-        write_iops = job_data['write']['iops']
-        write_bw = job_data['write']['bw']  # Bandwidth in KB/s
-        write_lat = job_data['write']['lat_ns']['mean'] / 1000  # Convert to microseconds
-        write_throughput = job_data['write']['bw_bytes'] / (1024 * 1024)  # Convert to MB/s
+    for base_job_name, category, thread_count, job_data in results:
+        rw_option = job_data['job options'].get('rw', '')
+        is_read = 'read' in rw_option
+        is_write = 'write' in rw_option
+
+        if is_read:
+            # Throughput: use 'iops' from 'read'
+            read_iops = job_data['read']['iops']
+            # Latency: extract from 'read' -> 'clat_ns'
+            latency_percentiles = job_data['read'].get('clat_ns', {}).get('percentile', {})
+            median_latency_ns = latency_percentiles.get('50.000000')
+            if median_latency_ns is None:
+                median_latency_ns = job_data['read'].get('clat_ns', {}).get('mean', 0)
+            # Convert latency from nanoseconds to milliseconds
+            median_latency_ms = median_latency_ns / 1e6  # ns to ms
+            throughput_k = read_iops / 1000  # Convert to thousands
+
+        elif is_write:
+            # Throughput: use 'iops' from 'write'
+            write_iops = job_data['write']['iops']
+            # Check if 'fsync' is enabled in job options
+            fsync_enabled = job_data['job options'].get('fsync', '0') == '1'
+
+            # Latency: extract from 'sync' if 'fsync' is enabled, else from 'write'
+            if fsync_enabled and 'sync' in job_data and 'lat_ns' in job_data['sync']:
+                latency_percentiles = job_data['sync']['lat_ns'].get('percentile', {})
+                median_latency_ns = latency_percentiles.get('50.000000')
+                if median_latency_ns is None:
+                    median_latency_ns = job_data['sync']['lat_ns'].get('mean', 0)
+            else:
+                latency_percentiles = job_data['write'].get('clat_ns', {}).get('percentile', {})
+                median_latency_ns = latency_percentiles.get('50.000000')
+                if median_latency_ns is None:
+                    median_latency_ns = job_data['write'].get('clat_ns', {}).get('mean', 0)
+            # Convert latency from nanoseconds to milliseconds
+            median_latency_ms = median_latency_ns / 1e6  # ns to ms
+            throughput_k = write_iops / 1000  # Convert to thousands
+        else:
+            print(f"Unknown rw option '{rw_option}' in job '{job_data['jobname']}'. Skipping.")
+            continue
 
         if base_job_name not in performance_data:
             performance_data[base_job_name] = {}
-
-        performance_data[base_job_name][category] = {
-            'read_iops': read_iops,
-            'read_bw': read_bw,
-            'read_lat_us': read_lat,
-            'read_throughput_mbs': read_throughput,
-            'write_iops': write_iops,
-            'write_bw': write_bw,
-            'write_lat_us': write_lat,
-            'write_throughput_mbs': write_throughput
+        if category not in performance_data[base_job_name]:
+            performance_data[base_job_name][category] = {}
+        performance_data[base_job_name][category][thread_count] = {
+            'throughput_k': throughput_k,
+            'median_lat_ms': median_latency_ms
         }
     return performance_data
 
-def plot_grouped_bar_graph(performance_data, metric, title, ylabel, output_file):
-    """
-    Plots a grouped bar chart for the specified performance metric.
-    """
-    categories = ['normal_disk', 'rollbaccine']
-    job_names = list(performance_data.keys())
-    num_jobs = len(job_names)
-    num_categories = len(categories)
+def plot_latency_vs_throughput_per_job(performance_data, output_dir):
+    markers = {
+        'DM': 'o',
+        'UNREPLICATED': '^',
+        'REPLICATED': 's',
+        'ROLLBACCINE': 'd'
+    }
+    colors = {
+        'DM': 'blue',
+        'UNREPLICATED': 'red',
+        'REPLICATED': 'green',
+        'ROLLBACCINE': 'orange'
+    }
 
-    # Prepare data
-    data = {category: [] for category in categories}
-    for job_name in job_names:
-        for category in categories:
-            if category in performance_data[job_name]:
-                data[category].append(performance_data[job_name][category].get(metric, 0))
-            else:
-                data[category].append(0)
-
-    x = np.arange(num_jobs)  # the label locations
-    width = 0.35  # the width of the bars
-
-    plt.figure(figsize=(12, 6))
-    fig, ax = plt.subplots()
-    rects_list = []
-
-    # Plot bars for each category
-    for idx, category in enumerate(categories):
-        offset = (idx - (num_categories - 1) / 2) * width
-        rects = ax.bar(x + offset, data[category], width, label=category)
-        rects_list.append(rects)
-
-    # Add labels, title, and custom x-axis tick labels, etc.
-    ax.set_xlabel('FIO Jobs')
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.set_xticks(x)
-    ax.set_xticklabels(job_names, rotation=45, ha='right')
-    ax.legend()
-
-    # Attach a text label above each bar in rects, displaying its height
-    def autolabel(rects):
-        for rect in rects:
-            height = rect.get_height()
-            if height != 0:
-                ax.annotate('{}'.format(int(height)),
-                            xy=(rect.get_x() + rect.get_width() / 2, height),
-                            xytext=(0, 3),  # 3 points vertical offset
-                            textcoords="offset points",
-                            ha='center', va='bottom')
-
-    for rects in rects_list:
-        autolabel(rects)
-
-    plt.tight_layout()
-    plt.savefig(output_file)
-    plt.close()
-    print(f"Saved grouped bar graph to {output_file}")
+    for base_job_name in performance_data:
+        plt.figure(figsize=(10, 6))
+        ax = plt.gca()
+        for category in performance_data[base_job_name]:
+            throughputs = []
+            latencies = []
+            thread_counts = []
+            for thread_count in sorted(performance_data[base_job_name][category].keys()):
+                metrics = performance_data[base_job_name][category][thread_count]
+                throughput = metrics['throughput_k']
+                latency = metrics['median_lat_ms']
+                throughputs.append(throughput)
+                latencies.append(latency)
+                thread_counts.append(thread_count)
+            label = f"{category}"
+            ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), color=colors.get(category, 'black'), linestyle='-', label=label)
+            # Annotate each data point with the number of threads
+            for i in range(len(throughputs)):
+                ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,10), ha='center')
+        ax.set_xlabel('Throughput (thousands of commands per second)')
+        ax.set_ylabel('Median Latency (ms)')
+        ax.set_title(f'{base_job_name} - Median Latency vs Throughput')
+        ax.legend()
+        ax.grid(True)
+        # log for y axis
+        ax.set_yscale('log')
+        plt.tight_layout()
+        # Save the figure
+        output_file = os.path.join(output_dir, f'{base_job_name}_latency_vs_throughput.png')
+        plt.savefig(output_file)
+        plt.close()
+        print(f"Saved latency vs throughput graph to {output_file}")
 
 def main():
     # Directory where the FIO JSON results are stored
-    results_dir = './results'  # Adjust this path if needed
+    results_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'results', 'fio')
 
     # Read the FIO JSON results
     results = read_fio_json_results(results_dir)
@@ -133,79 +154,13 @@ def main():
         print(f"{job_name}: {data}")
 
     # Create an output directory for graphs
-    output_dir = './graphs'
+    output_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'results', 'graphs')
     os.makedirs(output_dir, exist_ok=True)
 
-    # Plot Read IOPS
-    plot_grouped_bar_graph(
+    # Plot Latency vs Throughput per job
+    plot_latency_vs_throughput_per_job(
         performance_data,
-        metric='read_iops',
-        title='Read IOPS per FIO Job',
-        ylabel='IOPS',
-        output_file=os.path.join(output_dir, 'read_iops_grouped_bar_graph.png')
-    )
-
-    # Plot Write IOPS
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_iops',
-        title='Write IOPS per FIO Job',
-        ylabel='IOPS',
-        output_file=os.path.join(output_dir, 'write_iops_grouped_bar_graph.png')
-    )
-
-    # Plot Read Bandwidth
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='read_bw',
-        title='Read Bandwidth per FIO Job',
-        ylabel='Bandwidth (KB/s)',
-        output_file=os.path.join(output_dir, 'read_bandwidth_grouped_bar_graph.png')
-    )
-
-    # Plot Write Bandwidth
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_bw',
-        title='Write Bandwidth per FIO Job',
-        ylabel='Bandwidth (KB/s)',
-        output_file=os.path.join(output_dir, 'write_bandwidth_grouped_bar_graph.png')
-    )
-
-    # Plot Read Latency
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='read_lat_us',
-        title='Read Latency per FIO Job',
-        ylabel='Latency (μs)',
-        output_file=os.path.join(output_dir, 'read_latency_grouped_bar_graph.png')
-    )
-
-    # Plot Write Latency
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_lat_us',
-        title='Write Latency per FIO Job',
-        ylabel='Latency (μs)',
-        output_file=os.path.join(output_dir, 'write_latency_grouped_bar_graph.png')
-    )
-
-    # Plot Read Throughput
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='read_throughput_mbs',
-        title='Read Throughput per FIO Job',
-        ylabel='Throughput (MB/s)',
-        output_file=os.path.join(output_dir, 'read_throughput_grouped_bar_graph.png')
-    )
-
-    # Plot Write Throughput
-    plot_grouped_bar_graph(
-        performance_data,
-        metric='write_throughput_mbs',
-        title='Write Throughput per FIO Job',
-        ylabel='Throughput (MB/s)',
-        output_file=os.path.join(output_dir, 'write_throughput_grouped_bar_graph.png')
+        output_dir=output_dir
     )
 
 if __name__ == "__main__":
