@@ -17,13 +17,15 @@ def read_fio_json_results(results_dir):
             filename_parts = filename_without_extension.split('_')
             # Extract the category (e.g., 'DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE')
             category = filename_parts[0]
+            if category not in ['DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE']:
+                print(f"Unknown category '{category}' in filename '{filename}'. Skipping.")
+                continue
             try:
                 threads_index = filename_parts.index('threads')
                 base_job_name_parts = filename_parts[1:threads_index]
                 base_job_name = '_'.join(base_job_name_parts)
                 thread_count = int(filename_parts[threads_index + 1])
             except ValueError:
-                # Handle error if 'threads' is not in filename_parts
                 print(f"Error parsing filename {filename}")
                 continue
 
@@ -87,7 +89,20 @@ def extract_performance_data(results):
         }
     return performance_data
 
-def plot_latency_vs_throughput_per_job(performance_data, output_dir, markers, colors):
+def plot_latency_vs_throughput_per_job(performance_data, output_dir):
+    markers = {
+        'DM': 'o',
+        'UNREPLICATED': '^',
+        'REPLICATED': 's',
+        'ROLLBACCINE': 'd'
+    }
+    colors = {
+        'DM': 'blue',
+        'UNREPLICATED': 'red',
+        'REPLICATED': 'green',
+        'ROLLBACCINE': 'orange'
+    }
+
     for base_job_name in performance_data:
         plt.figure(figsize=(10, 6))
         ax = plt.gca()
@@ -112,6 +127,8 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir, markers, co
         ax.set_title(f'{base_job_name} - Median Latency vs Throughput')
         ax.legend()
         ax.grid(True)
+        # log for y axis
+        ax.set_yscale('log')
         plt.tight_layout()
         # Save the figure
         output_file = os.path.join(output_dir, f'{base_job_name}_latency_vs_throughput.png')
@@ -136,30 +153,6 @@ def main():
     for job_name, data in performance_data.items():
         print(f"{job_name}: {data}")
 
-    # Collect categories
-    categories = set()
-    for base_job_name in performance_data:
-        categories.update(performance_data[base_job_name].keys())
-
-    categories = sorted(categories)
-    markers_list = ['o', '^', 's', 'd', '*', '+', 'x', 'v', '<', '>', 'p', 'h']
-    colors_list = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta', 'yellow']
-
-    # Ensure we have enough markers and colors
-    if len(categories) > len(markers_list):
-        print("Not enough markers to assign to categories.")
-        return
-
-    if len(categories) > len(colors_list):
-        print("Not enough colors to assign to categories.")
-        return
-
-    markers = {}
-    colors = {}
-    for idx, category in enumerate(categories):
-        markers[category] = markers_list[idx % len(markers_list)]
-        colors[category] = colors_list[idx % len(colors_list)]
-
     # Create an output directory for graphs
     output_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'results', 'graphs')
     os.makedirs(output_dir, exist_ok=True)
@@ -167,9 +160,7 @@ def main():
     # Plot Latency vs Throughput per job
     plot_latency_vs_throughput_per_job(
         performance_data,
-        output_dir=output_dir,
-        markers=markers,
-        colors=colors
+        output_dir=output_dir
     )
 
 if __name__ == "__main__":
