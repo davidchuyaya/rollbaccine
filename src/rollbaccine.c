@@ -1858,7 +1858,6 @@ int submit_pending_bio_ring_prefix(void *args) {
     struct rollbaccine_device *device = args;
     struct bio_data *curr_bio_data;
     struct bio_list submit_queue;
-    struct bio *bio_to_submit;
     struct blk_plug plug; // Used to merge bios
     bool no_conflict, should_ack_fsync;
     int signal, curr_head, bios_between_plug;
