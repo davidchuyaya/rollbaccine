@@ -66,6 +66,7 @@ def get_leader_commands(backup_private_ip):
     """
     commands = [
         "sudo umount /dev/sdb1",
+        "echo 'mq-deadline' | sudo tee -a /sys/block/sdb/queue/scheduler",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
         f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 1 true abcdefghijklmnop 12340 2 {backup_private_ip} 12350" | sudo dmsetup create rollbaccine1'
@@ -78,6 +79,7 @@ def get_backup_commands(primary_private_ip):
     """
     commands = [
         "sudo umount /dev/sdb1",
+        "echo 'mq-deadline' | sudo tee -a /sys/block/sdb/queue/scheduler",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
         f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 12350 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
