@@ -36,9 +36,10 @@
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
 #define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
-#define ROLLBACCINE_PENDING_BIO_RING_SIZE 1000000 // Max "hole" between writes
+#define ROLLBACCINE_PENDING_BIO_RING_SIZE 10000000 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
+#define ROLLBACCINE_PLUG_NUM_BIOS 256 / 4  // Number of bios to allow between to calls to blk_plug for merging. 256K is the largest write we can send to disk, 4K is the size of individual writes
 #define ROLLBACCINE_HASHES_PER_MSG 100
 #define MODULE_NAME "rollbaccine"
 
@@ -520,7 +521,7 @@ void disconnect(struct rollbaccine_device *device, struct multisocket *multisock
 }
 
 void alert_client_of_liveness_problem(struct rollbaccine_device *device, uint64_t id) {
-    printk(KERN_ERR "Liveness problem detected for id %llu, alerting client", id);
+    printk_ratelimited(KERN_ERR "Liveness problem detected for id %llu, alerting client", id);
     // TODO: Telling client about liveness problem
 }
 
@@ -1360,11 +1361,9 @@ void broadcast_bio(struct work_struct *work) {
 #endif
     }
 
-    down_read(&device->connected_sockets_sem);
-    down_read(&device->counterpart_sem);
     multisocket = device->counterpart;
     if (multisocket == NULL) {
-        printk(KERN_ERR "Attempted to send to counterpart before we were connected");
+        printk_ratelimited(KERN_ERR "Attempted to send to counterpart before we were connected");
         goto finish_sending_to_socket;
     }
     socket_id = lock_on_next_free_socket(device, multisocket);
@@ -1424,11 +1423,9 @@ finish_sending_to_socket:
     mutex_unlock(&socket_data->socket_mutex);
     
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
-    up_read(&device->counterpart_sem);
-    up_read(&device->connected_sockets_sem);
 
     if (should_disconnect) {
-        printk(KERN_ERR "Disconnecting from misbehaving replica");
+        printk_ratelimited(KERN_ERR "Disconnecting from misbehaving replica");
         alert_client_of_liveness_problem(device, multisocket->sender_id);
         disconnect(device, multisocket);
     }
@@ -1862,8 +1859,9 @@ int submit_pending_bio_ring_prefix(void *args) {
     struct bio_data *curr_bio_data;
     struct bio_list submit_queue;
     struct bio *bio_to_submit;
+    struct blk_plug plug; // Used to merge bios
     bool no_conflict, should_ack_fsync;
-    int signal, curr_head;
+    int signal, curr_head, bios_between_plug;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
@@ -1922,6 +1920,8 @@ int submit_pending_bio_ring_prefix(void *args) {
         }
 
         // Submit all bios
+        bios_between_plug = 0;
+        blk_start_plug(&plug);
         while (!bio_list_empty(&submit_queue)) {
             bio_to_submit = bio_list_pop(&submit_queue);
             // If the bio is empty, don't submit, just free it
@@ -1929,7 +1929,14 @@ int submit_pending_bio_ring_prefix(void *args) {
                 free_pages_end_io(bio_to_submit);
             else
                 submit_bio_noacct(bio_to_submit);
+            bios_between_plug++;
+            if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+                blk_finish_plug(&plug);
+                blk_start_plug(&plug);
+                bios_between_plug = 0;
+            }
         }
+        blk_finish_plug(&plug);
 
         print_and_update_latency("submit_pending_bio_ring_prefix", &total_time);
     }
@@ -2199,6 +2206,8 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
     sector_t i, sector;
     struct bio_data *bio_data;
     struct bio *bio;
+    struct blk_plug plug;
+    int bios_between_plug = 0;
 
     hash_msg = kmalloc(sizeof(struct hash_msg), GFP_KERNEL);
 
@@ -2247,6 +2256,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
     // 2. Scan the disk to verify the hashes
     atomic_set(&device->num_verified_sectors, 0);
     sector = 0;
+    blk_start_plug(&plug);
     while (sector < device->num_sectors) {
         bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
         bio->bi_iter.bi_sector = sector;
@@ -2265,7 +2275,15 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
 
         sector += SECTORS_PER_PAGE;
         submit_bio_noacct(bio);
+
+        bios_between_plug++;
+        if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+            blk_finish_plug(&plug);
+            blk_start_plug(&plug);
+            bios_between_plug = 0;
+        }
     }
+    blk_finish_plug(&plug);
     printk(KERN_INFO "Finished submitting scans to disk");
     return true;
 }

@@ -50,7 +50,7 @@ class FioBenchmark(Benchmark):
         filename = mount_point(system_type)
 
         # Possible values for each parameter
-        io_directions = ['read', 'write']
+        io_directions = ['write', 'read']
         sequentialities = ['seq', 'rand']
         bufferings = [1, 0]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
         persistences = [1, 0]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
