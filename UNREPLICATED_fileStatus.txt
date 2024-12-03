@@ -1,0 +1,18 @@
+2024-11-29 00:04:42,895 INFO namenode.NNThroughputBenchmark: Starting benchmark: fileStatus
+2024-11-29 00:04:42,937 INFO namenode.NNThroughputBenchmark: Generate 500000 intputs for create
+2024-11-29 00:04:43,140 INFO namenode.NNThroughputBenchmark: Log level = ERROR
+2024-11-29 00:04:43,177 INFO namenode.NNThroughputBenchmark: Starting 500000 create(s).
+2024-11-29 00:05:40,108 INFO namenode.NNThroughputBenchmark: Created 500000 files.
+2024-11-29 00:05:40,112 INFO namenode.NNThroughputBenchmark: Generate 500000 intputs for fileStatus
+2024-11-29 00:05:40,466 INFO namenode.NNThroughputBenchmark: Log level = ERROR
+2024-11-29 00:05:40,466 INFO namenode.NNThroughputBenchmark: Starting 500000 fileStatus(s).
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: 
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: --- fileStatus inputs ---
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: nrFiles = 500000
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: nrThreads = 16
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: nrFilesPerDir = 4
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: --- fileStatus stats  ---
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: # operations: 500000
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: Elapsed Time: 26139
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark:  Ops per sec: 19128.505298595966
+2024-11-29 00:06:06,716 INFO namenode.NNThroughputBenchmark: Average Time: 0

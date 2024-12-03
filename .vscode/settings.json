@@ -11,10 +11,7 @@
     },
     "files.associations": {
         "*.h": "c"
-    },
-    "editor.detectIndentation": false,
-    "C_Cpp.errorSquiggles": "disabled",
-    "C_Cpp.clang_format_fallbackStyle": "{ BasedOnStyle: Google, IndentWidth: 4, ColumnLimit: 200 }",
-    "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, IndentWidth: 4, ColumnLimit: 200 }",
-    "vim.startInInsertMode": true,
+    }
+
+
 }
