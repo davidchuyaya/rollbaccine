@@ -172,7 +172,7 @@ struct rollbaccine_device {
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
     struct mutex replica_fsync_lock;
     int max_replica_fsync_index;
-    struct bio_list fsyncs_pending_replication;  // List of all fsyncs waiting for replication. Ordered by write index.
+    struct list_head fsyncs_pending_replication;  // List of all fsyncs waiting for replication. Ordered by write index.
 
     // Logic for writes that block on conflicting writes
     struct rb_root outstanding_ops;  // Tree of all outstanding operations, sorted by the sectors they write to
@@ -265,6 +265,13 @@ struct bio_data {
     struct list_head pending_list;      // So this bio can be inserted into pending_ops
     unsigned char *checksum_and_iv;     // Checksums and IVs for each sector or page, if this is a write
     struct multisocket *requester;      // The node that requested this block of disk from this node (for reconfiguration)
+};
+
+// For keeping track of pending fsyncs
+struct bio_fsync_list {
+    struct bio *bio_src;
+    int write_index;
+    struct list_head list;
 };
 
 // Thread params: Parameters passed into threads. Should be freed by the thread when it exits.
@@ -723,8 +730,7 @@ void ack_bio_to_user_without_executing(struct bio *bio) {
 // Assumes that the bio->bi_private field stores the write index
 void process_follower_fsync_index(struct rollbaccine_device *device, int follower_fsync_index) {
     bool max_index_changed = false;
-    struct bio *bio;
-    int bio_write_index;
+    struct bio_fsync_list *bio_fsync_data;
 
     mutex_lock(&device->replica_fsync_lock);
     // Special case for f = 1, n <= 3.
@@ -741,27 +747,27 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
     if (max_index_changed) {
         // printk(KERN_INFO "New max quorum write index: %d", device->max_replica_fsync_index);
 #ifdef MEMORY_TRACKING
-    device->max_outstanding_fsyncs_pending_replication = umax(device->max_outstanding_fsyncs_pending_replication, device->num_fsyncs_pending_replication);
+        device->max_outstanding_fsyncs_pending_replication = umax(device->max_outstanding_fsyncs_pending_replication, device->num_fsyncs_pending_replication);
 #endif
-    while (!bio_list_empty(&device->fsyncs_pending_replication)) {
-        bio = bio_list_peek(&device->fsyncs_pending_replication);
-        bio_write_index = bio->bi_private;
-        if (bio_write_index <= device->max_replica_fsync_index) {
-            // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
-            // Remove from queue
-            bio_list_pop(&device->fsyncs_pending_replication);
-            // Ack the fsync to the user
-            ack_bio_to_user_without_executing(bio);
-#ifdef MEMORY_TRACKING
-            device->num_fsyncs_pending_replication -= 1;
-#endif
-        } else {
-            break;
+        while (!list_empty(&device->fsyncs_pending_replication)) {
+            bio_fsync_data = list_first_entry(&device->fsyncs_pending_replication, struct bio_fsync_list, list);
+            if (bio_fsync_data->write_index <= device->max_replica_fsync_index) {
+                // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
+                // Remove from queue
+                list_del(&bio_fsync_data->list);
+                // Ack the fsync to the user
+                ack_bio_to_user_without_executing(bio_fsync_data->bio_src);
+                kfree(bio_fsync_data);
+    #ifdef MEMORY_TRACKING
+                device->num_fsyncs_pending_replication -= 1;
+    #endif
+            } else {
+                break;
+            }
         }
     }
-    }
     mutex_unlock(&device->replica_fsync_lock);
-    }
+}
 
 bool requires_fsync(struct bio *bio) { return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA); }
 
@@ -822,7 +828,7 @@ void try_free_clones(struct bio *clone) {
 }
 
 void begin_critical_path(struct rollbaccine_device *device) {
-    struct bio *bio;
+    struct bio_fsync_list *bio_fsync_data;
 
     printk(KERN_INFO "Beginning critical path");
 
@@ -843,9 +849,11 @@ void begin_critical_path(struct rollbaccine_device *device) {
         // Flush all fsyncs if we are the leader, because we know the backup must have it
         mutex_lock(&device->replica_fsync_lock);
         device->max_replica_fsync_index = device->write_index;
-        while (!bio_list_empty(&device->fsyncs_pending_replication)) {
-            bio = bio_list_pop(&device->fsyncs_pending_replication);
-            ack_bio_to_user_without_executing(bio);
+        while (!list_empty(&device->fsyncs_pending_replication)) {
+            bio_fsync_data = list_first_entry(&device->fsyncs_pending_replication, struct bio_fsync_list, list);
+            list_del(&bio_fsync_data->list);
+            ack_bio_to_user_without_executing(bio_fsync_data->bio_src);
+            kfree(bio_fsync_data);
         }
 #ifdef MEMORY_TRACKING
         device->num_fsyncs_pending_replication = 0;
@@ -1501,6 +1509,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bool encrypt_error;
     struct rollbaccine_device *device = ti->private;
     struct bio_data *bio_data;
+    struct bio_fsync_list *bio_fsync_data;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
 
@@ -1538,6 +1547,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 bio_data->is_fsync = requires_fsync(bio);
                 bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
+                if (bio_data->is_fsync) {
+                    bio_fsync_data = kmalloc(sizeof(struct bio_fsync_list), GFP_KERNEL);
+                    bio_fsync_data->bio_src = bio;
+                }
 
                 // Create the network clone
                 bio_data->deep_clone = deep_bio_clone(device, bio);
@@ -1586,10 +1599,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
                 if (bio_data->is_fsync) {
                     // Add original bio to fsyncs blocked on replication
-                    bio->bi_private = bio_data->write_index;  // HACK: Store the write index in this fsync's bi_private field so it can be checked when network fsyncs are being acknowledged
                     mutex_lock(&device->replica_fsync_lock);
                     print_and_update_latency("leader_process_write: index lock -> obtained replica fsync lock", &time);
-                    bio_list_add(&device->fsyncs_pending_replication, bio);
+                    bio_fsync_data->write_index = bio_data->write_index;
+                    list_add_tail(&bio_fsync_data->list, &device->fsyncs_pending_replication);
 #ifdef MEMORY_TRACKING
                     device->num_fsyncs_pending_replication += 1;
 #endif
@@ -3012,7 +3025,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->replica_fsync_lock);
-    bio_list_init(&device->fsyncs_pending_replication);
+    INIT_LIST_HEAD(&device->fsyncs_pending_replication);
 
     device->outstanding_ops = RB_ROOT;
     INIT_LIST_HEAD(&device->pending_ops);
