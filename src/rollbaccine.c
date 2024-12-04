@@ -1546,7 +1546,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
 
                 bio_data->is_fsync = requires_fsync(bio);
-                bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
+                // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
                 if (bio_data->is_fsync) {
                     bio_fsync_data = kmalloc(sizeof(struct bio_fsync_list), GFP_KERNEL);
                     bio_fsync_data->bio_src = bio;
@@ -1577,10 +1577,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 bio_data->shallow_clone->bi_end_io = leader_write_disk_end_io;
 
                 // Set shared data between clones
-                if (is_empty) // We won't be submitting this bio if it's empty, so the shallow_clone is unnecessary (we could remove it, but it's makes the code messier)
-                    atomic_set(&bio_data->ref_counter, 1);
-                else
-                    atomic_set(&bio_data->ref_counter, 2);
+                atomic_set(&bio_data->ref_counter, 2);
                 bio_data->deep_clone->bi_private = bio_data;
                 bio_data->shallow_clone->bi_private = bio_data;
 
@@ -1611,7 +1608,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 mutex_unlock(&device->index_lock);
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
-                if (doesnt_conflict_with_other_writes && !is_empty) {
+                if (doesnt_conflict_with_other_writes) {
                     if (bio_data->checksum_and_iv != NULL) {
                         update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
                     }
