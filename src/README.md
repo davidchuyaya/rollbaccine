@@ -338,9 +338,10 @@ curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 az login
 ```
 
+TODO: Include instructions for setting up venv
 Install Python dependencies:
 ```bash
-pip install -r tools/benchmarking/requirements.txt
+pip install -r src/tools/benchmarking/requirements.txt
 ```
 If your keys in `~/.ssh/id_rsa` are password-protected, create password-less SSH keys (clicking Enter on all options):
 ```bash

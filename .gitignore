@@ -115,9 +115,7 @@ Thumbs.db
 *.log
 
 # Azure-related
-vm1.json
-vm2.json
-storage.json
-
-# results and graphs
-stdout.txt
+*vm1.json
+*vm2.json
+*storage.json
+*stdout.txt

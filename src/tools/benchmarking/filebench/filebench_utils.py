@@ -21,11 +21,11 @@ class FileBenchmark(Benchmark):
     def needs_storage(self) -> bool:
         return False
 
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
+    def install(self, ssh_executor: SSH, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         ssh = connections[self.benchmarking_vm()]
         if not is_installed(ssh, 'which filebench'):
             print("Installing Filebench, may take a few minutes")
-            success = ssh_execute(ssh, [
+            success = ssh_executor.exec(ssh, [
                 "wget -nv https://github.com/filebench/filebench/releases/download/1.5-alpha3/filebench-1.5-alpha3.tar.gz",
                 "tar -xf filebench-1.5-alpha3.tar.gz",
                 "cd filebench-1.5-alpha3",

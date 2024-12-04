@@ -21,10 +21,11 @@ def run():
     SYSTEM = System.UNREPLICATED
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system, because we just want a single VM.")
     subprocess_execute([f"./launch.sh -b fio -s {SYSTEM} -n 1"])
+    ssh_executor = SSH("ace")
 
     print("Connecting to VMs and setting up main VMs")
-    print(f"\033[92mPlease run `tail -f {OUTPUT_FILE}` to see the execution log on the servers.\033[0m")
-    clear_output_file()
+    print(f"\033[92mPlease run `tail -f {ssh_executor.output_file}` to see the execution log on the servers.\033[0m")
+    ssh_executor.clear_output_file()
     
     with open('vm1.json') as f:
         vm_json = json.load(f)
@@ -35,7 +36,7 @@ def run():
     install_rollbaccine(ssh)
 
     print("Setting up rollbaccine primary and backup each over a 10GB ramdisk (so it can run faster)")
-    success = ssh_execute(ssh, [
+    success = ssh_executor.exec(ssh, [
         "sudo modprobe brd rd_nr=2 rd_size=10485760",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
@@ -49,7 +50,7 @@ def run():
     sleep(10)
 
     print("Mounting /dev/sdb1 at /mnt/test. It won't be used in the test but xfstests will check")
-    success = ssh_execute(ssh, [
+    success = ssh_executor.exec(ssh, [
         "sudo umount /dev/sdb1",
         "sudo mkfs.ext4 -F /dev/sdb1",
         "sudo mkdir -p /mnt/test",
@@ -59,12 +60,12 @@ def run():
         return False
 
     print(f"Creating a mount point for the primary at {MOUNT_DIR} and backup at {BACKUP_MOUNT_DIR}")
-    success = ssh_execute(ssh, [f"sudo mkdir -p {MOUNT_DIR} {BACKUP_MOUNT_DIR}"])
+    success = ssh_executor.exec(ssh, [f"sudo mkdir -p {MOUNT_DIR} {BACKUP_MOUNT_DIR}"])
     if not success:
         return False
 
     print("Installing xfstests, will take a few minutes")
-    success = ssh_execute(ssh, [
+    success = ssh_executor.exec(ssh, [
         "sudo apt-get -qq install acl attr automake bc dbench dump e2fsprogs fio gawk \
         gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
         libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
@@ -79,7 +80,7 @@ def run():
         return False
     
     print("Setting up xfstests")
-    success = ssh_execute(ssh, [
+    success = ssh_executor.exec(ssh, [
         "cd xfstests-dev/tests",
         "wget -nv https://github.com/davidchuyaya/crashmonkey/releases/download/rollbaccine/seq1_nested.tar.gz",
         "tar -xzf seq1_nested.tar.gz",
@@ -91,7 +92,7 @@ def run():
 
     print("Running xfstests, will take around 4 minutes")
     OUTPUT_DIR = f"/home/{getuser()}/results"
-    success = ssh_execute(ssh, [
+    success = ssh_executor.exec(ssh, [
         f"mkdir -p {OUTPUT_DIR}",
         "cd xfstests-dev",
         f"sudo ./check -g seq1_nested/auto 2>&1 | tee {OUTPUT_DIR}/xfstests.txt"

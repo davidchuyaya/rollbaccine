@@ -26,8 +26,8 @@ class NimbleHDFSBenchmark(Benchmark):
     def needs_storage(self) -> bool:
         return True
     
-    def install_nimble_on_vm(self, ssh: SSHClient):
-        success = ssh_execute(ssh, [
+    def install_nimble_on_vm(self, ssh_executor: SSH, ssh: SSHClient):
+        success = ssh_executor.exec(ssh, [
             "git clone https://github.com/Microsoft/Nimble",
             "sudo apt-get -qq update",
             "sudo apt-get -y -qq install make gcc libssl-dev pkg-config perl protobuf-compiler",
@@ -39,7 +39,7 @@ class NimbleHDFSBenchmark(Benchmark):
         if not success:
             return False
 
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
+    def install(self, ssh_executor: SSH, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         name_node_ip = private_ips[self.benchmarking_vm()]
         name_node_ssh = connections[self.benchmarking_vm()]
         coordinator_ip = private_ips[1]
@@ -50,7 +50,7 @@ class NimbleHDFSBenchmark(Benchmark):
         print(f"Checking if namenode has HDFS")
         if not is_installed(name_node_ssh, 'which hdfs'):
             print("Installing HDFS on the namenode")
-            success = ssh_execute(ssh, [
+            success = ssh_executor.exec(ssh, [
                 "wget -nv https://github.com/IceCoooola/hadoop-nimble/releases/download/3.3.3/hadoop-3.3.3.tar.gz",
                 "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get -qq update",
@@ -67,9 +67,9 @@ class NimbleHDFSBenchmark(Benchmark):
 
             # Replace {namenodeip} in core-site with the actual namenode IP
             print("Replacing {namenodeip} in core-site.xml")
-            ssh_execute(name_node_ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+            ssh_executor.exec(name_node_ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
             print("Replacing {nimbleip} in core-site.xml")
-            ssh_execute(name_node_ssh, [f"sed -i 's/{{nimbleip}}/{coordinator_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+            ssh_executor.exec(name_node_ssh, [f"sed -i 's/{{nimbleip}}/{coordinator_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
             print(f"Finished installing HDFS")
 
         print("Installing Nimble on the coordinator and endorsers (in parallel)")

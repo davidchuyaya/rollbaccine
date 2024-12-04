@@ -3,8 +3,6 @@ from typing import List
 from benchmark import *
 import subprocess
 
-OUTPUT_FILE = "stdout.txt"
-COLOR_UNIMPORTANT = '\033[90m'
 COLOR_ERROR = '\033[91m'
 COLOR_END = '\033[0m'
 
@@ -19,36 +17,40 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     path = stdout.read().decode().strip()
     return path != ''
 
-def clear_output_file():
-    open(OUTPUT_FILE, 'w').close()
+class SSH():
+    def __init__(self, job_name: str):
+        self.output_file = job_name + "-stdout.txt"
 
-def ssh_execute(ssh: SSHClient, commands: List[str], silent=False) -> bool:
-    """
-    Execute a list of commands on an SSH connection.
-    """
-    if isinstance(commands, str):
-        print("Please pass a list of commands to ssh_execute, not a string")
-        return False
+    def clear_output_file(self,):
+        open(self.output_file, 'w').close()
 
-    # Make sure we source the environment variables placed in .profile first
-    commands.insert(0, "source .profile")
-    # Join commands with "&&" so we can use "cd" correctly
-    separator = " && "
-    combined_commands = separator.join(commands)
-    stdin, stdout, stderr = ssh.exec_command(combined_commands, get_pty=True)
-    # Write outputs to OUTPUT_FILE
-    if not silent:
-        with open(OUTPUT_FILE, "a") as stdout_file:
-            for line in stdout:
-                stdout_file.write(line)
-                stdout_file.flush()
-            
-    error = stderr.read().decode()
-    if error:
-        print(f"Error executing SSH commands: {combined_commands}")
-        print(f"{COLOR_ERROR}{error}{COLOR_END}")
-        return False
-    return True
+    def exec(self, ssh: SSHClient, commands: List[str], silent=False) -> bool:
+        """
+        Execute a list of commands on an SSH connection.
+        """
+        if isinstance(commands, str):
+            print("Please pass a list of commands to ssh_execute, not a string")
+            return False
+
+        # Make sure we source the environment variables placed in .profile first
+        commands.insert(0, "source .profile")
+        # Join commands with "&&" so we can use "cd" correctly
+        separator = " && "
+        combined_commands = separator.join(commands)
+        stdin, stdout, stderr = ssh.exec_command(combined_commands, get_pty=True)
+        # Write outputs to OUTPUT_FILE
+        if not silent:
+            with open(self.output_file, "a") as stdout_file:
+                for line in stdout:
+                    stdout_file.write(line)
+                    stdout_file.flush()
+                
+        error = stderr.read().decode()
+        if error:
+            print(f"Error executing SSH commands: {combined_commands}")
+            print(f"{COLOR_ERROR}{error}{COLOR_END}")
+            return False
+        return True
 
 def ssh_execute_background(ssh: SSHClient, commands: List[str]):
     """

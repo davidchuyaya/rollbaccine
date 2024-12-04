@@ -23,7 +23,7 @@ az group delete \
     -n $NAME-group \
     --yes --no-wait
 # Use -f because storage.json may or may not exist, depending on whether the benchmark required it
-rm -f storage.json
-rm vm1.json
-rm -f vm2.json
-rm stdout.txt
+rm -f $NAME-storage.json
+rm $NAME-vm1.json
+rm -f $NAME-vm2.json
+rm $NAME-stdout.txt

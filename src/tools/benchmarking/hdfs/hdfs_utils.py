@@ -21,13 +21,13 @@ class HDFSBenchmark(Benchmark):
     def needs_storage(self) -> bool:
         return False
 
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
+    def install(self, ssh_executor: SSH, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         name_node_ip = private_ips[self.benchmarking_vm()]
         ssh = connections[self.benchmarking_vm()]
 
         print("Installing HDFS, may take a few minutes")
         if not is_installed(ssh, 'which hdfs'):
-            success = ssh_execute(ssh, [
+            success = ssh_executor.exec(ssh, [
                 "wget -nv https://mirror.lyrahosting.com/apache/hadoop/core/hadoop-3.3.3/hadoop-3.3.3.tar.gz",
                 "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get -qq update",
@@ -44,7 +44,7 @@ class HDFSBenchmark(Benchmark):
 
             # Replace {namenodeip} in core-site with the actual namenode IP
             print("Replacing {namenodeip} in core-site.xml")
-            ssh_execute(ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+            ssh_executor.exec(ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
             print(f"Finished installing HDFS")
         return True
 

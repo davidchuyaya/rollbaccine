@@ -34,6 +34,9 @@ VM_SIZE_TEMP_DISK=Standard_DC16ads_v5
 # Set managed disk size (GB) to same size as temp disk
 MANAGED_DISK_SIZE=600
 USERNAME=$(whoami)
+STORAGE_FILE=$BENCHMARK-$SYSTEM-storage.json
+VM1_FILE=$BENCHMARK-$SYSTEM-vm1.json
+VM2_FILE=$BENCHMARK-$SYSTEM-vm2.json
 
 echo "Creating resource group: "$NAME"-group"
 az group create \
@@ -52,7 +55,7 @@ az ppg create \
 if [ $STORAGE ]; then
     echo "Creating storage account: rollbaccinenimble"
     az storage account create -n rollbaccinenimble -g $NAME-group -l $LOCATION --sku Standard_LRS
-    az storage account keys list -n rollbaccinenimble -g $NAME-group > storage.json
+    az storage account keys list -n rollbaccinenimble -g $NAME-group > $STORAGE_FILE
 fi
 
 # Parameters: $1 = count, $2 = vm_size, $3 = output name, $4 = additional params
@@ -103,19 +106,19 @@ launch_vm () {
 
 # Launch the right number of VMs with temp/managed disk
 if [ $SYSTEM = "ROLLBACCINE" ]; then
-    launch_vm 2 $VM_SIZE_TEMP_DISK "vm1.json"
+    launch_vm 2 $VM_SIZE_TEMP_DISK $VM1_FILE
     REMAINING_VMS=$(($NUM_VMS - 2))
 elif [ $SYSTEM = "REPLICATED" ]; then
-    launch_vm 1 $VM_SIZE "vm1.json" "--data-disk-sizes-gb $MANAGED_DISK_SIZE --data-disk-caching None"
+    launch_vm 1 $VM_SIZE $VM1_FILE "--data-disk-sizes-gb $MANAGED_DISK_SIZE --data-disk-caching None"
     REMAINING_VMS=$(($NUM_VMS - 1))
 else
-    launch_vm 1 $VM_SIZE_TEMP_DISK "vm1.json"
+    launch_vm 1 $VM_SIZE_TEMP_DISK $VM1_FILE
     REMAINING_VMS=$(($NUM_VMS - 1))
 fi
 
 # Launch remaining VMs without any disk
 if [ $REMAINING_VMS -gt 0 ]; then
-    launch_vm $REMAINING_VMS $VM_SIZE "vm2.json"
+    launch_vm $REMAINING_VMS $VM_SIZE $VM2_FILE
 fi
 
 echo "Sleeping for 10 seconds to make sure the VMs are ready by the time this script finishes"

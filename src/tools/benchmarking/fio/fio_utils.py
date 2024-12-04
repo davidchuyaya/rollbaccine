@@ -55,8 +55,9 @@ class FioBenchmark(Benchmark):
 
         fio_commands = []
         # Add 2 additional commands
-        all_combinations.insert(0, ('read', '', 0, 0, 6))
-        all_combinations.insert(0, ('write', '', 0, 0, 64))
+        if system_type != System.REPLICATED:
+            all_combinations.insert(0, ('read', '', 0, 0, 6))
+            all_combinations.insert(0, ('write', '', 0, 0, 64))
 
         for io_direction, sequentiality, direct, fsync, num_jobs in all_combinations:
             # Don't execute certain commands
@@ -83,10 +84,10 @@ class FioBenchmark(Benchmark):
     def needs_storage(self) -> bool:
         return False
 
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
+    def install(self, ssh_executor: SSH, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         ssh = connections[self.benchmarking_vm()]
         if not is_installed(ssh, 'which fio'):
-            return ssh_execute(ssh, [
+            return ssh_executor.exec(ssh, [
                 "sudo apt-get update -qq",
                 "sudo apt-get install -y -qq fio"
             ])

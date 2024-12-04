@@ -21,13 +21,13 @@ class PostgresBenchmark(Benchmark):
     def needs_storage(self) -> bool:
         return False
 
-    def install(self, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
+    def install(self, ssh_executor: SSH, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         # Install Postgres on primary
         primary = connections[0]
         primary_private_ip = private_ips[0]
         if not is_installed(primary, 'which psql'):
             print("Installing Postgres on primary, may take a few minutes")
-            success = ssh_execute(primary, [
+            success = ssh_executor.exec(primary, [
                 "sudo apt-get -qq update",
                 "sudo apt-get install -qq -y postgresql-common",
                 # Install to our custom directory
@@ -49,7 +49,7 @@ class PostgresBenchmark(Benchmark):
         benchbase = connections[self.benchmarking_vm()]
         if not is_installed(benchbase, "test -d benchbase-2023 && echo 1"):
             print("Installing Benchbase on benchmarking VM, may also take a few minutes")
-            success = ssh_execute(benchbase, [
+            success = ssh_executor.exec(benchbase, [
                 "wget -nv https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz",
                 "tar -xzf v2023.tar.gz",
                 # Install Java
@@ -68,7 +68,7 @@ class PostgresBenchmark(Benchmark):
             upload(benchbase, "src/tools/benchmarking/postgres/tpcc_config.xml", REMOTE_CONFIG)
 
             print("Modifying config file")
-            success = ssh_execute(benchbase, [f"sed -i 's/localhost/{primary_private_ip}/g' {REMOTE_CONFIG}"])
+            success = ssh_executor.exec(benchbase, [f"sed -i 's/localhost/{primary_private_ip}/g' {REMOTE_CONFIG}"])
             if not success:
                 return False
         return True
