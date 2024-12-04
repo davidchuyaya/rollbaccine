@@ -42,9 +42,9 @@ def extract_performance_data(results):
         rw_option = job_data['job options'].get('rw', '')
         rw_name = 'read' if 'read' in rw_option else 'write'
 
-        # Throughput: use 'iops' from 'read'
+        # Throughput: use 'iops'
         read_iops = job_data[rw_name]['iops']
-        # Latency: extract from 'read' -> 'clat_ns'
+        # Latency: extract from 'clat_ns'
         latency_percentiles = job_data[rw_name].get('clat_ns', {}).get('percentile', {})
         median_latency_ns = latency_percentiles.get('50.000000')
         if median_latency_ns is None:
@@ -71,14 +71,14 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
         'ROLLBACCINE': 'd'
     }
     colors = {
-        'DM': 'blue',
+        'DM': 'cyan',
         'UNREPLICATED': 'red',
-        'REPLICATED': 'green',
+        'REPLICATED': 'lime',
         'ROLLBACCINE': 'orange'
     }
 
     for base_job_name in performance_data:
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(5, 3))
         ax = plt.gca()
         for category in performance_data[base_job_name]:
             throughputs = []
@@ -92,10 +92,10 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
                 latencies.append(latency)
                 thread_counts.append(thread_count)
             label = f"{category}"
-            ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=5, label=label)
+            ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=3, label=label)
             # Annotate each data point with the number of threads
             for i in range(len(throughputs)):
-                ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,10), ha='center')
+                ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,-5), ha='center')
         ax.set_xlabel('Throughput (thousands of commands per second)')
         ax.set_ylabel('Median Latency (ms)')
         ax.set_title(f'{base_job_name} - Median Latency vs Throughput')
@@ -105,7 +105,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
         ax.set_yscale('log')
         plt.tight_layout()
         # Save the figure
-        output_file = os.path.join(output_dir, f'{base_job_name}_latency_vs_throughput.png')
+        output_file = os.path.join(output_dir, f'{base_job_name}_latency_vs_throughput.pdf')
         plt.savefig(output_file)
         plt.close()
         print(f"Saved latency vs throughput graph to {output_file}")

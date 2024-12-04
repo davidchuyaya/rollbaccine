@@ -15,6 +15,8 @@ class FioBenchmark(Benchmark):
         """
         Returns which fio commands should be discarded based on the system config, in order to saturate individual configs (or stop after we've saturated)
         """
+        if system_type == System.REPLICATED:
+            return False
         if system_type == System.DM:
             if io_direction == 'write':
                 if sequentiality == 'rand':
@@ -31,7 +33,7 @@ class FioBenchmark(Benchmark):
                             return True
         if sequentiality == 'rand' and io_direction == 'write' and direct == 0 and fsync == 0 and num_jobs > 4:
             return True
-        if sequentiality == '' and io_direction == 'read' and direct == 0 and fsync == 0 and num_jobs > 4:
+        if sequentiality == '' and io_direction == 'read' and direct == 0 and fsync == 0 and num_jobs > 6:
             return True
         return False
 
@@ -54,10 +56,17 @@ class FioBenchmark(Benchmark):
         all_combinations = [combo for combo in all_combinations if not (combo[0] == 'read' and combo[3] == 1)]
 
         fio_commands = []
-        # Add 2 additional commands
-        if system_type != System.REPLICATED:
-            all_combinations.insert(0, ('read', '', 0, 0, 6))
-            all_combinations.insert(0, ('write', '', 0, 0, 64))
+        # Add additional commands
+        if system_type == System.DM:
+            # DM sequential writes with fsync do very well, add more
+            all_combinations.insert(0, ('write', '', 0, 1, 256))
+            all_combinations.insert(0, ('write', '', 0, 1, 1024))
+            all_combinations.insert(0, ('write', '', 0, 1, 2048))
+            all_combinations.insert(0, ('write', '', 1, 1, 256))
+            all_combinations.insert(0, ('write', '', 1, 1, 1024))
+        all_combinations.insert(0, ('read', '', 0, 0, 6))
+        all_combinations.insert(0, ('write', '', 0, 0, 64))
+        all_combinations.insert(0, ('write', '', 0, 0, 128))
 
         for io_direction, sequentiality, direct, fsync, num_jobs in all_combinations:
             # Don't execute certain commands
@@ -65,7 +74,7 @@ class FioBenchmark(Benchmark):
                 continue
 
             rw = sequentiality + io_direction
-            job_name = f"{rw}_direct{direct}_fsync{fsync}_threads_{num_jobs}_{str(uuid.uuid4())[:4]}"
+            job_name = f"{system_type}_{rw}_direct{direct}_fsync{fsync}_threads_{num_jobs}_{str(uuid.uuid4())[:4]}"
             output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
 
             fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --fsync={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 | tee {output_file}'
