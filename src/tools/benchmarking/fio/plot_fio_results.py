@@ -40,44 +40,18 @@ def extract_performance_data(results):
     performance_data = {}
     for base_job_name, category, thread_count, job_data in results:
         rw_option = job_data['job options'].get('rw', '')
-        is_read = 'read' in rw_option
-        is_write = 'write' in rw_option
+        rw_name = 'read' if 'read' in rw_option else 'write'
 
-        if is_read:
-            # Throughput: use 'iops' from 'read'
-            read_iops = job_data['read']['iops']
-            # Latency: extract from 'read' -> 'clat_ns'
-            latency_percentiles = job_data['read'].get('clat_ns', {}).get('percentile', {})
-            median_latency_ns = latency_percentiles.get('50.000000')
-            if median_latency_ns is None:
-                median_latency_ns = job_data['read'].get('clat_ns', {}).get('mean', 0)
-            # Convert latency from nanoseconds to milliseconds
-            median_latency_ms = median_latency_ns / 1e6  # ns to ms
-            throughput_k = read_iops / 1000  # Convert to thousands
-
-        elif is_write:
-            # Throughput: use 'iops' from 'write'
-            write_iops = job_data['write']['iops']
-            # Check if 'fsync' is enabled in job options
-            fsync_enabled = job_data['job options'].get('fsync', '0') == '1'
-
-            # Latency: extract from 'sync' if 'fsync' is enabled, else from 'write'
-            if fsync_enabled and 'sync' in job_data and 'lat_ns' in job_data['sync']:
-                latency_percentiles = job_data['sync']['lat_ns'].get('percentile', {})
-                median_latency_ns = latency_percentiles.get('50.000000')
-                if median_latency_ns is None:
-                    median_latency_ns = job_data['sync']['lat_ns'].get('mean', 0)
-            else:
-                latency_percentiles = job_data['write'].get('clat_ns', {}).get('percentile', {})
-                median_latency_ns = latency_percentiles.get('50.000000')
-                if median_latency_ns is None:
-                    median_latency_ns = job_data['write'].get('clat_ns', {}).get('mean', 0)
-            # Convert latency from nanoseconds to milliseconds
-            median_latency_ms = median_latency_ns / 1e6  # ns to ms
-            throughput_k = write_iops / 1000  # Convert to thousands
-        else:
-            print(f"Unknown rw option '{rw_option}' in job '{job_data['jobname']}'. Skipping.")
-            continue
+        # Throughput: use 'iops' from 'read'
+        read_iops = job_data[rw_name]['iops']
+        # Latency: extract from 'read' -> 'clat_ns'
+        latency_percentiles = job_data[rw_name].get('clat_ns', {}).get('percentile', {})
+        median_latency_ns = latency_percentiles.get('50.000000')
+        if median_latency_ns is None:
+            median_latency_ns = job_data[rw_name].get('clat_ns', {}).get('mean', 0)
+        # Convert latency from nanoseconds to milliseconds
+        median_latency_ms = median_latency_ns / 1e6  # ns to ms
+        throughput_k = read_iops / 1000  # Convert to thousands
 
         if base_job_name not in performance_data:
             performance_data[base_job_name] = {}
@@ -118,7 +92,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
                 latencies.append(latency)
                 thread_counts.append(thread_count)
             label = f"{category}"
-            ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), color=colors.get(category, 'black'), linestyle='-', label=label)
+            ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=5, label=label)
             # Annotate each data point with the number of threads
             for i in range(len(throughputs)):
                 ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,10), ha='center')

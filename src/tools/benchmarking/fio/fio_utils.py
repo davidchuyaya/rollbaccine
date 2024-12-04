@@ -11,82 +11,66 @@ from benchmark import *
 from utils import *
 
 class FioBenchmark(Benchmark):
-    def build_fio_command(self, parameters, output_file):
+    def discard_fio_command(self, system_type, io_direction, sequentiality, direct, fsync, num_jobs):
         """
-        Builds the FIO command based on the given parameters.
+        Returns which fio commands should be discarded based on the system config, in order to saturate individual configs (or stop after we've saturated)
         """
-        fio_command = (
-            f'sudo fio '
-            f'--name={parameters["name"]} '
-            f'--rw={parameters["write_mode"]} '
-            f'--direct={parameters.get("direct", 1)} '
-            f'--bs={parameters["bs"]} '
-        )
-        if parameters.get('runtime', 0) > 0:
-            fio_command += f'--runtime={parameters["runtime"]} '
-            fio_command += '--time_based '
-        if parameters.get('ramp_time', 0) > 0:
-            fio_command += f'--ramp_time={parameters["ramp_time"]} '
-        fio_command += f'--filename={parameters.get("filename", "/tmp/fio_test_file")} '
-        if parameters.get('filename_format'):
-            fio_command += f'--filename_format={parameters["filename_format"]} '
-        fio_command += f'--output-format=json '
-        fio_command += f'--iodepth={parameters.get("iodepth", 1)} '
-        fio_command += f'--numjobs={parameters["numjobs"]} '
-        if parameters.get('group_reporting', True):
-            fio_command += '--group_reporting '
-        if parameters.get('fsync', 0) == 1:
-            fio_command += '--fsync=1 '
-        fio_command += '--end_fsync=1 '
+        if system_type == System.DM:
+            if io_direction == 'write':
+                if sequentiality == 'rand':
+                    if direct == 0:
+                        if fsync == 1:
+                            if num_jobs > 8:
+                                return True
+                    else: # direct = 1
+                        if num_jobs > 4:
+                            return True
+                else: # sequential
+                    if direct == 1 and fsync == 0:
+                        if num_jobs > 4:
+                            return True
+        if sequentiality == 'rand' and io_direction == 'write' and direct == 0 and fsync == 0 and num_jobs > 4:
+            return True
+        if sequentiality == '' and io_direction == 'read' and direct == 0 and fsync == 0 and num_jobs > 4:
+            return True
+        return False
 
-        # Include additional FIO options if provided
-        additional_fio_options = parameters.get('additional_fio_options')
-        if additional_fio_options:
-            fio_command += f'{additional_fio_options} '
-
-        fio_command += f'| tee {output_file}'
-        return fio_command
-    
-    def build_fio_parameters_list(self, system_type: System):
+    def build_fio_commands(self, system_type: System, output_dir: str):
         filename = mount_point(system_type)
 
-        # Possible values for each parameter
+        # Possible values for each parameter. Most intense options first so we see errors early
         io_directions = ['write', 'read']
-        sequentialities = ['seq', 'rand']
-        bufferings = [1, 0]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
-        persistences = [1, 0]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
+        sequentialities = ['', 'rand'] # Empty string means sequential
+        bufferings = [0, 1]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
+        persistences = [0, 1]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
+        num_jobs_list = [32, 16, 8, 4, 1]
+
+        # Replicated disk saturates very quickly, don't run too many jobs
+        if system_type == System.REPLICATED:
+            num_jobs_list = [16, 8, 1]
 
         # Generate all permutations
-        all_combinations = list(itertools.product(io_directions, sequentialities, bufferings, persistences))
+        all_combinations = list(itertools.product(io_directions, sequentialities, bufferings, persistences, num_jobs_list))
         all_combinations = [combo for combo in all_combinations if not (combo[0] == 'read' and combo[3] == 1)]
-        fio_parameters_list = []
-        print(f"all_combinations: {all_combinations}")
 
-        for io_direction, sequentiality, direct_io, fsync in all_combinations:
-            # Construct the 'rw' parameter for FIO
-            if sequentiality == 'seq':
-                rw = io_direction
-            else:
-                rw = 'rand' + io_direction
+        fio_commands = []
+        # Add 2 additional commands
+        all_combinations.insert(0, ('read', '', 0, 0, 6))
+        all_combinations.insert(0, ('write', '', 0, 0, 64))
 
-            # Build the fio parameter dictionary
-            fio_param = {
-                'name': f'{sequentiality}_{io_direction}_direct{direct_io}_fsync{fsync}',
-                'write_mode': rw,
-                'bs': '4k',
-                'direct': direct_io,
-                'filename': filename,
-                'runtime': 30,
-                'ramp_time': 60,
-                'group_reporting': True,
-            }
+        for io_direction, sequentiality, direct, fsync, num_jobs in all_combinations:
+            # Don't execute certain commands
+            if self.discard_fio_command(system_type, io_direction, sequentiality, direct, fsync, num_jobs):
+                continue
 
-            # Add fsync parameter if persistence is required
-            if fsync == 1:
-                fio_param['fsync'] = 1  # Issue fsync after each write
+            rw = sequentiality + io_direction
+            job_name = f"{rw}_direct{direct}_fsync{fsync}_threads_{num_jobs}_{str(uuid.uuid4())[:4]}"
+            output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
 
-            fio_parameters_list.append(fio_param)
-        return fio_parameters_list
+            fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --fsync={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 | tee {output_file}'
+            fio_commands.append(fio_command)
+        return fio_commands
+    
     def filename(self):
         return "fio/fio_utils.py"
     
@@ -109,45 +93,32 @@ class FioBenchmark(Benchmark):
         return True
 
     def run(self, system_type: System, output_dir: str):
-        # Define the list of numjobs (thread counts) to test
-        numjobs_list = [1, 2, 4, 8, 16]
-        fio_parameters_list = self.build_fio_parameters_list(system_type)
-        total_benchmarks = len(fio_parameters_list) * len(numjobs_list)
-        current_benchmark = 0
-        print(f"Running {total_benchmarks} FIO benchmarks locally")
-
         success = subprocess_execute([f"sudo umount {MOUNT_DIR}"])
         if not success:
             print("Failed to unmount the mount point")
             return
+        
+        fio_commands = self.build_fio_commands(system_type, output_dir)
+        total_benchmarks = len(fio_commands)
+        current_benchmark = 0
+        print(f"Running {total_benchmarks} FIO benchmarks locally")
 
-        for fio_parameters_template in fio_parameters_list:
-            for numjobs in numjobs_list:
-                parameters = fio_parameters_template.copy()
-                parameters['numjobs'] = numjobs
-                short_uuid = str(uuid.uuid4())[:4]
-                job_name = f"{system_type}_{parameters['name']}_threads_{numjobs}_{short_uuid}"
+        for fio_command in fio_commands:
+            print(f"Running FIO command: {fio_command}")
 
-                output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
+            start_time = time.time()
+            # Execute the FIO command locally
+            success = subprocess_execute([fio_command])
+            if success:
+                print(f"FIO benchmark '{fio_command}' completed successfully")
+            else:
+                print(f"FIO benchmark '{fio_command}' failed")
+                sys.exit(1)
+                return
 
-                fio_command = self.build_fio_command(parameters, output_file)
-
-                print(f"Running FIO benchmark '{job_name}'")
-                print(f"FIO command: {fio_command}")
-
-                start_time = time.time()
-                # Execute the FIO command locally
-                success = subprocess_execute([fio_command])
-                if success:
-                    print(f"FIO benchmark '{job_name}' completed successfully")
-                else:
-                    print(f"FIO benchmark '{job_name}' failed")
-                    sys.exit(1)
-                    return
-
-                current_benchmark += 1
-                end_time = time.time()
-                print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time) / 60:.2f} minutes, completed {current_benchmark} of {total_benchmarks} benchmarks***")
+            current_benchmark += 1
+            end_time = time.time()
+            print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time) / 60:.2f} minutes, completed {current_benchmark} of {total_benchmarks} benchmarks***")
 
 if __name__ == "__main__":
     FioBenchmark().run(System[sys.argv[1]], sys.argv[2])
