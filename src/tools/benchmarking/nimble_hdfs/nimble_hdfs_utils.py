@@ -142,4 +142,4 @@ class NimbleHDFSBenchmark(Benchmark):
         subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
 
 if __name__ == "__main__":
-    NimbleHDFSBenchmark(sys.argv[3]).run(System[sys.argv[1]], sys.argv[2])
+    NimbleHDFSBenchmark(int(sys.argv[3])).run(System[sys.argv[1]], sys.argv[2])
