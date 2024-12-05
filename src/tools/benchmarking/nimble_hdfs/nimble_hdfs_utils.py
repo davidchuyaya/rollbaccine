@@ -115,8 +115,8 @@ class NimbleHDFSBenchmark(Benchmark):
         THREADS = 16
         # Use fewer files and directories since Nimble is very slow
         if self.batch_size == 1:
-            FILES = 1000
-            DIRS = 1000
+            FILES = 10000
+            DIRS = 10000
         else:
             FILES = 100000
             DIRS = 100000
