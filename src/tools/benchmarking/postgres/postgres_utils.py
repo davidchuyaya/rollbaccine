@@ -85,10 +85,11 @@ class PostgresBenchmark(Benchmark):
             print(f"TPCC benchmark failed")
             sys.exit(1)
 
-        # Remove everything from the output_dir except summary.json
+        # Remove everything from the output_dir except summary.json, and rename summary.json
         success = subprocess_execute([
             f"cd {output_dir}",
-            "rm -rf *.xml *.csv *.metrics.json *.params.json"
+            "rm -rf *.xml *.csv *.metrics.json *.params.json",
+            f"mv *.summary.json {system_type}_postgres_summary.json"
         ])
 
 if __name__ == "__main__":
