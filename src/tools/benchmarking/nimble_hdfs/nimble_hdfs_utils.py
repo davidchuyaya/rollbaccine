@@ -14,6 +14,12 @@ COORDINATOR_PORT = 8080
 ENDORSER_PORT = 9091
 
 class NimbleHDFSBenchmark(Benchmark):
+    def __init__(self, batch_size):
+        self.batch_size = batch_size
+        if batch_size != 1 and batch_size != 100:
+            print("Batch size must be 1 or 100")
+            sys.exit(1)
+
     def filename(self):
         return "nimble_hdfs/nimble_hdfs_utils.py"
     
@@ -50,7 +56,7 @@ class NimbleHDFSBenchmark(Benchmark):
         print(f"Checking if namenode has HDFS")
         if not is_installed(name_node_ssh, 'which hdfs'):
             print("Installing HDFS on the namenode")
-            success = ssh_executor.exec(ssh, [
+            success = ssh_executor.exec(name_node_ssh, [
                 "wget -nv https://github.com/IceCoooola/hadoop-nimble/releases/download/3.3.3/hadoop-3.3.3.tar.gz",
                 "tar -xzf hadoop-3.3.3.tar.gz",
                 "sudo apt-get -qq update",
@@ -61,8 +67,8 @@ class NimbleHDFSBenchmark(Benchmark):
             if not success:
                 return False
             
-            print(f"Uploading configuration file")
-            upload(name_node_ssh, "src/tools/benchmarking/nimble_hdfs/core-site.xml", f'/home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml')
+            print(f"Uploading configuration file, batch size: {self.batch_size}")
+            upload(name_node_ssh, f"src/tools/benchmarking/nimble_hdfs/core-site-{self.batch_size}.xml", f'/home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml')
             upload(name_node_ssh, "src/tools/benchmarking/nimble_hdfs/hdfs-site.xml", f'/home/{getuser()}/hadoop-3.3.3/etc/hadoop/hdfs-site.xml')
 
             # Replace {namenodeip} in core-site with the actual namenode IP
@@ -77,7 +83,7 @@ class NimbleHDFSBenchmark(Benchmark):
         for (i, ssh) in enumerate([coordinator_ssh] + endorser_sshs):
             if not is_installed(ssh, 'test -d Nimble && echo 1'):
                 print(f"Installing Nimble on node {i}")
-                thread = threading.Thread(target=self.install_nimble_on_vm, args=(ssh,))
+                thread = threading.Thread(target=self.install_nimble_on_vm, args=(ssh_executor, ssh,))
                 threads.append(thread)
                 thread.start()
         for thread in threads:
@@ -108,8 +114,12 @@ class NimbleHDFSBenchmark(Benchmark):
     def run(self, system_type: System, output_dir: str):
         THREADS = 16
         # Use fewer files and directories since Nimble is very slow
-        FILES = 100000
-        DIRS = 100000
+        if self.batch_size == 1:
+            FILES = 1000
+            DIRS = 1000
+        else:
+            FILES = 100000
+            DIRS = 100000
 
         print("Starting the namenode")
         success = subprocess_execute(["hdfs namenode -format", "hdfs --daemon start namenode"])
@@ -120,16 +130,16 @@ class NimbleHDFSBenchmark(Benchmark):
 
         for op in ["create", "open", "delete", "fileStatus", "rename"]:
             print(f"Running {op}")
-            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
+            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/NIMBLE_HDFS_{self.batch_size}_{op}.txt"])
             if not success:
                 sys.exit(1)
                 return
             
         print(f"Running mkdirs")
-        subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op mkdirs -threads {THREADS} -dirs {DIRS} 2>&1 | tee {output_dir}/{system_type}_mkdirs.txt"])
+        subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op mkdirs -threads {THREADS} -dirs {DIRS} 2>&1 | tee {output_dir}/NIMBLE_HDFS_{self.batch_size}_mkdirs.txt"])
 
         print(f"Cleaning up")
         subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
 
 if __name__ == "__main__":
-    NimbleHDFSBenchmark().run(System[sys.argv[1]], sys.argv[2])
+    NimbleHDFSBenchmark(sys.argv[3]).run(System[sys.argv[1]], sys.argv[2])

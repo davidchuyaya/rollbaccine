@@ -9,7 +9,7 @@ print_usage() {
     echo "  -n: Number of VMs to launch"
 }
 
-while getopts 'b:s:n' flag; do
+while getopts 'b:s:n:' flag; do
   case ${flag} in
     b) BENCHMARK=${OPTARG} ;;
     s) SYSTEM=${OPTARG} ;;
@@ -52,7 +52,7 @@ az ppg create \
   --zone $ZONE \
   --intent-vm-sizes $VM_SIZE $VM_SIZE_TEMP_DISK
 
-if [ $STORAGE ]; then
+if [ $BENCHMARK = "nimble_hdfs" ]; then
     echo "Creating storage account: rollbaccinenimble"
     az storage account create -n rollbaccinenimble -g $NAME-group -l $LOCATION --sku Standard_LRS
     az storage account keys list -n rollbaccinenimble -g $NAME-group > $STORAGE_FILE

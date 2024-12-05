@@ -23,7 +23,7 @@ def connect_ssh(public_ip):
     ssh.connect(public_ip, username=getuser())
     return ssh
 
-def name_to_benchmark(name):
+def name_to_benchmark(name, nimble_batch_size):
     """
     Converts a string to a Benchmark object.
     """
@@ -36,7 +36,7 @@ def name_to_benchmark(name):
     elif name == "hdfs":
         return HDFSBenchmark()
     elif name == "nimble_hdfs":
-        return NimbleHDFSBenchmark()
+        return NimbleHDFSBenchmark(nimble_batch_size)
     else:
         raise ValueError(f"Unknown benchmark name: {name}")
 
@@ -145,11 +145,11 @@ def ssh_vm_json(vm_json) -> Tuple[List[SSHClient], List[str]]:
             private_ips.append(vm['privateIps'])
     return connections, private_ips
 
-def run_everything(system_type: System, benchmark_name: str):
+def run_everything(system_type: System, benchmark_name: str, nimble_batch_size: int = 0):
     """
     Function to set up Azure VMs, run FIO benchmarks, and then delete the VMs.
     """
-    benchmark = name_to_benchmark(benchmark_name)
+    benchmark = name_to_benchmark(benchmark_name, nimble_batch_size)
     num_vms = benchmark.num_vms()
     # 1 additional VM for the rollbaccine backup
     if system_type == System.ROLLBACCINE:
@@ -220,7 +220,7 @@ def run_everything(system_type: System, benchmark_name: str):
         print("Running benchmark")
         success = ssh_executor.exec(ssh, [
             f"cd rollbaccine/src/tools/benchmarking",
-            f"python3 {benchmark.filename()} {system_type} {OUTPUT_DIR}"
+            f"python3 {benchmark.filename()} {system_type} {OUTPUT_DIR} {nimble_batch_size}"
         ])
         if not success:
             return False
@@ -237,5 +237,5 @@ def run_everything(system_type: System, benchmark_name: str):
     subprocess_execute([f"./cleanup.sh -b {benchmark_name} -s {system_type}"])
 
 if __name__ == "__main__":
-    run_everything(System[sys.argv[1]], sys.argv[2])
+    run_everything(System[sys.argv[1]], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 0)
 
