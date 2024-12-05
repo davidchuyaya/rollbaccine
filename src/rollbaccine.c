@@ -1265,8 +1265,11 @@ void leader_read_disk_end_io(struct bio *shallow_clone) {
 void leader_write_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
-    remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
-    // Return to the user. If this is an fsync, wait for replication
+    // We only added it to the tree if it was non-empty, so only remove if it's non-empty
+    if (bio_data->end_sector - bio_data->start_sector > 0) {
+        remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
+    }
+     // Return to the user. If this is an fsync, wait for replication
     if (!bio_data->is_fsync) {
         ack_bio_to_user_without_executing(bio_data->bio_src);
     }
@@ -1909,6 +1912,8 @@ int submit_pending_bio_ring_prefix(void *args) {
 #ifdef MEMORY_TRACKING
             atomic_dec(&device->num_bios_in_pending_bio_ring);
 #endif
+            // Record if we should ack the fsync
+            should_ack_fsync |= curr_bio_data->is_fsync;
 
             if (no_conflict) {
                 if (curr_bio_data->checksum_and_iv != NULL) {
@@ -1928,9 +1933,6 @@ int submit_pending_bio_ring_prefix(void *args) {
                     }
                 }
             }
-
-            // Record if we should ack the fsync
-            should_ack_fsync |= curr_bio_data->is_fsync;
 
             // Increment index and wrap around if necessary
             curr_head = atomic_inc_return(&device->pending_bio_ring_head) % ROLLBACCINE_PENDING_BIO_RING_SIZE;
