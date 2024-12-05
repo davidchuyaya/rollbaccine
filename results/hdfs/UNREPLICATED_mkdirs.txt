@@ -1,0 +1,14 @@
+2024-12-05 19:13:09,335 INFO namenode.NNThroughputBenchmark: Starting benchmark: mkdirs
+2024-12-05 19:13:09,382 INFO namenode.NNThroughputBenchmark: Generate 500000 inputs for mkdirs
+2024-12-05 19:13:09,812 INFO namenode.NNThroughputBenchmark: Log level = ERROR
+2024-12-05 19:13:09,852 INFO namenode.NNThroughputBenchmark: Starting 500000 mkdirs(s).
+2024-12-05 19:14:24,857 INFO namenode.NNThroughputBenchmark: 
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: --- mkdirs inputs ---
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: nrDirs = 500000
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: nrThreads = 16
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: nrDirsPerDir = 2
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: --- mkdirs stats  ---
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: # operations: 500000
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: Elapsed Time: 74893
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark:  Ops per sec: 6676.191366349325
+2024-12-05 19:14:24,858 INFO namenode.NNThroughputBenchmark: Average Time: 2

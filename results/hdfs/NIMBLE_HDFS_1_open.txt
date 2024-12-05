@@ -1,0 +1,19 @@
+2024-12-05 20:37:13,807 WARN util.NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+2024-12-05 20:37:14,320 INFO namenode.NNThroughputBenchmark: Starting benchmark: open
+2024-12-05 20:37:14,347 INFO namenode.NNThroughputBenchmark: Generate 10000 intputs for create
+2024-12-05 20:37:14,353 INFO namenode.NNThroughputBenchmark: Log level = ERROR
+2024-12-05 20:37:14,415 INFO namenode.NNThroughputBenchmark: Starting 10000 create(s).
+2024-12-05 20:45:03,567 INFO namenode.NNThroughputBenchmark: Created 10000 files.
+2024-12-05 20:45:03,569 INFO namenode.NNThroughputBenchmark: Generate 10000 intputs for open
+2024-12-05 20:45:03,685 INFO namenode.NNThroughputBenchmark: Log level = ERROR
+2024-12-05 20:45:03,685 INFO namenode.NNThroughputBenchmark: Starting 10000 open(s).
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: 
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: --- open inputs ---
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: nrFiles = 10000
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: nrThreads = 16
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: nrFilesPerDir = 4
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: --- open stats  ---
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: # operations: 10000
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: Elapsed Time: 1466
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark:  Ops per sec: 6821.2824010914055
+2024-12-05 20:45:05,178 INFO namenode.NNThroughputBenchmark: Average Time: 2

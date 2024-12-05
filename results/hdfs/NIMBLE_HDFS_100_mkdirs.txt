@@ -1,0 +1,15 @@
+2024-12-05 19:51:27,117 WARN util.NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+2024-12-05 19:51:27,613 INFO namenode.NNThroughputBenchmark: Starting benchmark: mkdirs
+2024-12-05 19:51:27,640 INFO namenode.NNThroughputBenchmark: Generate 100000 inputs for mkdirs
+2024-12-05 19:51:27,729 INFO namenode.NNThroughputBenchmark: Log level = ERROR
+2024-12-05 19:51:27,812 INFO namenode.NNThroughputBenchmark: Starting 100000 mkdirs(s).
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: 
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: --- mkdirs inputs ---
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: nrDirs = 100000
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: nrThreads = 16
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: nrDirsPerDir = 2
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: --- mkdirs stats  ---
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: # operations: 100000
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: Elapsed Time: 51099
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark:  Ops per sec: 1956.9854595980353
+2024-12-05 19:52:18,952 INFO namenode.NNThroughputBenchmark: Average Time: 8

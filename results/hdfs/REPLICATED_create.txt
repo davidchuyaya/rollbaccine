@@ -1,0 +1,14 @@
+2024-12-05 18:57:35,777 INFO namenode.NNThroughputBenchmark: Starting benchmark: create
+2024-12-05 18:57:35,873 INFO namenode.NNThroughputBenchmark: Generate 500000 intputs for create
+2024-12-05 18:57:36,077 INFO namenode.NNThroughputBenchmark: Log level = ERROR
+2024-12-05 18:57:36,118 INFO namenode.NNThroughputBenchmark: Starting 500000 create(s).
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: 
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: --- create inputs ---
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: nrFiles = 500000
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: nrThreads = 16
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: nrFilesPerDir = 4
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: --- create stats  ---
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: # operations: 500000
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: Elapsed Time: 110733
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark:  Ops per sec: 4515.365789782631
+2024-12-05 18:59:27,318 INFO namenode.NNThroughputBenchmark: Average Time: 3
