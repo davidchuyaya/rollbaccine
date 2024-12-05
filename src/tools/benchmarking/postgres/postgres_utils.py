@@ -85,5 +85,11 @@ class PostgresBenchmark(Benchmark):
             print(f"TPCC benchmark failed")
             sys.exit(1)
 
+        # Remove everything from the output_dir except summary.json
+        success = subprocess_execute([
+            f"cd {output_dir}",
+            "rm -rf *.xml *.csv *.metrics.json *.params.json"
+        ])
+
 if __name__ == "__main__":
     PostgresBenchmark().run(System[sys.argv[1]], sys.argv[2])

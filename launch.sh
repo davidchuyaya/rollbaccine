@@ -85,7 +85,7 @@ launch_vm () {
 
     az vm create \
     --resource-group $NAME-group \
-    --name $NAME \
+    --name $NAME-$(uuidgen) \
     --admin-username $USERNAME \
     --generate-ssh-keys \
     --public-ip-sku Standard \
