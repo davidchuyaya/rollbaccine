@@ -40,18 +40,19 @@ def extract_performance_data(results):
     performance_data = {}
     for base_job_name, category, thread_count, job_data in results:
         rw_option = job_data['job options'].get('rw', '')
-        rw_name = 'read' if 'read' in rw_option else 'write'
+        fsync_option = job_data['job options'].get('fsync', '0')
+        if 'read' in rw_option:
+            iops = job_data['read']['iops']
+            median_latency_ns = job_data['read'].get('clat_ns', {}).get('percentile', {}).get('50.000000')
+        else:
+            iops = job_data['write']['iops']
+            median_latency_ns = job_data['write'].get('clat_ns', {}).get('percentile', {}).get('50.000000')
+            if fsync_option == '1':
+                median_latency_ns += job_data['sync'].get('lat_ns', {}).get('percentile', {}).get('50.000000')
 
-        # Throughput: use 'iops'
-        read_iops = job_data[rw_name]['iops']
-        # Latency: extract from 'clat_ns'
-        latency_percentiles = job_data[rw_name].get('clat_ns', {}).get('percentile', {})
-        median_latency_ns = latency_percentiles.get('50.000000')
-        if median_latency_ns is None:
-            median_latency_ns = job_data[rw_name].get('clat_ns', {}).get('mean', 0)
         # Convert latency from nanoseconds to milliseconds
         median_latency_ms = median_latency_ns / 1e6  # ns to ms
-        throughput_k = read_iops / 1000  # Convert to thousands
+        throughput_k = iops / 1000  # Convert to thousands
 
         if base_job_name not in performance_data:
             performance_data[base_job_name] = {}
@@ -98,7 +99,6 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
                 ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,-5), ha='center')
         ax.set_xlabel('Throughput (thousands of commands per second)')
         ax.set_ylabel('Median Latency (ms)')
-        ax.set_title(f'{base_job_name} - Median Latency vs Throughput')
         ax.legend()
         ax.grid(True)
         # log for y axis

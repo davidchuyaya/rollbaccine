@@ -1,24 +1,15 @@
 import json
 import matplotlib.pyplot as plt
 
-# assume file path ordered as: [unreplicated, dm, replicated, rollbaccine]
-file_paths = [
-    "tpcc_2024-11-28_23-57-55.summary.json",
-    "tpcc_1.json",
-    "tpcc_2.json",
-    "tpcc_3.json"
-]
-config_names = ["unreplicated", "dm", "replicated", "rollbaccine"]
-figure_width = 5
-figure_height = 4
+configs = ["UNREPLICATED", "DM", "REPLICATED", "ROLLBACCINE"]
 
 # extract data from JSON files and return (throughputs, median_latencies)
-def extract_data(json_file_paths: str) -> (list, list):
+def extract_data():
     throughputs = []
     median_latencies = []
 
-    for file_path in json_file_paths:
-        with open(file_path, 'r') as file:
+    for config in configs:
+        with open(f"../../../../results/postgres/{config}_postgres_summary.json", 'r') as file:
             data = json.load(file)
 
         throughput = data.get("Throughput (requests/second)", 0)
@@ -31,35 +22,33 @@ def extract_data(json_file_paths: str) -> (list, list):
 
 
 # plot bar graphs
-def plot_bar_graph(labels, values, graph_title, performance_metric, filename):
-    colors = ['lightcoral', 'wheat', 'darkseagreen', 'powderblue']  # Different colors for configurations
-    plt.figure(figsize=(figure_width, figure_height))
-    plt.bar(labels, values, color=colors[:len(labels)])
+def plot_bar_graph(values, graph_title, performance_metric, filename):
+    colors = ['red', 'cyan', 'lime', 'orange']  # Different colors for configurations
+    plt.figure(figsize=(5, 4))
+    plt.bar(configs, values, color=colors[:len(configs)])
     plt.title(graph_title)
     plt.ylabel(performance_metric)
     plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
-    plt.savefig(filename)
-    plt.show()
+    plt.savefig(f"../../../../results/graphs/{filename}")
 
 
 if __name__ == "__main__":
     # Extract throughput and latency data
-    throughput, median_latency = extract_data(file_paths)
+    throughput, median_latency = extract_data()
 
     # Plot throughput graph
     plot_bar_graph(
-        config_names,
         throughput,
         "Postgres Throughput per Configuration",
         "Throughput (requests/second)",
-        "postgres_throughput_bar_graph.png"
+        "postgres_throughput_bar_graph.pdf"
     )
 
     # Plot median latency graph
     plot_bar_graph(
-        config_names, median_latency,
+        median_latency,
         "Postgres Median Latency per Configuration",
         "Median Latency (microseconds)",
-        "postgres_latency_bar_graph.png"
+        "postgres_latency_bar_graph.pdf"
     )

@@ -160,7 +160,7 @@ def run_everything(system_type: System, benchmark_name: str, nimble_batch_size: 
     # Create resources
     subprocess_execute([f"./launch.sh -b {benchmark_name} -s {system_type} -n {num_vms}"])
 
-    ssh_executor = SSH(f"{benchmark_name}-{system_type}")
+    ssh_executor = SSH(system_type, benchmark_name)
     
     storage_name = "rollbaccinenimble" # Must match storage name in ./launch.sh
     storage_key = ""
