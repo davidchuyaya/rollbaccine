@@ -124,7 +124,7 @@ def mount_point(system_type: System) -> str:
     elif system_type == System.DM:
         return '/dev/mapper/secure' 
     elif system_type == System.REPLICATED:
-        return '/dev/sda'
+        return '/dev/sdb'
     elif system_type == System.ROLLBACCINE:
         return '/dev/mapper/rollbaccine1'
 
