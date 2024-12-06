@@ -25,7 +25,7 @@ def extract_data():
 def plot_bar_graph(values, graph_title, performance_metric, filename):
     colors = ['red', 'cyan', 'lime', 'orange', 'blue', 'purple']  # Different colors for configurations
     patterns = ['/', '\\', '|', '*', 'o', 'x']  # Different patterns for configurations
-    plt.figure(figsize=(3, 3))
+    plt.figure(figsize=(3, 2.5))
     plt.grid(axis='y', linestyle='-', alpha=0.3, zorder=0)
     plt.bar_label(plt.bar(configs, values, color=colors[:len(configs)], hatch=patterns[:len(configs)], width=1.0, zorder=5), values, zorder=10)
     plt.ylabel(performance_metric)

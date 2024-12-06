@@ -1,5 +1,6 @@
 import os
 import json
+from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -65,6 +66,7 @@ def extract_performance_data(results):
     return performance_data
 
 def plot_latency_vs_throughput_per_job(performance_data, output_dir):
+    config_names = ["UNREPLICATED", "DM", "REPLICATED", "ROLLBACCINE"]
     markers = {
         'DM': 'o',
         'UNREPLICATED': '^',
@@ -97,9 +99,9 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
             # Annotate each data point with the number of threads
             for i in range(len(throughputs)):
                 ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,-5), ha='center')
-        ax.set_xlabel('Throughput (thousands of commands per second)')
+        ax.set_xlabel('Throughput (thousands of commands/sec)')
         ax.set_ylabel('Median Latency (ms)')
-        ax.legend()
+        # ax.legend()
         ax.grid(True)
         # log for y axis
         ax.set_yscale('log')
@@ -107,8 +109,17 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
         # Save the figure
         output_file = os.path.join(output_dir, f'{base_job_name}_latency_vs_throughput.pdf')
         plt.savefig(output_file)
-        plt.close()
+        # plt.close()
         print(f"Saved latency vs throughput graph to {output_file}")
+    
+    # Save the legend
+    fig_leg = plt.figure(figsize=(len(markers)*2, 0.5))
+    ax_leg = fig_leg.add_subplot(111)
+    # add the legend from the previous axes
+    ax_leg.legend(*ax.get_legend_handles_labels(), loc='center', ncol=len(config_names))
+    # hide the axes frame and the x/y labels
+    ax_leg.axis('off')
+    fig_leg.savefig('../../../../results/graphs/fio_legend.pdf')
 
 def main():
     # Directory where the FIO JSON results are stored
