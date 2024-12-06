@@ -15,20 +15,23 @@ def extract_data():
         throughput = data.get("Throughput (requests/second)", 0)
         median_latency = data.get("Latency Distribution", {}).get("Median Latency (microseconds)", 0)
 
-        throughputs.append(throughput)
-        median_latencies.append(median_latency)
+        throughputs.append(int(throughput))
+        median_latencies.append(int(median_latency))
 
     return throughputs, median_latencies
 
 
 # plot bar graphs
 def plot_bar_graph(values, graph_title, performance_metric, filename):
-    colors = ['red', 'cyan', 'lime', 'orange']  # Different colors for configurations
-    plt.figure(figsize=(5, 4))
-    plt.bar(configs, values, color=colors[:len(configs)])
-    plt.title(graph_title)
+    colors = ['red', 'cyan', 'lime', 'orange', 'blue', 'purple']  # Different colors for configurations
+    patterns = ['/', '\\', '|', '*', 'o', 'x']  # Different patterns for configurations
+    plt.figure(figsize=(3, 3))
+    plt.grid(axis='y', linestyle='-', alpha=0.3, zorder=0)
+    plt.bar_label(plt.bar(configs, values, color=colors[:len(configs)], hatch=patterns[:len(configs)], width=1.0, zorder=5), values, zorder=10)
     plt.ylabel(performance_metric)
-    plt.xticks(rotation=45, ha='right')
+    plt.tick_params(axis='both', left=False, bottom=False)
+    plt.xticks(['' for _ in range(len(configs))])
+    plt.box(False)
     plt.tight_layout()
     plt.savefig(f"../../../../results/graphs/{filename}")
 
@@ -41,7 +44,7 @@ if __name__ == "__main__":
     plot_bar_graph(
         throughput,
         "Postgres Throughput per Configuration",
-        "Throughput (requests/second)",
+        "Throughput (requests/sec)",
         "postgres_throughput_bar_graph.pdf"
     )
 
@@ -49,6 +52,6 @@ if __name__ == "__main__":
     plot_bar_graph(
         median_latency,
         "Postgres Median Latency per Configuration",
-        "Median Latency (microseconds)",
+        "Median Latency (us)",
         "postgres_latency_bar_graph.pdf"
     )
