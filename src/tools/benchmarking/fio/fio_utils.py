@@ -44,7 +44,7 @@ class FioBenchmark(Benchmark):
         io_directions = ['write', 'read']
         sequentialities = ['', 'rand'] # Empty string means sequential
         bufferings = [0, 1]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
-        persistences = [0, 1]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
+        persistences = [0, 1]  # writefua=1 (Synchronous) or writefua=0 (Asynchronous)
         num_jobs_list = [32, 16, 8, 4, 1]
 
         # Replicated disk saturates very quickly, don't run too many jobs
@@ -88,7 +88,7 @@ class FioBenchmark(Benchmark):
             job_name = f"{system_type}_{rw}_direct{direct}_fsync{fsync}_threads_{num_jobs}_{str(uuid.uuid4())[:4]}"
             output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
 
-            fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --fsync={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 | tee {output_file}'
+            fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --writefua={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 | tee {output_file}'
             fio_commands.append(fio_command)
         return fio_commands
     
