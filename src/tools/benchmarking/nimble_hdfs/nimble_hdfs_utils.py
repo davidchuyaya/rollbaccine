@@ -111,7 +111,7 @@ class NimbleHDFSBenchmark(Benchmark):
         
         return True
 
-    def run(self, system_type: System, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str):
         THREADS = 16
         # Use fewer files and directories since Nimble is very slow
         if self.batch_size == 1:
@@ -142,4 +142,4 @@ class NimbleHDFSBenchmark(Benchmark):
         subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
 
 if __name__ == "__main__":
-    NimbleHDFSBenchmark(int(sys.argv[3])).run(System[sys.argv[1]], sys.argv[2])
+    NimbleHDFSBenchmark(int(sys.argv[4])).run(System[sys.argv[1]], sys.argv[2], sys.argv[3])

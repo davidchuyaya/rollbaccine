@@ -18,8 +18,9 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     return path != ''
 
 class SSH():
-    def __init__(self, job_name: str):
-        self.output_file = job_name + "-stdout.txt"
+    def __init__(self, system_type: System, benchmark_name: str):
+        self.output_file = f"{benchmark_name}-{system_type}-stdout.txt"
+        self.system_type = system_type
 
     def clear_output_file(self,):
         open(self.output_file, 'w').close()
@@ -51,6 +52,28 @@ class SSH():
             print(f"{COLOR_ERROR}{error}{COLOR_END}")
             return False
         return True
+
+    def mount_point(self, ssh: SSHClient) -> str:
+        """
+        The file that represents the system configuration.
+        """
+        if self.system_type == System.UNREPLICATED:
+            return '/dev/sdb1'
+        elif self.system_type == System.DM:
+            return '/dev/mapper/secure' 
+        elif self.system_type == System.ROLLBACCINE:
+            return '/dev/mapper/rollbaccine1'
+        elif self.system_type == System.REPLICATED:
+            # Annoyingly, for REPLICATED, the managed disk may be /dev/sda or /dev/sdb. We need to find out
+            if is_installed(ssh, "test -b /dev/sda1 && echo 1"):
+                # If /dev/sda1 exists, then that's the OS, and the disk is actually in /dev/sdb
+                return '/dev/sdb'
+            else:
+                return '/dev/sda'
+        else:
+            print(f"Unknown system type {self.system_type}")
+            return None
+        
 
 def ssh_execute_background(ssh: SSHClient, commands: List[str]):
     """
@@ -114,19 +137,6 @@ def download_dir(ssh: SSHClient, remote_dir: str, local_dir: str):
         local_path = f"{local_dir}/{filename}"
         sftp.get(remote_path, local_path)
     sftp.close()
-
-def mount_point(system_type: System) -> str:
-    """
-    The file that represents the system configuration.
-    """
-    if system_type == System.UNREPLICATED:
-        return '/dev/sdb1'
-    elif system_type == System.DM:
-        return '/dev/mapper/secure' 
-    elif system_type == System.REPLICATED:
-        return '/dev/sdb'
-    elif system_type == System.ROLLBACCINE:
-        return '/dev/mapper/rollbaccine1'
 
 def mount_commands(file_system: str, mount_path: str, new_dir: str) -> List[str]:
     # Flag to force mounting file system is -F for ext4 and -f for xfs

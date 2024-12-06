@@ -84,9 +84,9 @@ def get_backup_commands(primary_private_ip):
     ]
     return commands
 
-def install_ext4(ssh_executor: SSH, ssh, system_type: System):
+def install_ext4(ssh_executor: SSH, ssh: SSHClient, mount_point: str):
     print(f"Installing ext4 at {MOUNT_DIR}")
-    ssh_executor.exec(ssh, mount_ext4_commands(mount_point(system_type), MOUNT_DIR))
+    ssh_executor.exec(ssh, mount_ext4_commands(mount_point, MOUNT_DIR))
     print(f"Creating {MOUNT_DIR} and giving the user permissions")
     ssh_executor.exec(ssh, [
         f"sudo mkdir -p {DATA_DIR}",
@@ -96,6 +96,7 @@ def install_ext4(ssh_executor: SSH, ssh, system_type: System):
 def setup_main_nodes(ssh_executor: SSH, system_type: System, connections: List[SSHClient], private_ips: List[str]):
     for i in range(len(connections)):
         ssh = connections[i]
+        mount_point = ssh_executor.mount_point(ssh)
 
         if not is_installed(ssh, f"test -d {DATA_DIR} && echo 1"):
             print(f"Unmounting {DATA_DIR} then mounting with what we want on VM {i}")
@@ -112,7 +113,7 @@ def setup_main_nodes(ssh_executor: SSH, system_type: System, connections: List[S
                     "sudo cryptsetup open --perf-no_read_workqueue --perf-no_write_workqueue --type luks /dev/sdb1 secure --key-file emptykey.txt",
                 ])
             elif system_type == System.REPLICATED:
-                ssh_executor.exec(ssh, ["sudo umount /dev/sda"])
+                ssh_executor.exec(ssh, [f"sudo umount {mount_point}"])
             elif system_type == System.ROLLBACCINE:
                 install_rollbaccine(ssh_executor, ssh)
                 # Setup primary and backup
@@ -124,12 +125,13 @@ def setup_main_nodes(ssh_executor: SSH, system_type: System, connections: List[S
             # If this isn't rollbaccine, then we're immediately to mount the file system.
             # If this is rollbaccine, we'll need to set up the backup first (so they can sync).
             if not system_type == System.ROLLBACCINE:
-                install_ext4(ssh_executor, ssh, system_type)
+                install_ext4(ssh_executor, ssh, mount_point)
 
     if system_type == System.ROLLBACCINE:
         # Wait for the backup to finish setting up
         sleep(10)
-        install_ext4(ssh_executor, connections[0], system_type)
+        install_ext4(ssh_executor, connections[0], mount_point)
+    return mount_point
                 
 
 def ssh_vm_json(vm_json) -> Tuple[List[SSHClient], List[str]]:
@@ -178,7 +180,14 @@ def run_everything(system_type: System, benchmark_name: str, nimble_batch_size: 
     with open(f'{benchmark_name}-{system_type}-vm1.json') as f:
         vm_json = json.load(f)
         connections, private_ips = ssh_vm_json(vm_json)
-        setup_main_nodes(ssh_executor, system_type, connections, private_ips)
+        mount_point = setup_main_nodes(ssh_executor, system_type, connections, private_ips)
+
+        if system_type == System.ROLLBACCINE:
+            # Disconnect from the backup
+            connections[-1].close()
+            connections = connections[:-1]
+            private_ips = private_ips[:-1]
+
     if os.path.isfile(f'{benchmark_name}-{system_type}-vm2.json'):
         with open(f'{benchmark_name}-{system_type}-vm2.json') as f:
             vm_json = json.load(f)
@@ -220,7 +229,7 @@ def run_everything(system_type: System, benchmark_name: str, nimble_batch_size: 
         print("Running benchmark")
         success = ssh_executor.exec(ssh, [
             f"cd rollbaccine/src/tools/benchmarking",
-            f"python3 {benchmark.filename()} {system_type} {OUTPUT_DIR} {nimble_batch_size}"
+            f"python3 {benchmark.filename()} {system_type} {mount_point} {OUTPUT_DIR} {nimble_batch_size}"
         ])
         if not success:
             return False

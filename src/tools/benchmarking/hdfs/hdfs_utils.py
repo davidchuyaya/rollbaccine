@@ -48,7 +48,7 @@ class HDFSBenchmark(Benchmark):
             print(f"Finished installing HDFS")
         return True
 
-    def run(self, system_type: System, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str):
         THREADS = 16
         FILES = 500000
         DIRS = 500000
@@ -74,4 +74,4 @@ class HDFSBenchmark(Benchmark):
         subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
 
 if __name__ == "__main__":
-    HDFSBenchmark().run(System[sys.argv[1]], sys.argv[2])
+    HDFSBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])

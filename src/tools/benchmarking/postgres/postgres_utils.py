@@ -73,7 +73,7 @@ class PostgresBenchmark(Benchmark):
                 return False
         return True
 
-    def run(self, system_type: System, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str):
         print("Running TPCC, may take a few minutes")
         success = subprocess_execute([
             "cd ~/benchbase-2023/target/benchbase-postgres",
@@ -93,4 +93,4 @@ class PostgresBenchmark(Benchmark):
         ])
 
 if __name__ == "__main__":
-    PostgresBenchmark().run(System[sys.argv[1]], sys.argv[2])
+    PostgresBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])

@@ -44,12 +44,12 @@ class FileBenchmark(Benchmark):
                 return False
         return True
 
-    def run(self, system_type: System, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str):
         # See issue: https://github.com/filebench/filebench/issues/112
         subprocess_execute(["echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"])
 
         for file_system in ['ext4', 'xfs']:
-            unmount_then_mount = [f"sudo umount -q {MOUNT_DIR}"] + mount_commands(file_system, mount_point(system_type), MOUNT_DIR)
+            unmount_then_mount = [f"sudo umount -q {MOUNT_DIR}"] + mount_commands(file_system, mount_point, MOUNT_DIR)
 
             print(f"Unmounting then remounting {file_system}")
             subprocess_execute(unmount_then_mount, silent=True)
@@ -64,4 +64,4 @@ class FileBenchmark(Benchmark):
             subprocess_execute([rf"sudo filebench -f /home/{getuser()}/rollbaccine/src/tools/benchmarking/filebench/webserver.f 2>&1 | tee {output_dir}/{system_type}_{file_system}_webserver.txt"])
 
 if __name__ == "__main__":
-    FileBenchmark().run(System[sys.argv[1]], sys.argv[2])
+    FileBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])

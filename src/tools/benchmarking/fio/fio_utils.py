@@ -37,14 +37,14 @@ class FioBenchmark(Benchmark):
             return True
         return False
 
-    def build_fio_commands(self, system_type: System, output_dir: str):
-        filename = mount_point(system_type)
+    def build_fio_commands(self, system_type: System, mount_point: str, output_dir: str):
+        filename = mount_point
 
         # Possible values for each parameter. Most intense options first so we see errors early
         io_directions = ['write', 'read']
         sequentialities = ['', 'rand'] # Empty string means sequential
         bufferings = [0, 1]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
-        persistences = [0, 1]  # writefua=1 (Synchronous) or writefua=0 (Asynchronous)
+        persistences = [0, 1]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
         num_jobs_list = [32, 16, 8, 4, 1]
 
         # Replicated disk saturates very quickly, don't run too many jobs
@@ -66,7 +66,6 @@ class FioBenchmark(Benchmark):
             all_combinations.insert(0, ('write', '', 1, 1, 1024))
         if system_type == System.ROLLBACCINE:
             all_combinations.insert(0, ('write', '', 0, 0, 256))
-            all_combinations.insert(0, ('write', '', 0, 1, 1024))
             all_combinations.insert(0, ('write', '', 1, 1, 256))
             all_combinations.insert(0, ('write', '', 1, 1, 1024))
             all_combinations.insert(0, ('write', 'rand', 0, 1, 128))
@@ -88,7 +87,7 @@ class FioBenchmark(Benchmark):
             job_name = f"{system_type}_{rw}_direct{direct}_fsync{fsync}_threads_{num_jobs}_{str(uuid.uuid4())[:4]}"
             output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
 
-            fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --writefua={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 | tee {output_file}'
+            fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --fsync={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 | tee {output_file}'
             fio_commands.append(fio_command)
         return fio_commands
     
@@ -113,13 +112,13 @@ class FioBenchmark(Benchmark):
             ])
         return True
 
-    def run(self, system_type: System, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str):
         success = subprocess_execute([f"sudo umount {MOUNT_DIR}"])
         if not success:
             print("Failed to unmount the mount point")
             return
         
-        fio_commands = self.build_fio_commands(system_type, output_dir)
+        fio_commands = self.build_fio_commands(system_type, mount_point, output_dir)
         total_benchmarks = len(fio_commands)
         current_benchmark = 0
         print(f"Running {total_benchmarks} FIO benchmarks locally")
@@ -142,4 +141,4 @@ class FioBenchmark(Benchmark):
             print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time) / 60:.2f} minutes, completed {current_benchmark} of {total_benchmarks} benchmarks***")
 
 if __name__ == "__main__":
-    FioBenchmark().run(System[sys.argv[1]], sys.argv[2])
+    FioBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
