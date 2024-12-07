@@ -28,7 +28,7 @@ for benchmark in benchmarks:
     latency_df = pd.DataFrame(latencies, index=file_systems)
 
     # Plot throughput and latency comparisons
-    for (df, axis, name) in [(throughput_df, "Throughput (ops/sec)", "throughput"), (latency_df, "Median Latency (us)", "latency")]:
+    for (df, axis, name) in [(throughput_df, "Throughput (ops/sec)", "throughput"), (latency_df, "Average Latency (us)", "latency")]:
         plt.figure(figsize=(5, 3))
         bar_width = 1.0 / (len(configs) + 1)  # Width of each bar
         x = range(len(file_systems))

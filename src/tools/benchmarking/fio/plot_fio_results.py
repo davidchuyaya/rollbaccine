@@ -37,6 +37,9 @@ def read_fio_json_results(results_dir):
                     results.append((base_job_name, category, thread_count, job))
     return results
 
+def get_mean(data):
+    return data.get('mean', 0)
+
 def extract_performance_data(results):
     performance_data = {}
     for base_job_name, category, thread_count, job_data in results:
@@ -44,15 +47,15 @@ def extract_performance_data(results):
         fsync_option = job_data['job options'].get('fsync', '0')
         if 'read' in rw_option:
             iops = job_data['read']['iops']
-            median_latency_ns = job_data['read'].get('clat_ns', {}).get('percentile', {}).get('50.000000')
+            latency = get_mean(job_data['read'].get('clat_ns', {}))
         else:
             iops = job_data['write']['iops']
-            median_latency_ns = job_data['write'].get('clat_ns', {}).get('percentile', {}).get('50.000000')
+            latency = get_mean(job_data['write'].get('clat_ns', {}))
             if fsync_option == '1':
-                median_latency_ns += job_data['sync'].get('lat_ns', {}).get('percentile', {}).get('50.000000')
+                latency += get_mean(job_data['sync'].get('lat_ns', {}))
 
         # Convert latency from nanoseconds to milliseconds
-        median_latency_ms = median_latency_ns / 1e6  # ns to ms
+        latency_ms = latency / 1e6  # ns to ms
         throughput_k = iops / 1000  # Convert to thousands
 
         if base_job_name not in performance_data:
@@ -61,7 +64,7 @@ def extract_performance_data(results):
             performance_data[base_job_name][category] = {}
         performance_data[base_job_name][category][thread_count] = {
             'throughput_k': throughput_k,
-            'median_lat_ms': median_latency_ms
+            'lat_ms': latency_ms
         }
     return performance_data
 
@@ -89,10 +92,8 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
             thread_counts = []
             for thread_count in sorted(performance_data[base_job_name][category].keys()):
                 metrics = performance_data[base_job_name][category][thread_count]
-                throughput = metrics['throughput_k']
-                latency = metrics['median_lat_ms']
-                throughputs.append(throughput)
-                latencies.append(latency)
+                throughputs.append(metrics['throughput_k'])
+                latencies.append(metrics['lat_ms'])
                 thread_counts.append(thread_count)
             label = f"{category}"
             ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=3, label=label)
@@ -100,7 +101,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
             for i in range(len(throughputs)):
                 ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,-5), ha='center')
         ax.set_xlabel('Throughput (thousands of commands/sec)')
-        ax.set_ylabel('Median Latency (ms)')
+        ax.set_ylabel('Average Latency (ms)')
         # ax.legend()
         ax.grid(True)
         # log for y axis

@@ -13,7 +13,7 @@ def extract_data():
             data = json.load(file)
 
         throughput = data.get("Throughput (requests/second)", 0)
-        median_latency = data.get("Latency Distribution", {}).get("Median Latency (microseconds)", 0)
+        median_latency = data.get("Latency Distribution", {}).get("Average Latency (microseconds)", 0)
 
         throughputs.append(int(throughput))
         median_latencies.append(int(median_latency))
@@ -52,6 +52,6 @@ if __name__ == "__main__":
     plot_bar_graph(
         median_latency,
         "Postgres Median Latency per Configuration",
-        "Median Latency (us)",
+        "Average Latency (us)",
         "postgres_latency_bar_graph.pdf"
     )

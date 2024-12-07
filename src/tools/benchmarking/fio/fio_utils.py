@@ -22,7 +22,7 @@ class FioBenchmark(Benchmark):
                 if sequentiality == 'rand':
                     if direct == 0:
                         if fsync == 1:
-                            if num_jobs > 8:
+                            if num_jobs > 4:
                                 return True
                     else: # direct = 1
                         if num_jobs > 4:
@@ -67,16 +67,15 @@ class FioBenchmark(Benchmark):
         if system_type == System.ROLLBACCINE:
             all_combinations.insert(0, ('write', '', 0, 0, 256))
             all_combinations.insert(0, ('write', '', 1, 1, 256))
-            all_combinations.insert(0, ('write', '', 1, 1, 1024))
             all_combinations.insert(0, ('write', 'rand', 0, 1, 128))
             all_combinations.insert(0, ('write', 'rand', 1, 1, 256))
-            all_combinations.insert(0, ('write', 'rand', 1, 1, 1024))
             all_combinations.insert(0, ('read', '', 1, 0, 64))
             all_combinations.insert(0, ('read', 'rand', 0, 0, 64))
             all_combinations.insert(0, ('read', 'rand', 1, 0, 64))
+        if system_type == System.UNREPLICATED or system_type == System.ROLLBACCINE:
+            all_combinations.insert(0, ('write', '', 0, 0, 64))
+            all_combinations.insert(0, ('write', '', 0, 0, 128))
         all_combinations.insert(0, ('read', '', 0, 0, 6))
-        all_combinations.insert(0, ('write', '', 0, 0, 64))
-        all_combinations.insert(0, ('write', '', 0, 0, 128))
 
         for io_direction, sequentiality, direct, fsync, num_jobs in all_combinations:
             # Don't execute certain commands
