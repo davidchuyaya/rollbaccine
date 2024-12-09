@@ -215,7 +215,8 @@ struct rollbaccine_device {
 
     // Counters for tracking memory usage
 #ifdef MEMORY_TRACKING
-    // These counters will tell us if there's a memory leak
+    atomic_t num_fsyncs;
+    atomic_t num_total_ops;
     atomic_t num_bio_pages_not_freed;
     atomic_t num_bio_data_not_freed;
     atomic_t num_shallow_clones_not_freed;
@@ -1547,6 +1548,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         dm_accept_partial_bio(bio, BIO_MAX_VECS * SECTORS_PER_PAGE);
     }
 
+#ifdef MEMORY_TRACKING
+    atomic_inc(&device->num_total_ops);
+#endif
+
     // Copy bio if it's a write. Permit non-leaders to read as well for ACE testing; can turn off in production.
     if (device->is_leader || bio_data_dir(bio) == READ) {
         is_cloned = true;
@@ -1573,6 +1578,9 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 if (bio_data->is_fsync) {
                     bio_fsync_data = kmalloc(sizeof(struct bio_fsync_list), GFP_KERNEL);
                     bio_fsync_data->bio_src = bio;
+#ifdef MEMORY_TRACKING
+                    atomic_inc(&device->num_fsyncs);
+#endif
                 }
 
                 // Create the network clone
@@ -2887,6 +2895,8 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num pages requested during recovery: %d\n", atomic_read(&device->num_pages_requested_during_recovery));
     DMEMIT("Num pages received during recovery: %d\n", atomic_read(&device->num_pages_received_during_recovery));
     DMEMIT("Hashes received during recovery: %d, total sectors: %llu\n", device->num_hashes_received_during_recovery, device->num_sectors);
+    DMEMIT("Num total operations: %d\n", atomic_read(&device->num_total_ops));
+    DMEMIT("Num fsyncs: %d\n", atomic_read(&device->num_fsyncs));
     DMEMIT("Num bio pages not freed: %d\n", atomic_read(&device->num_bio_pages_not_freed));
     DMEMIT("Num bio_data not freed: %d\n", atomic_read(&device->num_bio_data_not_freed));
     DMEMIT("Num deep clones not freed: %d\n", atomic_read(&device->num_deep_clones_not_freed));
