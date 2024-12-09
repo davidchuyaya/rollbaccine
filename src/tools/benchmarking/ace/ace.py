@@ -20,20 +20,20 @@ def run():
     BENCHMARK_NAME = "fio"
     SYSTEM = System.UNREPLICATED
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system, because we just want a single VM.")
-    subprocess_execute([f"./launch.sh -b fio -s {SYSTEM} -n 1"])
-    ssh_executor = SSH("ace")
+    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 1"])
+    ssh_executor = SSH(SYSTEM, BENCHMARK_NAME)
 
     print("Connecting to VMs and setting up main VMs")
     print(f"\033[92mPlease run `tail -f {ssh_executor.output_file}` to see the execution log on the servers.\033[0m")
     ssh_executor.clear_output_file()
     
-    with open('vm1.json') as f:
+    with open(f'{BENCHMARK_NAME}-{SYSTEM}-vm1.json') as f:
         vm_json = json.load(f)
         connections, private_ips = ssh_vm_json(vm_json)
         ssh = connections[0]
     
     print("Installing rollbaccine")
-    install_rollbaccine(ssh)
+    install_rollbaccine(ssh_executor, ssh)
 
     print("Setting up rollbaccine primary and backup each over a 10GB ramdisk (so it can run faster)")
     success = ssh_executor.exec(ssh, [

@@ -208,40 +208,36 @@ def run_everything(system_type: System, benchmark_name: str, nimble_batch_size: 
             ssh.close()
     
     # Copy the repo to the VM that runs the benchmark, install python, and run the benchmark
-    try:
-        ssh = connections[benchmark.benchmarking_vm()]
-        print("Downloading repo on the benchmarking VM for the python scripts")
-        download_rollbaccine(ssh_executor, ssh)
+    ssh = connections[benchmark.benchmarking_vm()]
+    print("Downloading repo on the benchmarking VM for the python scripts")
+    download_rollbaccine(ssh_executor, ssh)
 
-        # Install python and the requirements, create output folder
-        print("Install python for benchmarking")
-        OUTPUT_DIR = f"/home/{getuser()}/results"
-        success = ssh_executor.exec(ssh, [
-            "sudo apt-get update",
-            "sudo apt-get install -y python3 python3-pip",
-            f"cd rollbaccine/src/tools/benchmarking",
-            f"pip3 install --break-system-packages -r cloud-requirements.txt",
-            f"mkdir -p {OUTPUT_DIR}"
-        ])
-        if not success:
-            return False
-        
-        print("Running benchmark")
-        success = ssh_executor.exec(ssh, [
-            f"cd rollbaccine/src/tools/benchmarking",
-            f"python3 {benchmark.filename()} {system_type} {mount_point} {OUTPUT_DIR} {nimble_batch_size}"
-        ])
-        if not success:
-            return False
-
-        print("Downloading results")
-        download_dir(ssh, OUTPUT_DIR, ".")
-
-        ssh.close()
-        print("Benchmark completed, deleting resources")
-    except Exception as e:
-        print(f"Failed to run benchmark: {e}")
+    # Install python and the requirements, create output folder
+    print("Install python for benchmarking")
+    OUTPUT_DIR = f"/home/{getuser()}/results"
+    success = ssh_executor.exec(ssh, [
+        "sudo apt-get update",
+        "sudo apt-get install -y python3 python3-pip",
+        f"cd rollbaccine/src/tools/benchmarking",
+        f"pip3 install --break-system-packages -r cloud-requirements.txt",
+        f"mkdir -p {OUTPUT_DIR}"
+    ])
+    if not success:
         return False
+    
+    print("Running benchmark")
+    success = ssh_executor.exec(ssh, [
+        f"cd rollbaccine/src/tools/benchmarking",
+        f"python3 {benchmark.filename()} {system_type} {mount_point} {OUTPUT_DIR} {nimble_batch_size}"
+    ])
+    if not success:
+        return False
+
+    print("Downloading results")
+    download_dir(ssh, OUTPUT_DIR, ".")
+
+    ssh.close()
+    print("Benchmark completed, deleting resources")
 
     subprocess_execute([f"./cleanup.sh -b {benchmark_name} -s {system_type}"])
 

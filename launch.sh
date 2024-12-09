@@ -62,6 +62,8 @@ fi
 launch_vm () {
     if [ $1 -gt 1 ]; then
         COUNT='--count '$1
+    else # Reset COUNT in case some other invocation set it
+        COUNT=''
     fi
 
     echo "Launching $1 $2 VMs"

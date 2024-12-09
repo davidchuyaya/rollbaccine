@@ -29,10 +29,12 @@ python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE fio
 python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE filebench
 python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE postgres
 python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE hdfs
+python3 src/tools/benchmarking/recovery/recovery.py True
 python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs
+python3 src/tools/benchmarking/recovery/recovery.py False # Don't immediately run after the previous recovery, since the resource group names are the same, and shutting down a group takes time.
 ```
 
-Each experiment, upon completion, will download files to the root directory. Move the files to the `results` folder under the right benchmark name (`nimble_hdfs` is put in `hdfs`), then run the following command to generate the graphs:
+Each experiment, upon completion, will download files to the root directory (except for `recovery`, which directly puts the files in `results/recovery`). Move the files to the `results` folder under the right benchmark name (`nimble_hdfs` is put in `hdfs`), then run the following command to generate the graphs:
 ```bash
 cd src/tools/benchmarking/fio
 python3 plot_fio_results.py
@@ -42,6 +44,8 @@ cd ../postgres
 python3 postgres_benchmark_graph.py
 cd ../filebench
 python3 filebench_benchmark_graph.py
+cd ../recovery
+python3 recovery_benchmark_graph.py
 ```
 Graphs will be generated in `results/graphs`.
 
