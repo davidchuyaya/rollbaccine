@@ -267,7 +267,9 @@ struct bio_data {
     struct rb_node tree_node;           // So this bio can be inserted into a tree
     struct list_head pending_list;      // So this bio can be inserted into pending_ops
     unsigned char *checksum_and_iv;     // Checksums and IVs for each sector or page, if this is a write
+    // Reconfiguration
     struct multisocket *requester;      // The node that requested this block of disk from this node (for reconfiguration)
+    struct page *reconfig_read_page;
 };
 
 // For keeping track of pending fsyncs
@@ -1095,8 +1097,7 @@ void fetch_disk_end_io_task(struct work_struct *work) {
     struct metadata_msg metadata;
     struct kvec vec;
     struct socket_data *socket_data;
-    struct bio_vec bvec, chunked_bvec;
-    struct bvec_iter iter;
+    struct bio_vec bvec;
     int socket_id;
     bool success;
 
@@ -1127,12 +1128,10 @@ void fetch_disk_end_io_task(struct work_struct *work) {
         goto unlock_and_free;
 
     // 2. Send the actual disk content
-    bio_for_each_segment(bvec, bio_data->bio_src, iter) {
-        bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
-        success = send_page(chunked_bvec, socket_data->sock);
-        if (!success)
-            goto unlock_and_free;
-    }
+    bvec_set_page(&bvec, bio_data->reconfig_read_page, PAGE_SIZE, 0);
+    success = send_page(bvec, socket_data->sock);
+    if (!success)
+        goto unlock_and_free;
 
 unlock_and_free:
     mutex_unlock(&socket_data->socket_mutex);
@@ -1151,13 +1150,15 @@ void fetch_disk_end_io(struct bio *bio) {
 void handle_disk_req(struct rollbaccine_device *device, struct multisocket *multisocket, sector_t sector) {
     struct bio_data *bio_data;
     struct bio *bio;
+    struct page *page;
 
     // Send a bio to disk to read the sector that's requested
     // printk(KERN_INFO "Reading %llu from disk per request", sector);
 
     bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
     bio->bi_iter.bi_sector = sector;
-    __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
+    page = page_cache_alloc(device);
+    __bio_add_page(bio, page, PAGE_SIZE, 0);
 #ifdef MEMORY_TRACKING
     atomic_inc(&device->num_bio_pages_not_freed);
 #endif
@@ -1168,6 +1169,7 @@ void handle_disk_req(struct rollbaccine_device *device, struct multisocket *mult
     bio_data->start_sector = sector;
     bio_data->end_sector = sector + SECTORS_PER_PAGE;
     bio_data->requester = multisocket;
+    bio_data->reconfig_read_page = page;
     bio->bi_private = bio_data;
 
     bio_data->shallow_clone = shallow_bio_clone(device, bio);
@@ -1694,7 +1696,7 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, cha
     msg_index_matches = socket_data->waiting_for_msg_index == msg_index;
 
     if (!hash_matches || !sender_matches || !thread_matches || !i_am_recipient || !msg_index_matches) {
-        printk(KERN_ERR "Received incorrect message, expected hash: %s, hash: %s, expected sender: %llu, sender: %llu, expected thread: %llu, thread: %llu, expected recipient: %llu, I am: %llu, expected msg index: %llu, msg index: %llu", expected_hash, calculated_hash, socket_data->sender_id, sender_id, socket_data->sender_socket_id, sender_socket_id, intended_recipient_id, my_id, socket_data->waiting_for_msg_index, msg_index);
+        printk(KERN_ERR "Received incorrect message, expected sender: %llu, sender: %llu, expected thread: %llu, thread: %llu, expected recipient: %llu, I am: %llu, expected msg index: %llu, msg index: %llu", socket_data->sender_id, sender_id, socket_data->sender_socket_id, sender_socket_id, intended_recipient_id, my_id, socket_data->waiting_for_msg_index, msg_index);
         return false;
     }
     // Increment the message index
