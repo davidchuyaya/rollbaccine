@@ -33,7 +33,7 @@ def plot_bar_graph(values, graph_title, performance_metric, filename):
     plt.xticks(['' for _ in range(len(configs))])
     plt.box(False)
     plt.tight_layout()
-    plt.savefig(f"../../../../results/graphs/{filename}")
+    plt.savefig(f"../../../../results/graphs/{filename}", bbox_inches='tight', pad_inches=0)
 
 
 if __name__ == "__main__":

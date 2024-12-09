@@ -54,5 +54,5 @@ for benchmark in benchmarks:
         plt.tick_params(axis='y', left=False)
         plt.box(False)
         plt.tight_layout()
-        plt.savefig(f"../../../../results/graphs/filebench_{benchmark}_{name}_bar_graph.pdf")
+        plt.savefig(f"../../../../results/graphs/filebench_{benchmark}_{name}_bar_graph.pdf", bbox_inches='tight', pad_inches=0)
         plt.close()

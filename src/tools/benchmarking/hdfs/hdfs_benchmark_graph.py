@@ -56,7 +56,7 @@ plt.xticks([pos + bar_width * (len(config_names)-1) / 2 for pos in x], operation
 plt.tick_params(axis='y', left=False)
 plt.box(False)
 plt.tight_layout()
-plt.savefig("../../../../results/graphs/hdfs_throughput_comparison.pdf")
+plt.savefig("../../../../results/graphs/hdfs_throughput_comparison.pdf", bbox_inches='tight', pad_inches=0)
 plt.close()
 
 # Save the legend

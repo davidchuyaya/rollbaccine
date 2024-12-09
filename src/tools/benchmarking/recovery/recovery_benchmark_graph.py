@@ -17,6 +17,7 @@ def extract_data(filename: str):
     hash_receive_start = 0
     hash_receive_end = 0
     disk_scan_end = 0
+    disk_pages_requested = 0
     mode = Mode.NORMAL
 
     start_time = 0
@@ -50,6 +51,9 @@ def extract_data(filename: str):
             elif "ballot 3, seen_ballot: 3" in line and disk_scan_end == 0:
                 disk_scan_end = curr_time
                 mode = Mode.NORMAL
+            elif "Num pages requested during recovery" in line:
+                disk_pages_requested = int(line.split("Num pages requested during recovery: ")[1])
+    print(f"{filename} VM physical recovery time: {hash_receive_start - crash_start}, hash receive time: {hash_receive_end - hash_receive_start}, disk scan time: {disk_scan_end - hash_receive_end}, disk pages requested: {disk_pages_requested}")
 
     return times, throughputs, crash_start, hash_receive_start, hash_receive_end, disk_scan_end
 
@@ -70,7 +74,7 @@ def plot_time_series(filename, times, throughputs, crash_start, hash_receive_sta
     plt.text(disk_scan_end + 10, 0.99, 'Disk scanned', rotation=90, ha='left', va='top', transform=ax.get_xaxis_transform())
     plt.box(False)
     plt.tight_layout()
-    plt.savefig(f"../../../../results/graphs/{filename}")
+    plt.savefig(f"../../../../results/graphs/{filename}", bbox_inches='tight', pad_inches=0)
 
 
 if __name__ == "__main__":

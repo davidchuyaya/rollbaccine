@@ -109,7 +109,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
         plt.tight_layout()
         # Save the figure
         output_file = os.path.join(output_dir, f'{base_job_name}_latency_vs_throughput.pdf')
-        plt.savefig(output_file)
+        plt.savefig(output_file, bbox_inches='tight', pad_inches=0)
         # plt.close()
         print(f"Saved latency vs throughput graph to {output_file}")
     
