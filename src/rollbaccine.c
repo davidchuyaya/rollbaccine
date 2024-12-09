@@ -440,7 +440,7 @@ bool send_msg(struct kvec vec, struct socket *sock) {
     while (vec.iov_len > 0) {
         sent = kernel_sendmsg(sock, &msg_header, &vec, 1, vec.iov_len);
         if (sent <= 0) {
-            printk(KERN_ERR "Error sending message, aborting");
+            printk_ratelimited(KERN_ERR "Error sending message, aborting");
             return false;
         } else {
             vec.iov_base += sent;
@@ -462,7 +462,7 @@ bool receive_msg(struct kvec vec, struct socket *sock) {
 
     received = kernel_recvmsg(sock, &msg_header, &vec, vec.iov_len, vec.iov_len, msg_header.msg_flags);
     if (received <= 0) {
-        printk(KERN_ERR "Error receiving message, aborting");
+        printk_ratelimited(KERN_ERR "Error receiving message, aborting");
         return false;
     }
     return true;
@@ -483,7 +483,7 @@ bool send_page(struct bio_vec bvec, struct socket *sock) {
 
         sent = sock_sendmsg(sock, &msg_header);
         if (sent <= 0) {
-            printk(KERN_ERR "Error broadcasting pages");
+            printk_ratelimited(KERN_ERR "Error broadcasting pages");
             return false;
         } else {
             bvec.bv_offset += sent;
@@ -1138,6 +1138,7 @@ unlock_and_free:
     mutex_unlock(&socket_data->socket_mutex);
     up_read(&device->connected_sockets_sem);
 
+    bio_put(bio_data->shallow_clone);
     free_pages_end_io(bio_data->bio_src);
 }
 
@@ -1156,7 +1157,6 @@ void handle_disk_req(struct rollbaccine_device *device, struct multisocket *mult
 
     bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
     bio->bi_iter.bi_sector = sector;
-    bio->bi_end_io = fetch_disk_end_io;
     __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
 #ifdef MEMORY_TRACKING
     atomic_inc(&device->num_bio_pages_not_freed);
@@ -1170,7 +1170,11 @@ void handle_disk_req(struct rollbaccine_device *device, struct multisocket *mult
     bio_data->requester = multisocket;
     bio->bi_private = bio_data;
 
-    submit_bio_noacct(bio);
+    bio_data->shallow_clone = shallow_bio_clone(device, bio);
+    bio_data->shallow_clone->bi_end_io = fetch_disk_end_io;
+    bio_data->shallow_clone->bi_private = bio_data;
+
+    submit_bio_noacct(bio_data->shallow_clone);
 }
 
 void send_disk_req(struct rollbaccine_device *device, sector_t sector) {
@@ -1223,6 +1227,7 @@ void verify_disk_end_io_task(struct work_struct *work) {
     else
         inc_verified_pages(device);
 
+    bio_put(bio_data->shallow_clone);
     free_pages_end_io(bio_data->bio_src);
 }
 
@@ -2280,7 +2285,6 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
     while (sector < device->num_sectors) {
         bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
         bio->bi_iter.bi_sector = sector;
-        bio->bi_end_io = verify_disk_end_io;
         __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
 #ifdef MEMORY_TRACKING
         atomic_inc(&device->num_bio_pages_not_freed);
@@ -2293,8 +2297,13 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
         bio_data->end_sector = sector + SECTORS_PER_PAGE;
         bio->bi_private = bio_data;
 
+        bio_data->shallow_clone = shallow_bio_clone(device, bio);
+        bio_data->shallow_clone->bi_end_io = verify_disk_end_io;
+        bio_data->shallow_clone->bi_private = bio_data;
+
+        submit_bio_noacct(bio_data->shallow_clone);
+
         sector += SECTORS_PER_PAGE;
-        submit_bio_noacct(bio);
 
         bios_between_plug++;
         if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
