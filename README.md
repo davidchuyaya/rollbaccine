@@ -1,5 +1,5 @@
 # Rollbaccine
-A Linux device mapper that uses replication to prevent rollback attacks in CVMs.  
+A Linux device mapper that uses replication to prevent rollback attacks in VM-based TEEs.  
 Rollbaccine will:
 1. Encrypt and decrypt all sectors.
 2. Check integrity on all sectors, forcing recovery on failure. The hashes are kept in memory.
