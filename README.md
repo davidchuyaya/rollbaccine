@@ -54,7 +54,7 @@ Graphs will be generated in `results/graphs`.
 
 - [Setup](#setup)
 - [Everyday development](#everyday-development)
-- [Benchmarking](#benchmarking)
+- [Running on Azure](#running-on-azure)
 
 Create a Ubuntu 24.04 LTS VM locally in order to compile and install the kernel module. Containers will not suffice; [kernel modules cannot be installed on containers](https://stackoverflow.com/q/62455239/4028758).
 
@@ -235,7 +235,7 @@ sudo modprobe -r brd
 ```
 
 #### Testing writes/reads to block device
-We will use `fio` to benchmark performance, as seen in [Benchmarking](#benchmarking). However, `fio` is not ideal for testing to see if a block device works, because it will multiple threads that spam a block device with writes and reads. To see if a block device can handle small individual reads and writes, use [device_tester.c](src/tools/device_tester.c).
+We use `fio` to benchmark performance. However, `fio` is not ideal for testing to see if a block device works, because it spins up multiple threads that spam a block device with writes and reads. To see if a block device can handle small individual reads and writes, use [device_tester.c](src/tools/device_tester.c).
 
 Compile the device tester:
 ```bash
@@ -243,10 +243,10 @@ cd tools
 make
 ```
 
-Set up the block devices as described in [Benchmarking](#benchmarking). Then run the device tester over it. Here we will run the device tester over ramdisk `/dev/ram0`:
+Set up the block devices as described in [Everyday development](#everyday-development). Then run the device tester over it:
 ```bash
-sudo ./device_tester /dev/ram0 write
-sudo ./device_tester /dev/ram0 read
+sudo ./device_tester /dev/mapper/rollbaccine1 write
+sudo ./device_tester /dev/mapper/rollbaccine1 read
 ```
 
 For those who are curious, none of the other folders in `src` are used in `rollbaccine.c`. They are minimal experiments we used during development in order to understand how to write a device mapper.
