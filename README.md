@@ -30,9 +30,11 @@ python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE filebench
 python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE postgres
 python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE hdfs
 python3 src/tools/benchmarking/recovery/recovery.py True
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 1
+python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 1 true
 python3 src/tools/benchmarking/recovery/recovery.py False # Don't immediately run after the previous recovery, since the resource group names are the same, and shutting down a group takes time.
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 100
+python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 100 true
+python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 1 false
+python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 100 false
 ```
 
 Each experiment, upon completion, will download files to the root directory (except for `recovery`, which directly puts the files in `results/recovery`). Move the files to the `results` folder under the right benchmark name (`nimble_hdfs` is put in `hdfs`), then run the following command to generate the graphs:

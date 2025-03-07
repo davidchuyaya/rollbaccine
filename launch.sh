@@ -58,6 +58,9 @@ if [ $BENCHMARK = "nimble_hdfs" ]; then
     az storage account keys list -n rollbaccinenimble -g $NAME-group > $STORAGE_FILE
 fi
 
+# Append a unique int to the end of each VM's name. Incremented at the end of launch_vm.
+UNIQUE_ID=0
+
 # Parameters: $1 = count, $2 = vm_size, $3 = output name, $4 = additional params
 launch_vm () {
     if [ $1 -gt 1 ]; then
@@ -87,7 +90,7 @@ launch_vm () {
 
     az vm create \
     --resource-group $NAME-group \
-    --name $NAME-$(uuidgen) \
+    --name $NAME-$UNIQUE_ID \
     --admin-username $USERNAME \
     --generate-ssh-keys \
     --public-ip-sku Standard \
@@ -104,6 +107,8 @@ launch_vm () {
     --os-disk-security-encryption-type VMGuestStateOnly \
     --enable-secure-boot false \
     --enable-vtpm $COUNT $4 > $3
+
+    (($UNIQUE_ID++))
 }
 
 # Launch the right number of VMs with temp/managed disk

@@ -14,7 +14,8 @@ COORDINATOR_PORT = 8080
 ENDORSER_PORT = 9091
 
 class NimbleHDFSBenchmark(Benchmark):
-    def __init__(self, batch_size):
+    def __init__(self, batch_size, storage):
+        self.storage = storage
         self.batch_size = batch_size
         if batch_size != 1 and batch_size != 100:
             print("Batch size must be 1 or 100")
@@ -30,7 +31,7 @@ class NimbleHDFSBenchmark(Benchmark):
         return 0
     
     def needs_storage(self) -> bool:
-        return True
+        return self.storage
     
     def install_nimble_on_vm(self, ssh_executor: SSH, ssh: SSHClient):
         success = ssh_executor.exec(ssh, [
@@ -98,9 +99,13 @@ class NimbleHDFSBenchmark(Benchmark):
             ])
 
         print("Starting the coordinator")
+        if self.storage:
+            storage_params = f"-s 'table' -n nimbledb -a {storage_name} -k {storage_key}"
+        else:
+            storage_params = "-s 'memory'"
         ssh_execute_background(coordinator_ssh, [
             "cd Nimble",
-            f"target/release/coordinator -t {coordinator_ip} -p {COORDINATOR_PORT} -e 'http://{endorser_ips[0]}:{ENDORSER_PORT},http://{endorser_ips[1]}:{ENDORSER_PORT},http://{endorser_ips[2]}:{ENDORSER_PORT}' -s 'table' -n nimbledb -a {storage_name} -k {storage_key}",
+            f"target/release/coordinator -t {coordinator_ip} -p {COORDINATOR_PORT} -e 'http://{endorser_ips[0]}:{ENDORSER_PORT},http://{endorser_ips[1]}:{ENDORSER_PORT},http://{endorser_ips[2]}:{ENDORSER_PORT}' {storage_params}",
         ])
         
         print("Starting the endpoint (still on the coordinator)")
@@ -142,4 +147,5 @@ class NimbleHDFSBenchmark(Benchmark):
         subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
 
 if __name__ == "__main__":
-    NimbleHDFSBenchmark(int(sys.argv[4])).run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
+    # The storage parameter doesn't matter once this is launched
+    NimbleHDFSBenchmark(int(sys.argv[4]), True).run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
