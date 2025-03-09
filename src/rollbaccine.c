@@ -1386,70 +1386,69 @@ void broadcast_bio(struct work_struct *work) {
 #endif
     }
 
-    multisocket = device->counterpart;
-    if (multisocket == NULL) {
-        printk_ratelimited(KERN_ERR "Attempted to send to counterpart before we were connected");
-        goto finish_no_unlock;
-    }
-    if (atomic_read(&multisocket->disconnected)) {
-        goto finish_no_unlock;
-    }
-    socket_id = lock_on_next_free_socket(device, multisocket);
-    socket_data = &multisocket->socket_data[socket_id];
-    
-    metadata.sender_socket_id = socket_id;
-    // Send the recipient its own ID so it can check that this message was intended for them
-    metadata.recipient_id = multisocket->sender_id;
-    // Create a hash of the message after incrementing msg_index
-    metadata.msg_index = socket_data->last_sent_msg_index++;
-    hash_metadata(socket_data, &metadata);
+    down_read(&device->connected_sockets_sem);
+    list_for_each_entry(multisocket, &device->connected_sockets, list) {
+        if (atomic_read(&multisocket->disconnected)) {
+            goto finish_no_unlock;
+        }
+        socket_id = lock_on_next_free_socket(device, multisocket);
+        socket_data = &multisocket->socket_data[socket_id];
+        
+        metadata.sender_socket_id = socket_id;
+        // Send the recipient its own ID so it can check that this message was intended for them
+        metadata.recipient_id = multisocket->sender_id;
+        // Create a hash of the message after incrementing msg_index
+        metadata.msg_index = socket_data->last_sent_msg_index++;
+        hash_metadata(socket_data, &metadata);
 
-    vec.iov_base = &metadata;
-    vec.iov_len = sizeof(struct metadata_msg);
-    print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
+        vec.iov_base = &metadata;
+        vec.iov_len = sizeof(struct metadata_msg);
+        print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
 
-    // 1. Send metadata
-    success = send_msg(vec, socket_data->sock);
-    if (!success) {
-        // printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
-        should_disconnect = true;
-        goto finish_sending_to_socket;
-    }
-    print_and_update_latency("broadcast_bio: Send metadata", &time);
-
-    // 2. Send hash & IVs if they exceed what could be sent with the metadata
-    if (additional_hash_msg != NULL) {
-        additional_hash_msg->sender_socket_id = socket_id;
-        additional_hash_msg->recipient_id = multisocket->sender_id;
-        additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
-        hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
-
-        vec.iov_base = additional_hash_msg;
-        vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
+        // 1. Send metadata
         success = send_msg(vec, socket_data->sock);
         if (!success) {
-            // printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+            // printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
             should_disconnect = true;
             goto finish_sending_to_socket;
         }
-        print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
-    }
+        print_and_update_latency("broadcast_bio: Send metadata", &time);
 
-    // 3. Send bios
-    bio_for_each_segment(bvec, clone, iter) {
-        bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
-        success = send_page(chunked_bvec, socket_data->sock);
-        if (!success) {
-            // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
-            should_disconnect = true;
-            goto finish_sending_to_socket;
+        // 2. Send hash & IVs if they exceed what could be sent with the metadata
+        if (additional_hash_msg != NULL) {
+            additional_hash_msg->sender_socket_id = socket_id;
+            additional_hash_msg->recipient_id = multisocket->sender_id;
+            additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
+            hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
+
+            vec.iov_base = additional_hash_msg;
+            vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
+            success = send_msg(vec, socket_data->sock);
+            if (!success) {
+                // printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+                should_disconnect = true;
+                goto finish_sending_to_socket;
+            }
+            print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
         }
+
+        // 3. Send bios
+        bio_for_each_segment(bvec, clone, iter) {
+            bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
+            success = send_page(chunked_bvec, socket_data->sock);
+            if (!success) {
+                // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
+                should_disconnect = true;
+                goto finish_sending_to_socket;
+            }
+        }
+        print_and_update_latency("broadcast_bio: Send pages", &time);
+        // Label to jump to if socket cannot be written to, so we can iterate the next socket
+    finish_sending_to_socket:
+        mutex_unlock(&socket_data->socket_mutex);
     }
-    print_and_update_latency("broadcast_bio: Send pages", &time);
-    // Label to jump to if socket cannot be written to, so we can iterate the next socket
-finish_sending_to_socket:
-    mutex_unlock(&socket_data->socket_mutex);
 finish_no_unlock:
+    up_read(&device->connected_sockets_sem);
     
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
 
