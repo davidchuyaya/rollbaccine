@@ -50,6 +50,7 @@ def install_rollbaccine(ssh_executor: SSH, ssh):
             "sudo apt-get install -qq -y build-essential",
             "git clone -q https://github.com/davidchuyaya/rollbaccine",
             "cd rollbaccine/src",
+            "git checkout fgt1",
             "make --silent"
         ])
 
@@ -72,7 +73,7 @@ def get_leader_commands(backup_private_ip):
     ]
     return commands
 
-def get_backup_commands(primary_private_ip):
+def get_backup_commands(primary_private_ip, id):
     """
     Returns the list of commands to execute on the backup.
     """
@@ -80,7 +81,7 @@ def get_backup_commands(primary_private_ip):
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 12350 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 {id} 1 false abcdefghijklmnop 12350 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
     ]
     return commands
 
@@ -119,8 +120,8 @@ def setup_main_nodes(ssh_executor: SSH, system_type: System, connections: List[S
                 # Setup primary and backup
                 if i == 0:
                     ssh_executor.exec(ssh, get_leader_commands(private_ips[1]))
-                elif i == 1:
-                   ssh_executor.exec(ssh, get_backup_commands(private_ips[0]))
+                elif i > 0:
+                   ssh_executor.exec(ssh, get_backup_commands(private_ips[0], i+1))
 
             # If this isn't rollbaccine, then we're immediately to mount the file system.
             # If this is rollbaccine, we'll need to set up the backup first (so they can sync).
@@ -155,7 +156,7 @@ def run_everything(system_type: System, benchmark_name: str, nimble_batch_size: 
     num_vms = benchmark.num_vms()
     # 1 additional VM for the rollbaccine backup
     if system_type == System.ROLLBACCINE:
-        num_vms += 1
+        num_vms += 2
     
     # Create resources
     subprocess_execute([f"./launch.sh -b {benchmark_name} -s {system_type} -n {num_vms}"])
@@ -184,9 +185,9 @@ def run_everything(system_type: System, benchmark_name: str, nimble_batch_size: 
 
         if system_type == System.ROLLBACCINE:
             # Disconnect from the backup
-            connections[-1].close()
-            connections = connections[:-1]
-            private_ips = private_ips[:-1]
+            connections[-2].close()
+            connections = connections[:-2]
+            private_ips = private_ips[:-2]
 
     if os.path.isfile(f'{benchmark_name}-{system_type}-vm2.json'):
         with open(f'{benchmark_name}-{system_type}-vm2.json') as f:

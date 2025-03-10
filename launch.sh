@@ -113,8 +113,8 @@ launch_vm () {
 
 # Launch the right number of VMs with temp/managed disk
 if [ $SYSTEM = "ROLLBACCINE" ]; then
-    launch_vm 2 $VM_SIZE_TEMP_DISK $VM1_FILE
-    REMAINING_VMS=$(($NUM_VMS - 2))
+    launch_vm 3 $VM_SIZE_TEMP_DISK $VM1_FILE
+    REMAINING_VMS=$(($NUM_VMS - 3))
 elif [ $SYSTEM = "REPLICATED" ]; then
     launch_vm 1 $VM_SIZE $VM1_FILE "--data-disk-sizes-gb $MANAGED_DISK_SIZE --data-disk-caching None"
     REMAINING_VMS=$(($NUM_VMS - 1))
