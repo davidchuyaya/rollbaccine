@@ -2938,9 +2938,25 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     }
 }
 
-// Arguments: 0 = underlying device name, like /dev/ram0. 1 = id, 2 = seen_ballot, 3 = is_leader, 4 = key, 5 = listen port, 6 = server id, 7 = server addr, 8 = server port
-// 9+ = additional configs' server id, server addr, server port, etc.
-// Primary does not connect to backup if this is the first configuration (no additional configs)
+/**
+ * Arguments:
+ * 0 = underlying device name, like /dev/ram0
+ * 1 = id (unique per instance)
+ * 2 = seen_ballot
+ * 3 = is_leader ("true" or "false")
+ * 4 = key
+ * 5 = f (can be 0 to verify reads only)
+ * 6 = Hash cache size, in number of pages
+ * 7 = sync mode ("default", "sync", "async"). "Default" respects FUA/PREFLUSH flags, "sync" forces all writes to be FUA, "async" removes all write flags.
+ * 8 = listen port
+ * 
+ * The remaining arguments are optional:
+ * 9 = server id (if this is a backup, then the server is the primary to connect to. If this is a primary, and it's recovering, then the server is a backup to connect to)
+ * 10 = server addr
+ * 11 = server port
+ * 12 ... (additional server id, addr, port, if this is a primary, for each f-1 backup)
+ * Additional server id, addr, port, for each server in the previous configuration, to connect to during recovery
+ */
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
     ushort port, counterpart_port;
