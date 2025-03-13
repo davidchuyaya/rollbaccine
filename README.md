@@ -115,6 +115,7 @@ Outside the VM, run the following so we don't need to re-enter the password ever
 ```bash
 ssh-copy-id localvm
 ```
+This command fails if you don't have ssh keys on your machine. Create those with `ssh-keygen`, using the defaults whenever prompted.
 </details>
 
 ### Windows Setup
@@ -171,19 +172,6 @@ Host localvm
 </details>
 
 
-#### VSCode setup
-
-To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
-
-In order for VSCode to understand Linux kernel headers, we will follow instructions from the [vscode-linux-kernel](https://github.com/amezin/vscode-linux-kernel) repo:
-```bash
-cd rollbaccine
-rm -rf .vscode
-git clone https://github.com/amezin/vscode-linux-kernel .vscode
-python3 .vscode/generate_compdb.py -O /lib/modules/$(uname -r)/build $PWD
-```
-
-
 #### Setting up the VM
 To avoid having to type your password on sudo, execute the following:
 ```bash
@@ -197,6 +185,19 @@ sudo apt update
 sudo apt install -y build-essential
 ```
 [Install the GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt) so you can push changes after developing in the VM.
+
+
+#### VSCode setup
+
+To use VSCode in the VM, click the blue >< box in VSCode's bottom left corner, select "Connect to Host", and select "localvm". Install the necessary extensions (C++, Github copilot).
+
+In order for VSCode to understand Linux kernel headers, we will follow instructions from the [vscode-linux-kernel](https://github.com/amezin/vscode-linux-kernel) repo:
+```bash
+cd rollbaccine
+rm -rf .vscode
+git clone https://github.com/amezin/vscode-linux-kernel .vscode
+python3 .vscode/generate_compdb.py -O /lib/modules/$(uname -r)/build $PWD
+```
 
 
 #### Everyday development
