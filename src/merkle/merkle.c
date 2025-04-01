@@ -169,7 +169,7 @@ void submit_merkle_bio_task(struct work_struct *work) {
 
 void init_merkle_tree(struct merkle_device *device) {
     int i, j;
-    int total_checksum_pages = device->num_sectors * ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_AUTH_SIZE / AES_GCM_PER_PAGE;
+    int total_checksum_pages = device->num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION / AES_GCM_PER_PAGE;
     int pages_in_memory = total_checksum_pages;
     int pages_on_disk = 0;
 
@@ -643,11 +643,8 @@ void write_disk_end_io(struct bio *shallow_clone) {
 
     ack_bio_to_user_without_executing(bio_data->bio_src);
 
-    if (atomic_dec_and_test(&bio_data->ref_counter)) {
-        // printk(KERN_INFO "Freeing clone, write index: %d", deep_clone_bio_data->write_index);
-        free_pages_end_io(bio_data, bio_data->deep_clone);
-        free_bio_data(bio_data);
-    }
+    free_pages_end_io(bio_data, bio_data->deep_clone);
+    free_bio_data(bio_data);
 }
 
 void try_read_bio_task(struct work_struct *work) {
@@ -744,6 +741,7 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
                 printk(KERN_ERR "Could not create deep clone");
                 return DM_MAPIO_REMAPPED;
             }
+            bio_data->deep_clone->bi_private = bio_data;
 
             // Encrypt
             error = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
@@ -755,10 +753,6 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
             // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
             bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
             bio_data->shallow_clone->bi_end_io = write_disk_end_io;
-
-            // Set shared data between clones
-            atomic_set(&bio_data->ref_counter, 2);
-            bio_data->deep_clone->bi_private = bio_data;
             bio_data->shallow_clone->bi_private = bio_data;
 
             // Request merkle tree parent pages from disk
@@ -780,7 +774,7 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
             break;
     }
 
-    return DM_MAPIO_REMAPPED;
+    return DM_MAPIO_SUBMITTED;
 }
 
 void hash_buffer(struct merkle_device *device, char *buffer, size_t len, char *out) {
