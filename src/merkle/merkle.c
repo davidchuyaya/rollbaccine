@@ -58,6 +58,7 @@ struct merkle_device {
     struct mutex merkle_tree_lock;
     struct rb_root *merkle_tree_layers;  // Note: [0] = NULL always, since that layer is represented by merkle_tree_root in memory
     
+    struct workqueue_struct *submit_bio_queue;
     struct workqueue_struct *read_hash_end_io_queue;
     struct workqueue_struct *write_hash_end_io_queue;
 };
@@ -69,26 +70,31 @@ struct bio_data {
     struct bio *shallow_clone;
     atomic_t ref_counter;  // The number of clones AND number of pending_checksum_ops with references to this bio. Once it hits 0, the bio can be freed
     bool is_write;
+    atomic_t retrieved_from_disk; // If this is a read, 1 once the page has been fetched from disk. Used to know when we can verify.
     sector_t start_sector;
     sector_t end_sector;
-    unsigned char *checksum_and_iv; // TODO: Allocate this for reads so the parent can fill it up
+    unsigned char *checksum_and_iv;
 };
 
 struct merkle_bio_data {
     struct merkle_device *device;
     struct bio *bio_src;
+    int layer;
     int page_num;
+    bool hashed; // True if this page has been loaded into memory and "hash" has been populated
+    bool is_empty; // True if this page is all zeros
     bool verified;
     bool dirtied;
-    int layer;
+    
     struct merkle_bio_data *parent;  // Null if the parent is merkle_tree_root
     int parent_page_offset;
-    char hash[SHA256_SIZE];      // Read: The hash of this node once loaded, to verify against
-    struct rb_root pending_checksum_ops; // Children of merkle tree leaves, keyed by page offset
-    struct list_head pending_merkle_children; // If this is not a merkle tree leaf, this is a list of merkle_bio_data from lower levels
+
+    char hash[SHA256_SIZE];      // Read: The hash of this node once loaded
+    void *page_addr;
+    struct list_head pending_children; // If this is a merkle leaf, then this is a list of pending_checksum_op. Otherwise,this is a list of merkle_bio_data from lower levels
 
     struct rb_node tree_node; // For merkle_tree_layers
-    struct list_head list; // So this bio can be stored in the parent's pending_merkle_children
+    struct list_head list; // So this bio can be stored in the parent's pending_children
     struct work_struct work;  // So this bio can be queued in read/write_hash_end_io_queue
 };
 
@@ -97,13 +103,18 @@ struct pending_checksum_op {
     int read_checksum_offset; // Read: Within the read_bio, the offset of the checksum
     char checksum[AES_GCM_INTEGRITY_SIZE]; // Write: The hash of the written page
     struct bio *read_bio;     // NULL if this is a write, since writes can ACK early and don't need to wait here
-    struct rb_node tree_node; // For the pending_ops tree in merkle_bio_data
+    struct list_head list; // For the pending_children list in merkle_bio_data
 };
 
 enum EncDecType { ROLLBACCINE_ENCRYPT, ROLLBACCINE_DECRYPT };
 
 int __init dm_merkle_init(void);
 void dm_merkle_exit(void);
+
+void submit_merkle_bio_task(struct work_struct *work) {
+    struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
+    submit_bio_noacct(bio_data->bio_src);
+}
 
 void init_merkle_tree(struct merkle_device *device, uint64_t max_merkle_root_pages) {
     int smallest_layer_pages, i;
@@ -148,27 +159,40 @@ void init_merkle_tree(struct merkle_device *device, uint64_t max_merkle_root_pag
     }
 }
 
+void recursive_remove_merkle_node(struct merkle_bio_data *bio_data, bool recursive) {
+    struct merkle_device *device = bio_data->device;
+
+    rb_erase(&bio_data->tree_node, &device->merkle_tree_layers[bio_data->layer]);
+    // Remove from parent's pending_children (works even if parent is NULL)
+    list_del(&bio_data->list);
+
+    // Check if any ancestor can also be evicted
+    if (recursive && bio_data->parent != NULL) {
+        recursive_evict_merkle_ancestors(bio_data->parent, recursive);
+    }
+
+    free_merkle_bio(bio_data);
+}
+
 void write_hash_end_io_task(struct work_struct *work) {
-    // struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
-    // struct bio *bio = bio_data->bio_src;
-    // struct merkle_device *device = bio_data->device;
-    // struct pending_checksum_list *pending_checksum_list = bio_data->pending_checksum_list;
-    // bool no_more_pending_ops;
+    struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
+    struct bio *bio = bio_data->bio_src;
+    struct merkle_device *device = bio_data->device;
+    bool no_more_pending_ops;
 
-    // mutex_lock(&device->merkle_tree_lock);
-    // no_more_pending_ops = list_empty(&pending_checksum_list->ops);
-    // if (no_more_pending_ops) {
-    //     // Remove from pending ops tree
-    //     rb_erase(&pending_checksum_list->tree_node, &device->merkle_tree_layers[pending_checksum_list->layer]);
-    // }
-    // mutex_unlock(&device->merkle_tree_lock);
-
-    // if (!no_more_pending_ops) {
-    //     // If there are still pending operations for this page, we need to reissue the read
-    //     bio_reset(bio, device->dev->bdev, REQ_OP_READ);
-    //     bio->bi_end_io = read_hash_end_io;
-    //     submit_bio_noacct(bio);
-    // }
+    mutex_lock(&device->merkle_tree_lock);
+    if (list_empty(&bio_data->pending_children)) {
+        // The hash has been written to disk and there are no more children; remove the data structure and attempt to evict parents
+        recursive_remove_merkle_node(bio_data, true);
+    }
+    else {
+        // Read from disk (again)
+        bio_reset(bio, device->dev->bdev, REQ_OP_READ);
+        bio->bi_end_io = read_hash_end_io;
+        INIT_WORK(&bio_data->work, submit_merkle_bio_task);
+        queue_work(device->submit_bio_queue, &bio_data->work);
+    }
+    mutex_unlock(&device->merkle_tree_lock);
 }
 
 void write_hash_end_io(struct bio *bio) {
@@ -177,63 +201,149 @@ void write_hash_end_io(struct bio *bio) {
     queue_work(bio_data->device->write_hash_end_io_queue, &bio_data->work);
 }
 
+inline bool mem_is_zero(void *addr, size_t size) {
+    return memchr_inv(addr, 0, size) == NULL;
+}
+
+// Note: Assumes that merkle_tree_lock is held, and that if the node has a parent, the parent has been verified
+void verify_merkle_node(struct merkle_bio_data *bio_data) {
+    struct merkle_bio_data *parent = bio_data->parent;
+
+    if (parent == NULL) {
+        // TODO: Verify against root
+    }
+    else {
+        if (bio_data->is_empty) {
+            if (!parent->is_empty) {
+                printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, parent: %d, child is all zeros but parent is not", bio_data->page_num, bio_data->parent->page_num);
+                // Note: Should crash the system and enter recovery
+            }
+        }
+        else {
+            int res = memcmp(bio_data->hash, bio_data->parent->page_addr + bio_data->parent_page_offset, SHA256_SIZE);
+            if (res != 0) {
+                printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, parent: %d", bio_data->page_num, bio_data->parent->page_num);
+                // Note: Should crash the system and enter recovery
+            }
+        }
+    }
+}
+
+// Note: Assumes that merkle_tree_lock is held. Caller must check if bio_data is NULL after this funciton returns
+void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool recursive) {
+    struct merkle_device *device = bio_data->device;
+    struct bio *bio = bio_data->bio_src;
+    struct page *parent_page;
+    void *parent_page_addr;
+
+    // Only evict once there are no more dependents
+    if (!list_empty(&bio_data->pending_children)) {
+        return;
+    }
+
+    if (bio_data->dirtied) {
+        // Lower levels have been modified. Modify the parent's hash, then flush to disk. Don't remove the data structure yet (to prevent concurrent reads)
+        if (bio_data->parent != NULL) {
+            // Modify parent's page
+            memcpy(bio_data->parent->page_addr + bio_data->parent_page_offset, bio_data->hash, SHA256_SIZE);
+            bio_data->parent->dirtied = true;
+        } else {
+            // TODO: Modify in-memory checksum
+        }
+
+        // Reset flags so other nodes don't mistake this for an in-memory page
+        bio_data->verified = false;
+        bio_data->hashed = false;
+        bio_data->dirtied = false;
+        kunmap(bio_page(bio));
+
+        // Write to disk
+        bio_reset(bio, device->dev->bdev, REQ_OP_WRITE);
+        bio->bi_end_io = write_hash_end_io;
+        INIT_WORK(&bio_data->work, submit_merkle_bio_task);
+        queue_work(device->submit_bio_queue, &bio_data->work);
+    } else {
+        // Lower levels have NOT been modified, remove the data structure and check if parents can be freed too
+        recursive_remove_merkle_node(bio_data, recursive);
+    }
+}
+
+void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
+    struct merkle_device *device = bio_data->device;
+    struct pending_checksum_op *pending_checksum_op, *next_pending_checksum_op;
+    struct merkle_bio_data *merkle_child;
+    struct bio_data *read_bio_data;
+
+    // 1. Verify self
+    verify_merkle_node(bio_data);
+    bio_data->verified = true;
+
+    // 2. Process children
+    if (bio_data->layer == device->merkle_tree_height - 1) {
+        // This is a leaf, children are pending_checksum_ops
+        list_for_each_entry_safe(pending_checksum_op, next_pending_checksum_op, &bio_data->pending_children, list) {
+            if (pending_checksum_op->read_bio != NULL) {
+                // Read
+                read_bio_data = pending_checksum_op->read_bio->bi_private;
+                memcpy(read_bio_data->checksum_and_iv + pending_checksum_op->read_checksum_offset, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_INTEGRITY_SIZE);
+                if (atomic_dec_return(&read_bio_data->ref_counter) == 1) {
+                    // TODO: The read can now be performed, schedule it on a task
+                }
+            } else {
+                // Write
+                memcpy(pending_checksum_op->checksum, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_INTEGRITY_SIZE);
+                bio_data->dirtied = true;
+            }
+            list_del(&pending_checksum_op->list);
+            kfree(pending_checksum_op);
+        }
+    } else {
+        // This is a node, children are merkle_bio_data
+        list_for_each_entry(merkle_child, &bio_data->pending_children, list) {
+            // Process children once they have been read from disk
+            if (merkle_child->hashed) {
+                recursive_process_merkle_descendants(merkle_child);
+            }
+        }
+    }
+
+    // 3. See if this node should be evicted (not recursively, since we're already recusively walking down the tree)
+    recursive_evict_merkle_ancestors(bio_data, false);
+}
+
 void read_hash_end_io_task(struct work_struct *work) {
-    // struct bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
-    // struct bio *bio = bio_data->bio_src;
-    // struct merkle_device *device = bio_data->device;
-    // struct pending_checksum_list *pending_checksum_list = bio_data->pending_checksum_list;
-    // struct pending_checksum_op *pending_checksum_op, *next_pending_checksum_op;
-    // struct bio_data *pending_bio_data;
-    // bool encrypt_error;
-    // bool dirtied = false;
+    struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
+    struct bio *bio = bio_data->bio_src;
+    struct merkle_device *device = bio_data->device;
 
-    // struct page *page = bio_page(bio);
-    // void *page_addr = kmap(page);
+    bio_data->page_addr = kmap(bio_page(bio));
 
-    // // Execute any pending checksum operations
-    // mutex_lock(&device->merkle_tree_lock);
-    // list_for_each_entry_safe(pending_checksum_op, next_pending_checksum_op, &pending_checksum_list->ops, list) {
-    //     pending_bio_data = pending_checksum_op->bio_data;
-    //     if (pending_bio_data->is_write) {
-    //         // Write to the parent (the page read)
-    //         memcpy(pending_bio_data->checksum + pending_checksum_op->checksum_offset, page_addr + pending_checksum_op->parent_page_offset, AES_GCM_INTEGRITY_SIZE);
-    //         dirtied = true;
+    // 1. Hash ourselves (unless this page is all zeros, in which case the hash should also be all zeros)
+    bio_data->is_empty = mem_is_zero(bio_data->page_addr, PAGE_SIZE);
+    if (!bio_data->is_empty) {
+        hash_buffer(device, bio_data->page_addr, PAGE_SIZE, bio_data->hash);
+    }
 
-    //         try_free_bio(pending_bio_data);
+    mutex_lock(&device->merkle_tree_lock);
+    bio_data->hashed = true;
 
-    //         list_del(&pending_checksum_op->list);
-    //         kfree(pending_checksum_op);
-    //     } else {
-    //         // TODO: Read from the page
-    //     }
-    // }
-    // if (!dirtied) {
-    //     // Remove from pending ops tree
-    //     // Note: We don't remove if the page is dirtied, because we want to prevent the next read from happening until the dirtied page makes it to disk, so the pending ops structures should remain
-    //     rb_erase(&pending_checksum_list->tree_node, &device->merkle_tree_layers[pending_checksum_list->layer]);
-    // }
-    // mutex_unlock(&device->merkle_tree_lock);
+    // 2. Check if the parent was verified
+    if (bio_data->parent != NULL) {
+        if (!bio_data->parent->verified) {
+            goto unlock_and_exit;
+        }
+    }
 
-    // kunmap(page);
+    // 3. Verify self, then check descendants, evicting when necessary
+    recursive_process_merkle_descendants(bio_data);
 
-    // // Add to this page's parent's pending ops, then write this bio to disk
-    // if (dirtied) {
-    //     // Encrypt
-    //     bio_data->checksum = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT, &encrypt_error);
-    //     if (encrypt_error) {
-    //         printk_ratelimited(KERN_ERR "Error encrypting hash %llu", bio_data->start_sector);
-    //         return;
-    //     }
-    //     // Queue this write to the parent and fetch the parents
-    //     fetch_merkle_leaf(device, bio_data);
+    // 4. Evict ancestors
+    if (bio_data->parent != NULL) {
+        recursive_evict_merkle_ancestors(bio_data->parent, true);
+    }
 
-    //     bio_reset(bio, device->dev->bdev, REQ_OP_WRITE);
-    //     bio->bi_end_io = write_hash_end_io;
-    //     submit_bio_noacct(bio);
-    // } else {
-    //     // Decrement ref count
-    //     try_free_bio(bio_data);
-    // }
+    unlock_and_exit:
+    mutex_unlock(&device->merkle_tree_lock);
 }
 
 void read_hash_end_io(struct bio *bio) {
@@ -242,7 +352,16 @@ void read_hash_end_io(struct bio *bio) {
     queue_work(bio_data->device->read_hash_end_io_queue, &bio_data->work);
 }
 
-struct merkle_bio_data *create_merkle_bio(struct merkle_device *device, int layer, int page, int page_offset) {
+void free_merkle_bio(struct merkle_bio_data *bio_data) {
+    struct bio *bio = bio_data->bio_src;
+    struct page *page = bio_page(bio);
+    kunmap(page);
+    __free_page(page);
+    bio_put(bio);
+    kfree(bio_data);
+}
+
+struct merkle_bio_data *create_and_submit_merkle_bio(struct merkle_device *device, int layer, int page, int page_offset) {
     struct merkle_bio_data *bio_data;
     struct page *page;
     struct bio *bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
@@ -263,19 +382,21 @@ struct merkle_bio_data *create_merkle_bio(struct merkle_device *device, int laye
     bio_data->layer = layer;
     // Note: parent should be filled in once the parent bio is created
     bio_data->parent_page_offset = page_offset;
-    bio_data->pending_checksum_ops = RB_ROOT;
-    INIT_LIST_HEAD(&bio_data->pending_merkle_children);
+    INIT_LIST_HEAD(&bio_data->pending_children);
+    INIT_WORK(&bio_data->work, submit_merkle_bio_task);
+
+    // Submit in queue (so we don't block mutexes)
+    queue_work(device->submit_bio_queue, &bio_data->work);
 
     bio->bi_private = bio_data;
 
     return bio_data;
 }
 
-void add_merkle_node_request(struct merkle_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset, struct merkle_bio_data **parent_bio_datas, int *num_parent_bios) {
+void add_merkle_node_request(struct merkle_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset) {
     struct rb_node **tree_node_location;
     struct rb_node *tree_node;
     struct merkle_bio_data *merkle_node;
-    struct pending_checksum_op *other_pending_checksum_op;
 
     // Stop if the parent must be in memory
     if (layer < 1) {
@@ -295,26 +416,25 @@ void add_merkle_node_request(struct merkle_device *device, struct merkle_bio_dat
             tree_node_location = &tree_node->rb_right;
         else {
             // Request for this merkle node exists, add to the tail and stop
-            list_add_tail(&child->list, &merkle_node->pending_merkle_children);
+            list_add_tail(&child->list, &merkle_node->pending_children);
             child->parent = merkle_node;
             return;
         }
     }
 
     // Page hasn't been requested, add it
-    merkle_node = create_merkle_bio(device, layer, parent_page_num, parent_page_offset);
-    parent_bio_datas[*num_parent_bios] = merkle_node;
-    (*num_parent_bios)++;
+    merkle_node = create_and_submit_merkle_bio(device, layer, parent_page_num, parent_page_offset);
     rb_link_node(&merkle_node->tree_node, tree_node, tree_node_location);
     rb_insert_color(&merkle_node->tree_node, &device->merkle_tree_layers[layer]);
 
     child->parent = merkle_node;
 
     // Iterate through all ancestors to fetch the pages if necessary
-    add_merkle_node_request(device, merkle_node, layer - 1, parent_page_num / AES_GCM_PER_PAGE, parent_page_num % AES_GCM_PER_PAGE, parent_bio_datas, num_parent_bios);
+    add_merkle_node_request(device, merkle_node, layer - 1, parent_page_num / AES_GCM_PER_PAGE, parent_page_num % AES_GCM_PER_PAGE);
 }
 
-void add_merkle_leaf_request(struct merkle_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num, struct merkle_bio_data **parent_bio_datas, int *num_parent_bios) {
+void add_merkle_leaf_request(struct merkle_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num) {
+    struct bio_data *bio_data;
     struct rb_node **tree_node_location = &(device->merkle_tree_layers[device->merkle_tree_height - 1].rb_node);
     struct rb_node *tree_node;
     struct merkle_bio_data *merkle_leaf;
@@ -330,47 +450,63 @@ void add_merkle_leaf_request(struct merkle_device *device, struct pending_checks
         else if (parent_page_num > merkle_leaf->page_num)
             tree_node_location = &tree_node->rb_right;
         else {
-            // Request for this merkle node exists, add this pending op to *that* tree
-            tree_node_location = &merkle_leaf->pending_checksum_ops.rb_node;
-            while (*tree_node_location != NULL) {
-                other_pending_checksum_op = container_of(*tree_node_location, struct pending_checksum_op, tree_node);
-                if (pending_checksum_op->parent_page_offset < other_pending_checksum_op->parent_page_offset)
-                    tree_node_location = other_pending_checksum_op->tree_node.rb_left;
-                else if (pending_checksum_op->parent_page_offset > other_pending_checksum_op->parent_page_offset)
-                    tree_node_location = other_pending_checksum_op->tree_node.rb_right;
-                else {
-                    // Shouldn't happen
-                    printk_ratelimited(KERN_ERR "Detected concurrent read/write to the same block in add_merkle_leaf_request, parent_page_num: %d, parent_page_offset: %d", parent_page_num, pending_checksum_op->parent_page_offset);
+            // Request for this merkle node exists, add this pending op to its list, looking for conflicts
+            // Optimize by maintaining order based on offset and iterating backwards to reduce search time, assuming ops are mostly fetched in order
+            list_for_each_entry_reverse(other_pending_checksum_op, &merkle_leaf->pending_children, list) {
+                if (other_pending_checksum_op->parent_page_offset < pending_checksum_op->parent_page_offset) {
+                    // Iterating backwards in sorted order, found an op with a smaller offset. We should insert before this op
+                    list_add_tail(&pending_checksum_op->list, &other_pending_checksum_op->list);
+                    return;
+                }
+                else if (other_pending_checksum_op->parent_page_offset == pending_checksum_op->parent_page_offset) {
+                    // Conflict. Since there can be at most 1 outgoing op at once, the preexisting op MUST be a write (the read wouldn't have returned yet and allowed a 2nd op)
+                    if (pending_checksum_op->read_bio != NULL) {
+                        // If we're a read, copy the write's hash for verification once the page is read back from disk
+                        bio_data = pending_checksum_op->read_bio->bi_private;
+                        memcpy(bio_data->checksum_and_iv + pending_checksum_op->read_checksum_offset, other_pending_checksum_op->checksum, AES_GCM_INTEGRITY_SIZE);
+                        // This read op has been satisfied, so we don't need the pending_checksum_op anymore
+                        atomic_dec(&bio_data->ref_counter);
+                        kfree(pending_checksum_op);
+                    }
+                    else {
+                        // If we're a write, overwrite the old write
+                        list_replace(&other_pending_checksum_op->list, &pending_checksum_op->list);
+                        kfree(other_pending_checksum_op);
+                    }
                     return;
                 }
             }
-            // Add this pending op to that page and return
-            rb_link_node(&pending_checksum_op->tree_node, tree_node, tree_node_location);
-            rb_insert_color(&pending_checksum_op->tree_node, &merkle_leaf->pending_checksum_ops);
+
+            // List empty, add to head. This is only possible if the page finished processing all children and is en route to disk
+            list_add_tail(&pending_checksum_op->list, &merkle_leaf->pending_children);
             return;
         }
     }
 
     // Page hasn't been requested, add it
-    merkle_leaf = create_merkle_bio(device, device->merkle_tree_height - 1, parent_page_num, pending_checksum_op->parent_page_offset);
+    merkle_leaf = create_and_submit_merkle_bio(device, device->merkle_tree_height - 1, parent_page_num, pending_checksum_op->parent_page_offset);
     rb_link_node(&merkle_leaf->tree_node, tree_node, tree_node_location);
     rb_insert_color(&merkle_leaf->tree_node, &device->merkle_tree_layers[device->merkle_tree_height - 1]);
-    parent_bio_datas[*num_parent_bios] = merkle_leaf;
-    (*num_parent_bios)++;
 
     // Add this pending op to the new page
-    rb_link_node(&pending_checksum_op->tree_node, tree_node, &merkle_leaf->pending_checksum_ops.rb_node);
-    rb_insert_color(&pending_checksum_op->tree_node, &merkle_leaf->pending_checksum_ops);
+    list_add_tail(&pending_checksum_op->list, &merkle_leaf->pending_children);
 
     // Iterate through all ancestors to fetch the pages if necessary
-    add_merkle_node_request(device, merkle_leaf, device->merkle_tree_height - 2, parent_page_num / AES_GCM_PER_PAGE, parent_page_num % AES_GCM_PER_PAGE, parent_bio_datas, num_parent_bios);
+    add_merkle_node_request(device, merkle_leaf, device->merkle_tree_height - 2, parent_page_num / AES_GCM_PER_PAGE, parent_page_num % AES_GCM_PER_PAGE);
 }
 
-void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data, struct merkle_bio_data **parent_bio_datas, int *num_parent_bios) {
+void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data) {
     struct bio *bio = bio_data->bio_src;
     struct pending_checksum_op *pending_checksum_op;
     int parent_page_num, curr_sector, curr_page;
     int checksum_offset = 0;
+
+    // TODO: Fast path if the entire tree is in memory
+    if (device->merkle_tree_height == 1) {
+        return;
+    }
+
+    mutex_lock(&device->merkle_tree_lock);
 
     // Create a pending_checksum_op for each page in the bio
     while (bio->bi_iter.bi_size) {
@@ -396,7 +532,7 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data,
         parent_page_num = curr_page / AES_GCM_PER_PAGE;
 
         // Add to pending ops, check if the parent's parent also needs to be fetched
-        add_merkle_leaf_request(device, pending_checksum_op, parent_page_num, parent_bio_datas, num_parent_bios);
+        add_merkle_leaf_request(device, pending_checksum_op, parent_page_num);
 
         bio_advance_iter(bio, &bio->bi_iter, ROLLBACCINE_ENCRYPTION_GRANULARITY);
         checksum_offset += AES_GCM_INTEGRITY_SIZE;
@@ -406,33 +542,8 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data,
     bio->bi_iter.bi_sector = bio_data->start_sector;
     bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
     bio->bi_iter.bi_idx = 0;
-}
 
-// Layer is 0 indexed. Layer = tree_height for data read/writes
-void fetch_merkle_leaf(struct merkle_device *device, struct bio_data *bio_data) {
-    int num_pages = bio_sectors(bio_data->bio_src) / SECTORS_PER_PAGE;
-    struct merkle_bio_data **parent_bio_datas;
-    int num_parent_bios = 0;
-    int i;
-
-    // TODO: Fast path if the entire tree is in memory
-    if (device->merkle_tree_height == 1) {
-        return;
-    }
-
-    parent_bio_datas = kmalloc(num_pages * (device->merkle_tree_height - 1) * sizeof(struct merkle_bio_data *), GFP_KERNEL);
-
-    mutex_lock(&device->merkle_tree_lock);
-    fetch_merkle_nodes(device, bio_data, parent_bio_datas, &num_parent_bios);
     mutex_unlock(&device->merkle_tree_lock);
-
-    // Read all parent bios. Note that we shouldn't read unless the previous write has completed.
-    // All parent_bio_datas must have made it to disk, since if the previous write hasn't, then it would exist in the pending_checksums list and this parent bio_data wouldn't have been created
-    for (i = 0; i < num_parent_bios; i++) {
-        submit_bio_noacct(parent_bio_datas[i]->bio_src);
-    }
-
-    kfree(parent_bio_datas);
 }
 
 void free_pages_end_io(struct bio *bio) {
@@ -476,6 +587,12 @@ void write_disk_end_io(struct bio *shallow_clone) {
     try_free_bio(bio_data);
 }
 
+void read_disk_end_io(struct bio *shallow_clone) {
+    struct bio_data *bio_data = shallow_clone->bi_private;
+
+    // TODO
+}
+
 struct bio *shallow_bio_clone(struct merkle_device *device, struct bio *bio_src) {
     struct bio *clone;
     clone = bio_alloc_clone(bio_src->bi_bdev, bio_src, GFP_NOIO, &device->bs);
@@ -502,6 +619,7 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
     bio_data->start_sector = bio->bi_iter.bi_sector;
     bio_data->end_sector = bio->bi_iter.bi_sector + bio_sectors(bio);
     bio_data->is_write = bio_data_dir(bio) == WRITE;
+    bio_data->checksum_and_iv = alloc_bio_checksum(bio_sectors(bio));
 
     switch (bio_data_dir(bio)) {
         case WRITE:
@@ -513,11 +631,6 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
             }
 
             // Encrypt
-            bio_data->checksum_and_iv = alloc_bio_checksum(bio_sectors(bio));
-            if (!bio_data->checksum_and_iv) {
-                printk(KERN_ERR "Could not allocate checksum_and_iv for bio");
-                return DM_MAPIO_REMAPPED;
-            }
             error = enc_or_dec_bio(bio_data, bio_data->checksum_and_iv, ROLLBACCINE_ENCRYPT);
             if (error) {
                 printk_ratelimited(KERN_ERR "Error encrypting bio %llu", bio_data->start_sector);
@@ -526,10 +639,6 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
 
             // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
             bio_data->shallow_clone = shallow_bio_clone(device, bio_data->deep_clone);
-            if (!bio_data->shallow_clone) {
-                printk(KERN_ERR "Could not create shallow clone");
-                return DM_MAPIO_REMAPPED;
-            }
             bio_data->shallow_clone->bi_end_io = write_disk_end_io;
 
             // Set shared data between clones
@@ -538,15 +647,35 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
             bio_data->shallow_clone->bi_private = bio_data;
 
             // Request merkle tree parent pages from disk
-            fetch_merkle_leaf(device, bio_data);
+            fetch_merkle_nodes(device, bio_data);
 
             submit_bio_noacct(bio_data->shallow_clone);
             break;
         case READ:
+            // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
+            bio_data->shallow_clone = shallow_bio_clone(device, bio);
+            bio_data->shallow_clone->bi_end_io = read_disk_end_io;
+            bio_data->shallow_clone->bi_private = bio_data;
+            atomic_set(&bio_data->ref_counter, 1);
+
+            // Request merkle tree parent pages from disk
+            fetch_merkle_nodes(device, bio_data);
+            
+            submit_bio_noacct(bio_data->shallow_clone);
             break;
     }
 
     return DM_MAPIO_REMAPPED;
+}
+
+void hash_buffer(struct merkle_device *device, char *buffer, size_t len, char *out) {
+    // Note: If this becomes a bottleneck, change to per_cpu hash_desc (and maybe disable interrupts to avoid mutexes?)
+    mutex_lock(&device->hash_lock);
+    int ret = crypto_shash_digest(device->hash_desc, buffer, len, out);
+    mutex_unlock(&device->hash_lock);
+    if (ret) {
+        printk_ratelimited(KERN_ERR "Could not hash buffer");
+    }
 }
 
 inline size_t bio_checksum_and_iv_size(int num_sectors) { return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_INTEGRITY_SIZE; }
@@ -597,6 +726,19 @@ int enc_or_dec_bio(struct bio_data *bio_data, unsigned char *full_checksum, enum
 
         sector_checksum = get_bio_checksum(full_checksum, bio_data->start_sector, curr_sector);
         sector_iv = sector_checksum + AES_GCM_AUTH_SIZE;
+
+        switch (enc_or_dec) {
+            case ROLLBACCINE_ENCRYPT:
+                // Generate a new IV
+                get_random_bytes(sector_iv, AES_GCM_IV_SIZE);
+                break;
+            case ROLLBACCINE_DECRYPT:
+                // Skip decryption for any block that has not been written to
+                if (mem_is_zero(sector_checksum, AES_GCM_AUTH_SIZE)) {
+                    goto enc_or_dec_next_sector;
+                }
+                break;
+        }
 
         // Lazily allocate the AEAD request, because a lot of reads are over blocks that have not been written to (so they will not pass !has_checksum and won't need to alloc)
         if (req == NULL) {
@@ -670,6 +812,12 @@ static int merkle_constructor(struct dm_target *ti, unsigned int argc, char **ar
 
     bioset_init(&device->bs, 0, 0, BIOSET_NEED_BVECS);
 
+    device->submit_bio_queue = alloc_workqueue("submit_bio_queue", 0, 0);
+    if (!device->submit_bio_queue) {
+        printk(KERN_ERR "Cannot allocate submit_bio_queue");
+        return -ENOMEM;
+    }
+
     device->read_hash_end_io_queue = alloc_workqueue("read_hash_end_io_queue", 0, 0);
     if (!device->read_hash_end_io_queue) {
         printk(KERN_ERR "Cannot allocate read_hash_end_io_queue");
@@ -695,6 +843,7 @@ static int merkle_constructor(struct dm_target *ti, unsigned int argc, char **ar
         printk(KERN_ERR "Error allocating hash");
         return PTR_ERR(device->insecure_hash_alg);
     }
+    mutex_init(&device->hash_lock);
     device->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->insecure_hash_alg), GFP_KERNEL);
     if (!device->hash_desc) {
         printk(KERN_ERR "Error allocating hash desc");
@@ -743,6 +892,7 @@ static void merkle_destructor(struct dm_target *ti) {
     crypto_free_shash(device->insecure_hash_alg);
     kfree(device->hash_desc);
     kvfree(device->merkle_tree_root);
+    destroy_workqueue(device->submit_bio_queue);
     destroy_workqueue(device->read_hash_end_io_queue);
     destroy_workqueue(device->write_hash_end_io_queue);
     dm_put_device(ti, device->dev);
