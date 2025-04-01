@@ -15,8 +15,7 @@
 #define SECTORS_PER_PAGE (PAGE_SIZE / SECTOR_SIZE)
 #define AES_GCM_IV_SIZE 12
 #define AES_GCM_AUTH_SIZE 16
-#define AES_GCM_INTEGRITY_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)
-#define AES_GCM_PER_PAGE (PAGE_SIZE / AES_GCM_INTEGRITY_SIZE)
+#define AES_GCM_PER_PAGE (PAGE_SIZE / AES_GCM_AUTH_SIZE)
 #define KEY_SIZE 16
 #define SHA256_SIZE 32
 #define DM_MSG_PREFIX "merkle"
@@ -51,8 +50,8 @@ struct merkle_device {
     struct shash_desc *hash_desc;
 
     int merkle_tree_height;        // Number of layers in merkle tree, including the layer in memory
-    int merkle_tree_num_pages; // Total number of pages in merkle tree (on disk)
-    int *pages_above_merkle_tree_layer;  // Note: [0] = 0 since there is no layer above the root, and [1] = 0 since the root is in memory
+    uint64_t disk_pages_for_merkle_tree;
+    int *disk_pages_above_merkle_tree_layer;  // Note: [0] = 0 since there is no layer above the root, and [1] = 0 since the root is in memory
 
     char *merkle_tree_root;  // Layer "0" of the merkle tree
     struct mutex merkle_tree_lock;
@@ -62,6 +61,10 @@ struct merkle_device {
     struct workqueue_struct *try_read_bio_queue;
     struct workqueue_struct *read_hash_end_io_queue;
     struct workqueue_struct *write_hash_end_io_queue;
+
+#ifdef MEMORY_TRACKING
+    atomic_t num_bio_data_not_freed;
+#endif
 };
 
 struct bio_data {
@@ -70,11 +73,10 @@ struct bio_data {
     struct bio *deep_clone;
     struct bio *shallow_clone;
     atomic_t ref_counter;  // The number of clones AND number of pending_checksum_ops with references to this bio. Once it hits 0, the bio can be freed
-    bool is_write;
     atomic_t retrieved_from_disk; // If this is a read, 1 once the page has been fetched from disk. Used to know when we can verify.
     sector_t start_sector;
     sector_t end_sector;
-    unsigned char *checksum_and_iv;
+    unsigned char *checksum;
 
     struct work_struct work; // For scheduling read tasks in a locked context (while iterating through the merkle tree)
 };
@@ -104,55 +106,98 @@ struct merkle_bio_data {
 struct pending_checksum_op {
     int parent_page_offset; // Offset into the parent
     int read_checksum_offset; // Read: Within the read_bio, the offset of the checksum
-    char checksum[AES_GCM_INTEGRITY_SIZE]; // Write: The hash of the written page
+    char checksum[AES_GCM_AUTH_SIZE]; // Write: The hash of the written page
     struct bio *read_bio;     // NULL if this is a write, since writes can ACK early and don't need to wait here
     struct list_head list; // For the pending_children list in merkle_bio_data
 };
 
 enum EncDecType { ROLLBACCINE_ENCRYPT, ROLLBACCINE_DECRYPT };
 
+void submit_merkle_bio_task(struct work_struct *work);
+void init_merkle_tree(struct merkle_device *device);
+
+void recursive_remove_merkle_node(struct merkle_bio_data *bio_data, bool recursive);
+void write_hash_end_io_task(struct work_struct *work);
+void write_hash_end_io(struct bio *bio);
+void verify_merkle_node(struct merkle_bio_data *bio_data);
+void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool recursive);
+void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data);
+void read_hash_end_io_task(struct work_struct *work);
+void read_hash_end_io(struct bio *bio);
+
+void free_merkle_bio(struct merkle_bio_data *bio_data);
+struct merkle_bio_data *create_and_submit_merkle_bio(struct merkle_device *device, int layer, int page_num, int page_offset);
+void add_merkle_node_request(struct merkle_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset);
+void add_merkle_leaf_request(struct merkle_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num);
+void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data);
+
+void free_pages_end_io(struct bio_data *bio_data, struct bio *bio);
+void free_bio_data(struct bio_data *bio_data);
+void ack_bio_to_user_without_executing(struct bio *bio);
+void write_disk_end_io(struct bio *shallow_clone);
+void try_read_bio_task(struct work_struct *work);
+void try_read_bio(struct bio_data *bio_data);
+void read_disk_end_io(struct bio *shallow_clone);
+
+struct bio *shallow_bio_clone(struct merkle_device *device, struct bio *bio_src);
+struct bio *deep_bio_clone(struct merkle_device *device, struct bio *bio_src);
+void hash_buffer(struct merkle_device *device, char *buffer, size_t len, char *out);
+int enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec);
 int __init dm_merkle_init(void);
 void dm_merkle_exit(void);
+
+inline unsigned char *alloc_bio_checksum(int num_sectors) {
+    if (num_sectors != 0) {
+        return kmalloc(num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_AUTH_SIZE, GFP_KERNEL);
+    } else {
+        return NULL;
+    }
+}
+
+inline unsigned char *get_bio_checksum(struct bio_data *bio_data, sector_t current_sector) {
+    return bio_data->checksum + (current_sector - bio_data->start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_AUTH_SIZE;
+}
+
+inline bool mem_is_zero(void *addr, size_t size) {
+    return memchr_inv(addr, 0, size) == NULL;
+}
 
 void submit_merkle_bio_task(struct work_struct *work) {
     struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
     submit_bio_noacct(bio_data->bio_src);
 }
 
-void init_merkle_tree(struct merkle_device *device, uint64_t max_merkle_root_pages) {
-    int smallest_layer_pages, i;
-    int total_integrity_pages = device->num_sectors * ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_INTEGRITY_SIZE / AES_GCM_PER_PAGE;
+void init_merkle_tree(struct merkle_device *device) {
+    int i, j;
+    int total_checksum_pages = device->num_sectors * ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_AUTH_SIZE / AES_GCM_PER_PAGE;
+    int pages_in_memory = total_checksum_pages;
+    int pages_on_disk = 0;
 
-    device->merkle_tree_height = 0;
+    device->merkle_tree_height = 1;
 
-    do {
-        smallest_layer_pages = total_integrity_pages;
-        for (i = 0; i < device->merkle_tree_height; i++) {
-            // Calculate the size of the smallest Merkle tree hash layer
-            // Round layer size up so we have enough space
-            smallest_layer_pages = (smallest_layer_pages + AES_GCM_PER_PAGE - 1) / AES_GCM_PER_PAGE;
-        }
-
+    while (pages_on_disk + pages_in_memory < device->disk_pages_for_merkle_tree) {
+        pages_on_disk += pages_in_memory;
+        pages_in_memory = (pages_in_memory + SHA256_SIZE - 1) / SHA256_SIZE;
         device->merkle_tree_height++;
-    } while (smallest_layer_pages > max_merkle_root_pages);
+    }
 
-    printk(KERN_INFO "num_sectors: %d, max_merkle_root_pages: %llu, smallest_layer_pages: %llu, height: %d", device->num_sectors, max_merkle_root_pages, smallest_layer_pages, device->merkle_tree_height);
+    printk(KERN_INFO "num_sectors: %llu, disk_pages_for_merkle_tree: %llu, pages_on_disk: %d, pages_in_memory: %d, height: %d", device->num_sectors, device->disk_pages_for_merkle_tree, pages_on_disk, pages_in_memory, device->merkle_tree_height);
 
-    device->merkle_tree_root = vzalloc(smallest_layer_pages * PAGE_SIZE);
+    device->merkle_tree_root = vzalloc(pages_in_memory * PAGE_SIZE);
     if (!device->merkle_tree_root) {
         printk(KERN_ERR "Could not allocate merkle tree root");
         return;
     }
 
-    device->pages_above_merkle_tree_layer = kzalloc(device->merkle_tree_height * sizeof(int), GFP_KERNEL);
-    device->pages_above_merkle_tree_layer[device->merkle_tree_height - 1] = total_integrity_pages;
+    device->disk_pages_above_merkle_tree_layer = kzalloc(device->merkle_tree_height * sizeof(int), GFP_KERNEL);
+
     // Note: [0] = 0 since there is no layer above the root, and [1] = 0 since the root is in memory
-    for (i = device->merkle_tree_height - 2; i > 1; i--) {
-        device->pages_above_merkle_tree_layer[i] = (device->pages_above_merkle_tree_layer[i + 1] + AES_GCM_PER_PAGE - 1) / AES_GCM_PER_PAGE;
-    }
-    device->merkle_tree_num_pages = 0;
-    for (i = 2; i < device->merkle_tree_height; i++) {
-        device->merkle_tree_num_pages += device->pages_above_merkle_tree_layer[i];
+    pages_in_memory = total_checksum_pages;
+    for (i = device->merkle_tree_height - 1; i > 1; i--) {
+        pages_in_memory = (pages_in_memory + SHA256_SIZE - 1) / SHA256_SIZE;
+        for (j = i; j < device->merkle_tree_height; j++) {
+            device->disk_pages_above_merkle_tree_layer[j] += pages_in_memory;
+        }
     }
 
     device->merkle_tree_layers = kzalloc(device->merkle_tree_height * sizeof(struct rb_root), GFP_KERNEL);
@@ -161,6 +206,9 @@ void init_merkle_tree(struct merkle_device *device, uint64_t max_merkle_root_pag
         device->merkle_tree_layers[i] = RB_ROOT;
     }
 }
+
+// int merkle_root_hash_offset(struct merkle_device *device, int page_num) {
+// }
 
 void recursive_remove_merkle_node(struct merkle_bio_data *bio_data, bool recursive) {
     struct merkle_device *device = bio_data->device;
@@ -181,7 +229,6 @@ void write_hash_end_io_task(struct work_struct *work) {
     struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
     struct bio *bio = bio_data->bio_src;
     struct merkle_device *device = bio_data->device;
-    bool no_more_pending_ops;
 
     mutex_lock(&device->merkle_tree_lock);
     if (list_empty(&bio_data->pending_children)) {
@@ -202,10 +249,6 @@ void write_hash_end_io(struct bio *bio) {
     struct merkle_bio_data *bio_data = bio->bi_private;
     INIT_WORK(&bio_data->work, write_hash_end_io_task);
     queue_work(bio_data->device->write_hash_end_io_queue, &bio_data->work);
-}
-
-inline bool mem_is_zero(void *addr, size_t size) {
-    return memchr_inv(addr, 0, size) == NULL;
 }
 
 // Note: Assumes that merkle_tree_lock is held, and that if the node has a parent, the parent has been verified
@@ -236,8 +279,6 @@ void verify_merkle_node(struct merkle_bio_data *bio_data) {
 void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool recursive) {
     struct merkle_device *device = bio_data->device;
     struct bio *bio = bio_data->bio_src;
-    struct page *parent_page;
-    void *parent_page_addr;
 
     // Only evict once there are no more dependents
     if (!list_empty(&bio_data->pending_children)) {
@@ -246,6 +287,8 @@ void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool rec
 
     if (bio_data->dirtied) {
         // Lower levels have been modified. Modify the parent's hash, then flush to disk. Don't remove the data structure yet (to prevent concurrent reads)
+        hash_buffer(device, bio_data->page_addr, PAGE_SIZE, bio_data->hash);
+
         if (bio_data->parent != NULL) {
             // Modify parent's page
             memcpy(bio_data->parent->page_addr + bio_data->parent_page_offset, bio_data->hash, SHA256_SIZE);
@@ -288,13 +331,13 @@ void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
             if (pending_checksum_op->read_bio != NULL) {
                 // Read
                 read_bio_data = pending_checksum_op->read_bio->bi_private;
-                memcpy(read_bio_data->checksum_and_iv + pending_checksum_op->read_checksum_offset, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_INTEGRITY_SIZE);
+                memcpy(read_bio_data->checksum + pending_checksum_op->read_checksum_offset, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_AUTH_SIZE);
                 // Schedule the read
                 INIT_WORK(&read_bio_data->work, try_read_bio_task);
                 queue_work(device->try_read_bio_queue, &read_bio_data->work);
             } else {
                 // Write
-                memcpy(bio_data->page_addr + pending_checksum_op->parent_page_offset, pending_checksum_op->checksum, AES_GCM_INTEGRITY_SIZE);
+                memcpy(bio_data->page_addr + pending_checksum_op->parent_page_offset, pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
                 bio_data->dirtied = true;
             }
             list_del(&pending_checksum_op->list);
@@ -364,24 +407,24 @@ void free_merkle_bio(struct merkle_bio_data *bio_data) {
     kfree(bio_data);
 }
 
-struct merkle_bio_data *create_and_submit_merkle_bio(struct merkle_device *device, int layer, int page, int page_offset) {
+struct merkle_bio_data *create_and_submit_merkle_bio(struct merkle_device *device, int layer, int page_num, int page_offset) {
     struct merkle_bio_data *bio_data;
     struct page *page;
     struct bio *bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
-    bio->bi_iter.bi_sector = page * SECTORS_PER_PAGE;
+    bio->bi_iter.bi_sector = page_num * SECTORS_PER_PAGE;
 
     page = alloc_page(GFP_KERNEL);
     if (!page) {
         printk(KERN_ERR "Could not allocate page");
         return NULL;
     }
-    _bio_add_page(bio, page, PAGE_SIZE, 0);
+    __bio_add_page(bio, page, PAGE_SIZE, 0);
     bio->bi_end_io = read_hash_end_io;
 
     bio_data = kzalloc(sizeof(struct merkle_bio_data), GFP_KERNEL);
     bio_data->device = device;
     bio_data->bio_src = bio;
-    bio_data->page_num = bio->bi_iter.bi_sector / SECTORS_PER_PAGE;
+    bio_data->page_num = page_num;
     bio_data->layer = layer;
     // Note: parent should be filled in once the parent bio is created
     bio_data->parent_page_offset = page_offset;
@@ -400,11 +443,6 @@ void add_merkle_node_request(struct merkle_device *device, struct merkle_bio_dat
     struct rb_node **tree_node_location;
     struct rb_node *tree_node;
     struct merkle_bio_data *merkle_node;
-
-    // Stop if the parent must be in memory
-    if (layer < 1) {
-        return;
-    }
 
     tree_node_location = &(device->merkle_tree_layers[layer].rb_node);
 
@@ -433,12 +471,16 @@ void add_merkle_node_request(struct merkle_device *device, struct merkle_bio_dat
     child->parent = merkle_node;
 
     // Iterate through all ancestors to fetch the pages if necessary
-    add_merkle_node_request(device, merkle_node, layer - 1, parent_page_num / AES_GCM_PER_PAGE, parent_page_num % AES_GCM_PER_PAGE);
+    if (layer - 1 > 0) {
+        parent_page_num -= device->disk_pages_above_merkle_tree_layer[layer];  // Remove padding
+        add_merkle_node_request(device, merkle_node, layer - 1, parent_page_num / SHA256_SIZE + device->disk_pages_above_merkle_tree_layer[layer - 1], parent_page_num % SHA256_SIZE);
+    }
 }
 
 void add_merkle_leaf_request(struct merkle_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num) {
-    struct bio_data *bio_data;
-    struct rb_node **tree_node_location = &(device->merkle_tree_layers[device->merkle_tree_height - 1].rb_node);
+    int layer = device->merkle_tree_height - 1;
+    struct bio_data * bio_data;
+    struct rb_node **tree_node_location = &(device->merkle_tree_layers[layer].rb_node);
     struct rb_node *tree_node;
     struct merkle_bio_data *merkle_leaf;
     struct pending_checksum_op *other_pending_checksum_op;
@@ -466,7 +508,7 @@ void add_merkle_leaf_request(struct merkle_device *device, struct pending_checks
                     if (pending_checksum_op->read_bio != NULL) {
                         // If we're a read, copy the write's hash for verification once the page is read back from disk
                         bio_data = pending_checksum_op->read_bio->bi_private;
-                        memcpy(bio_data->checksum_and_iv + pending_checksum_op->read_checksum_offset, other_pending_checksum_op->checksum, AES_GCM_INTEGRITY_SIZE);
+                        memcpy(bio_data->checksum + pending_checksum_op->read_checksum_offset, other_pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
                         // This read op has been satisfied, so we don't need the pending_checksum_op anymore
                         atomic_dec(&bio_data->ref_counter);
                         kfree(pending_checksum_op);
@@ -487,25 +529,38 @@ void add_merkle_leaf_request(struct merkle_device *device, struct pending_checks
     }
 
     // Page hasn't been requested, add it
-    merkle_leaf = create_and_submit_merkle_bio(device, device->merkle_tree_height - 1, parent_page_num, pending_checksum_op->parent_page_offset);
+    merkle_leaf = create_and_submit_merkle_bio(device, layer, parent_page_num, pending_checksum_op->parent_page_offset);
     rb_link_node(&merkle_leaf->tree_node, tree_node, tree_node_location);
-    rb_insert_color(&merkle_leaf->tree_node, &device->merkle_tree_layers[device->merkle_tree_height - 1]);
+    rb_insert_color(&merkle_leaf->tree_node, &device->merkle_tree_layers[layer]);
 
     // Add this pending op to the new page
     list_add_tail(&pending_checksum_op->list, &merkle_leaf->pending_children);
 
     // Iterate through all ancestors to fetch the pages if necessary
-    add_merkle_node_request(device, merkle_leaf, device->merkle_tree_height - 2, parent_page_num / AES_GCM_PER_PAGE, parent_page_num % AES_GCM_PER_PAGE);
+    if (layer - 1 > 0) {
+        parent_page_num -= device->disk_pages_above_merkle_tree_layer[layer];  // Remove padding
+        add_merkle_node_request(device, merkle_leaf, layer - 1, parent_page_num / SHA256_SIZE + device->disk_pages_above_merkle_tree_layer[layer - 1], parent_page_num % SHA256_SIZE);
+    }
 }
 
 void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data) {
     struct bio *bio = bio_data->bio_src;
     struct pending_checksum_op *pending_checksum_op;
-    int parent_page_num, curr_sector, curr_page;
+    int parent_page_num, curr_sector, curr_page, num_pages;
     int checksum_offset = 0;
 
-    // TODO: Fast path if the entire tree is in memory
+    // Fast path if the entire tree is in memory
     if (device->merkle_tree_height == 1) {
+        curr_page = bio_data->start_sector / SECTORS_PER_PAGE;
+        num_pages = (bio_data->end_sector - bio_data->start_sector) / SECTORS_PER_PAGE;
+        switch (bio_data_dir(bio)) {
+            case WRITE:
+                memcpy(device->merkle_tree_root + curr_page * AES_GCM_AUTH_SIZE, bio_data->checksum, num_pages * AES_GCM_AUTH_SIZE);
+                break;
+            case READ:
+                memcpy(bio_data->checksum, device->merkle_tree_root + curr_page * AES_GCM_AUTH_SIZE, num_pages * AES_GCM_AUTH_SIZE);
+                break;
+        }
         return;
     }
 
@@ -514,15 +569,16 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data)
     // Create a pending_checksum_op for each page in the bio
     while (bio->bi_iter.bi_size) {
         curr_sector = bio->bi_iter.bi_sector;
-        curr_page = curr_sector / SECTORS_PER_PAGE - device->merkle_tree_num_pages;
+        // Remove merkle tree padding in calculations
+        curr_page = curr_sector / SECTORS_PER_PAGE - device->disk_pages_for_merkle_tree;
 
         pending_checksum_op = kmalloc(sizeof(struct pending_checksum_op), GFP_KERNEL);
-        pending_checksum_op->parent_page_offset = curr_page % AES_GCM_PER_PAGE;
+        pending_checksum_op->parent_page_offset = (curr_page % AES_GCM_PER_PAGE) * AES_GCM_AUTH_SIZE;
 
         switch (bio_data_dir(bio)) {
             case WRITE:
                 // If this is a write, copy the relevant part of the checksum to write to the parent
-                memcpy(pending_checksum_op->checksum, bio_data->checksum_and_iv + checksum_offset, AES_GCM_INTEGRITY_SIZE);
+                memcpy(pending_checksum_op->checksum, bio_data->checksum + checksum_offset, AES_GCM_AUTH_SIZE);
                 break;
             case READ:
                 // If this is a read, leave a reference to the bio so it can be notified when the read is ready
@@ -532,21 +588,20 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data)
                 break;
         }
         
-        parent_page_num = curr_page / AES_GCM_PER_PAGE;
+        parent_page_num = curr_page / AES_GCM_PER_PAGE + device->disk_pages_above_merkle_tree_layer[device->merkle_tree_height - 1];
 
         // Add to pending ops, check if the parent's parent also needs to be fetched
         add_merkle_leaf_request(device, pending_checksum_op, parent_page_num);
 
         bio_advance_iter(bio, &bio->bi_iter, ROLLBACCINE_ENCRYPTION_GRANULARITY);
-        checksum_offset += AES_GCM_INTEGRITY_SIZE;
+        checksum_offset += AES_GCM_AUTH_SIZE;
     }
+    mutex_unlock(&device->merkle_tree_lock);
 
     // Reset bio to start after iterating
     bio->bi_iter.bi_sector = bio_data->start_sector;
     bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
     bio->bi_iter.bi_idx = 0;
-
-    mutex_unlock(&device->merkle_tree_lock);
 }
 
 void free_pages_end_io(struct bio_data *bio_data, struct bio *bio) {
@@ -565,12 +620,16 @@ void free_pages_end_io(struct bio_data *bio_data, struct bio *bio) {
 }
 
 void free_bio_data(struct bio_data *bio_data) {
-    if (bio_data->checksum_and_iv != NULL) {
-        kfree(bio_data->checksum_and_iv);
+    if (bio_data->checksum != NULL) {
+        kfree(bio_data->checksum);
     }
     if (bio_data->shallow_clone != NULL) {
         bio_put(bio_data->shallow_clone);
     }
+
+#ifdef MEMORY_TRACKING
+    atomic_dec(&bio_data->device->num_bio_data_not_freed);
+#endif
     kfree(bio_data);
 }
 
@@ -601,7 +660,7 @@ void try_read_bio(struct bio_data *bio_data) {
 
     if (atomic_dec_and_test(&bio_data->ref_counter)) {
         // Ready to read when there are 0 other references
-        error = enc_or_dec_bio(bio_data, bio_data->checksum_and_iv, ROLLBACCINE_DECRYPT);
+        error = enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT);
         if (error) {
             printk_ratelimited(KERN_ERR "Error decrypting bio %llu", bio_data->start_sector);
             return;
@@ -629,21 +688,53 @@ struct bio *shallow_bio_clone(struct merkle_device *device, struct bio *bio_src)
     return clone;
 }
 
+struct bio *deep_bio_clone(struct merkle_device *device, struct bio *bio_src) {
+    struct bio *clone;
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+    struct page *page;
+
+    // Note: If bi_size is not a multiple of PAGE_SIZE, we have a BIG problem :(
+    clone = bio_alloc_bioset(bio_src->bi_bdev, bio_src->bi_iter.bi_size / PAGE_SIZE, bio_src->bi_opf, GFP_NOIO, &device->bs);
+    if (!clone) {
+        return NULL;
+    }
+
+    clone->bi_iter.bi_sector = bio_src->bi_iter.bi_sector;
+
+    bio_for_each_segment(bvec, bio_src, iter) {
+        page = alloc_page(GFP_KERNEL);
+        if (!page) {
+            bio_put(clone);
+            return NULL;
+        }
+        memcpy(kmap(page), kmap(bvec.bv_page) + bvec.bv_offset, bvec.bv_len);
+        kunmap(page);
+        kunmap(bvec.bv_page);
+
+        __bio_add_page(clone, page, bvec.bv_len, 0);
+    }
+    return clone;
+}
+
 static int merkle_map(struct dm_target *ti, struct bio *bio) {
     struct merkle_device *device = ti->private;
     struct bio_data *bio_data;
     int error;
 
     bio_set_dev(bio, device->dev->bdev);
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+    // Offset write to account for merkle tree on disk
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector) + device->disk_pages_for_merkle_tree * SECTORS_PER_PAGE;
 
     bio_data = kmalloc(sizeof(struct bio_data), GFP_KERNEL);
     bio_data->device = device;
     bio_data->bio_src = bio;
     bio_data->start_sector = bio->bi_iter.bi_sector;
     bio_data->end_sector = bio->bi_iter.bi_sector + bio_sectors(bio);
-    bio_data->is_write = bio_data_dir(bio) == WRITE;
-    bio_data->checksum_and_iv = alloc_bio_checksum(bio_sectors(bio));
+    bio_data->checksum = alloc_bio_checksum(bio_sectors(bio));
+#ifdef MEMORY_TRACKING
+    atomic_inc(&device->num_bio_data_not_freed);
+#endif
 
     switch (bio_data_dir(bio)) {
         case WRITE:
@@ -655,7 +746,7 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
             }
 
             // Encrypt
-            error = enc_or_dec_bio(bio_data, bio_data->checksum_and_iv, ROLLBACCINE_ENCRYPT);
+            error = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
             if (error) {
                 printk_ratelimited(KERN_ERR "Error encrypting bio %llu", bio_data->start_sector);
                 return DM_MAPIO_REMAPPED;
@@ -702,31 +793,16 @@ void hash_buffer(struct merkle_device *device, char *buffer, size_t len, char *o
     }
 }
 
-inline size_t bio_checksum_and_iv_size(int num_sectors) { return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_INTEGRITY_SIZE; }
-
-inline unsigned char *alloc_bio_checksum_and_iv(int num_sectors) {
-    if (num_sectors != 0) {
-        return kmalloc(bio_checksum_and_ivsize(num_sectors), GFP_KERNEL);
-    } else {
-        return NULL;
-    }
-}
-
-inline unsigned char *get_bio_checksum(unsigned char *checksum, sector_t start_sector, sector_t current_sector) {
-    return checksum + (current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_INTEGRITY_SIZE;
-}
-
-int enc_or_dec_bio(struct bio_data *bio_data, unsigned char *full_checksum, enum EncDecType enc_or_dec) {
+int enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
     int ret = 0;
     struct bio *bio;
     struct bio_vec bv;
     sector_t curr_sector;
     struct aead_request *req;
     struct scatterlist sg[4];
-    struct page *page_verify;
     DECLARE_CRYPTO_WAIT(wait);
     unsigned char *sector_checksum;
-    unsigned char *sector_iv;
+    char sector_iv[AES_GCM_IV_SIZE];
 
     if (bio_data->end_sector == bio_data->start_sector) {
         // printk(KERN_INFO "Skipping encryption/decryption for empty bio");
@@ -748,20 +824,12 @@ int enc_or_dec_bio(struct bio_data *bio_data, unsigned char *full_checksum, enum
         curr_sector = bio->bi_iter.bi_sector;
         bv = bio_iter_iovec(bio, bio->bi_iter);
 
-        sector_checksum = get_bio_checksum(full_checksum, bio_data->start_sector, curr_sector);
-        sector_iv = sector_checksum + AES_GCM_AUTH_SIZE;
+        sector_checksum = get_bio_checksum(bio_data, curr_sector);
+        memcpy(sector_iv, &curr_sector, sizeof(uint64_t));
 
-        switch (enc_or_dec) {
-            case ROLLBACCINE_ENCRYPT:
-                // Generate a new IV
-                get_random_bytes(sector_iv, AES_GCM_IV_SIZE);
-                break;
-            case ROLLBACCINE_DECRYPT:
-                // Skip decryption for any block that has not been written to
-                if (mem_is_zero(sector_checksum, AES_GCM_AUTH_SIZE)) {
-                    goto enc_or_dec_next_sector;
-                }
-                break;
+        // Skip decryption for any block that has not been written to
+        if (enc_or_dec == ROLLBACCINE_DECRYPT && mem_is_zero(sector_checksum, AES_GCM_AUTH_SIZE)) {
+            goto enc_or_dec_next_sector;
         }
 
         // Lazily allocate the AEAD request, because a lot of reads are over blocks that have not been written to (so they will not pass !has_checksum and won't need to alloc)
@@ -822,9 +890,19 @@ free_and_return:
     return ret;
 }
 
+static void merkle_status(struct dm_target *ti, status_type_t type, unsigned int status_flags, char *result, unsigned int maxlen) {
+    struct merkle_device *device = ti->private;
+    unsigned int sz = 0;  // Required by DMEMIT
+
+    DMEMIT("\n");
+#ifdef MEMORY_TRACKING
+    DMEMIT("Num bio_data not freed: %d\n", atomic_read(&device->num_bio_data_not_freed));
+#endif
+}
+
+// Args: [1] disk_pages_for_merkle_tree
 static int merkle_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
-    int i;
-    uint64_t max_merkle_root_pages;
+    int error;
 
     printk(KERN_INFO "merkle constructor called\n");
 
@@ -889,24 +967,22 @@ static int merkle_constructor(struct dm_target *ti, unsigned int argc, char **ar
     }
     crypto_aead_setauthsize(device->tfm, AES_GCM_AUTH_SIZE);
 
-    ti->error = crypto_aead_setkey(device->tfm, "abcdefghijklmnop", KEY_SIZE);
-    if (ti->error < 0) {
+    error = crypto_aead_setkey(device->tfm, "abcdefghijklmnop", KEY_SIZE);
+    if (error < 0) {
         printk(KERN_ERR "Error setting key");
-        return ti->error;
+        return error;
     }
 
     device->num_sectors = ti->len;
 
-    ti->error = kstrtou64(argv[1], 10, max_merkle_root_pages);
-    if (ti->error < 0) {
-        printk(KERN_ERR "Error parsing max_merkle_root_pages");
-        return ti->error;
+    error = kstrtou64(argv[1], 10, &device->disk_pages_for_merkle_tree);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing disk_pages_for_merkle_tree");
+        return error;
     }
 
     mutex_init(&device->merkle_tree_lock);
-    init_merkle_tree(device, max_merkle_root_pages);
-
-    // TODO: Remap write sectors to be after where we store the merkle tree on disk
+    init_merkle_tree(device);
 
     ti->private = device;
 
@@ -922,6 +998,8 @@ static void merkle_destructor(struct dm_target *ti) {
     crypto_free_shash(device->insecure_hash_alg);
     kfree(device->hash_desc);
     kvfree(device->merkle_tree_root);
+    kfree(device->disk_pages_above_merkle_tree_layer);
+    kfree(device->merkle_tree_layers);
     destroy_workqueue(device->submit_bio_queue);
     destroy_workqueue(device->try_read_bio_queue);
     destroy_workqueue(device->read_hash_end_io_queue);
@@ -937,6 +1015,7 @@ static struct target_type merkle_target = {
     .module = THIS_MODULE,
     .ctr = merkle_constructor,
     .dtr = merkle_destructor,
+    .status = merkle_status,
     .map = merkle_map,
 };
 
