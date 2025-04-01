@@ -59,6 +59,7 @@ struct merkle_device {
     struct rb_root *merkle_tree_layers;  // Note: [0] = NULL always, since that layer is represented by merkle_tree_root in memory
     
     struct workqueue_struct *submit_bio_queue;
+    struct workqueue_struct *try_read_bio_queue;
     struct workqueue_struct *read_hash_end_io_queue;
     struct workqueue_struct *write_hash_end_io_queue;
 };
@@ -74,6 +75,8 @@ struct bio_data {
     sector_t start_sector;
     sector_t end_sector;
     unsigned char *checksum_and_iv;
+
+    struct work_struct work; // For scheduling read tasks in a locked context (while iterating through the merkle tree)
 };
 
 struct merkle_bio_data {
@@ -286,12 +289,12 @@ void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
                 // Read
                 read_bio_data = pending_checksum_op->read_bio->bi_private;
                 memcpy(read_bio_data->checksum_and_iv + pending_checksum_op->read_checksum_offset, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_INTEGRITY_SIZE);
-                if (atomic_dec_return(&read_bio_data->ref_counter) == 1) {
-                    // TODO: The read can now be performed, schedule it on a task
-                }
+                // Schedule the read
+                INIT_WORK(&read_bio_data->work, try_read_bio_task);
+                queue_work(device->try_read_bio_queue, &read_bio_data->work);
             } else {
                 // Write
-                memcpy(pending_checksum_op->checksum, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_INTEGRITY_SIZE);
+                memcpy(bio_data->page_addr + pending_checksum_op->parent_page_offset, pending_checksum_op->checksum, AES_GCM_INTEGRITY_SIZE);
                 bio_data->dirtied = true;
             }
             list_del(&pending_checksum_op->list);
@@ -546,8 +549,7 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data)
     mutex_unlock(&device->merkle_tree_lock);
 }
 
-void free_pages_end_io(struct bio *bio) {
-    struct bio_data *bio_data = bio->bi_private;
+void free_pages_end_io(struct bio_data *bio_data, struct bio *bio) {
     struct bio_vec bvec;
     struct bvec_iter iter;
 
@@ -559,20 +561,17 @@ void free_pages_end_io(struct bio *bio) {
         __free_page(bvec.bv_page);
     }
 
-    if (bio_data->checksum_and_iv != NULL) {
-        kfree(bio_data->checksum_and_iv);
-    }
-    kfree(bio_data);
-
     bio_put(bio);
 }
 
-void try_free_bio(struct bio_data *bio_data) {
-    if (atomic_dec_and_test(&bio_data->ref_counter)) {
-        // printk(KERN_INFO "Freeing clone, write index: %d", deep_clone_bio_data->write_index);
-        bio_put(bio_data->shallow_clone);
-        free_pages_end_io(bio_data->deep_clone);
+void free_bio_data(struct bio_data *bio_data) {
+    if (bio_data->checksum_and_iv != NULL) {
+        kfree(bio_data->checksum_and_iv);
     }
+    if (bio_data->shallow_clone != NULL) {
+        bio_put(bio_data->shallow_clone);
+    }
+    kfree(bio_data);
 }
 
 void ack_bio_to_user_without_executing(struct bio *bio) {
@@ -584,13 +583,38 @@ void write_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
 
     ack_bio_to_user_without_executing(bio_data->bio_src);
-    try_free_bio(bio_data);
+
+    if (atomic_dec_and_test(&bio_data->ref_counter)) {
+        // printk(KERN_INFO "Freeing clone, write index: %d", deep_clone_bio_data->write_index);
+        free_pages_end_io(bio_data, bio_data->deep_clone);
+        free_bio_data(bio_data);
+    }
+}
+
+void try_read_bio_task(struct work_struct *work) {
+    struct bio_data *bio_data = container_of(work, struct bio_data, work);
+    try_read_bio(bio_data);
+}
+
+void try_read_bio(struct bio_data *bio_data) {
+    int error;
+
+    if (atomic_dec_and_test(&bio_data->ref_counter)) {
+        // Ready to read when there are 0 other references
+        error = enc_or_dec_bio(bio_data, bio_data->checksum_and_iv, ROLLBACCINE_DECRYPT);
+        if (error) {
+            printk_ratelimited(KERN_ERR "Error decrypting bio %llu", bio_data->start_sector);
+            return;
+        }
+
+        bio_endio(bio_data->bio_src);
+        free_bio_data(bio_data);
+    }
 }
 
 void read_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
-
-    // TODO
+    try_read_bio(bio_data);
 }
 
 struct bio *shallow_bio_clone(struct merkle_device *device, struct bio *bio_src) {
@@ -818,6 +842,12 @@ static int merkle_constructor(struct dm_target *ti, unsigned int argc, char **ar
         return -ENOMEM;
     }
 
+    device->try_read_bio_queue = alloc_workqueue("try_read_bio_queue", 0, 0);
+    if (!device->try_read_bio_queue) {
+        printk(KERN_ERR "Cannot allocate try_read_bio_queue");
+        return -ENOMEM;
+    }
+
     device->read_hash_end_io_queue = alloc_workqueue("read_hash_end_io_queue", 0, 0);
     if (!device->read_hash_end_io_queue) {
         printk(KERN_ERR "Cannot allocate read_hash_end_io_queue");
@@ -893,6 +923,7 @@ static void merkle_destructor(struct dm_target *ti) {
     kfree(device->hash_desc);
     kvfree(device->merkle_tree_root);
     destroy_workqueue(device->submit_bio_queue);
+    destroy_workqueue(device->try_read_bio_queue);
     destroy_workqueue(device->read_hash_end_io_queue);
     destroy_workqueue(device->write_hash_end_io_queue);
     dm_put_device(ti, device->dev);
