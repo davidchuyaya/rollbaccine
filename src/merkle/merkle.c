@@ -146,6 +146,11 @@ int enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec);
 int __init dm_merkle_init(void);
 void dm_merkle_exit(void);
 
+inline char *merkle_root_hash_offset(struct merkle_device *device, struct merkle_bio_data *bio_data) {
+    int page_num = bio_data->page_num - device->disk_pages_above_merkle_tree_layer[bio_data->layer];
+    return device->merkle_tree_root + page_num * SHA256_SIZE;
+}
+
 inline unsigned char *alloc_bio_checksum(int num_sectors) {
     if (num_sectors != 0) {
         return kmalloc(num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * AES_GCM_AUTH_SIZE, GFP_KERNEL);
@@ -207,19 +212,17 @@ void init_merkle_tree(struct merkle_device *device) {
     }
 }
 
-// int merkle_root_hash_offset(struct merkle_device *device, int page_num) {
-// }
-
 void recursive_remove_merkle_node(struct merkle_bio_data *bio_data, bool recursive) {
     struct merkle_device *device = bio_data->device;
 
     rb_erase(&bio_data->tree_node, &device->merkle_tree_layers[bio_data->layer]);
-    // Remove from parent's pending_children (works even if parent is NULL)
-    list_del(&bio_data->list);
-
-    // Check if any ancestor can also be evicted
-    if (recursive && bio_data->parent != NULL) {
-        recursive_evict_merkle_ancestors(bio_data->parent, recursive);
+    // Remove from parent's pending_children
+    if (bio_data->parent != NULL) {
+        list_del(&bio_data->list);
+        if (recursive) {
+            // Check if any ancestor can also be evicted
+            recursive_evict_merkle_ancestors(bio_data->parent, recursive);
+        }
     }
 
     free_merkle_bio(bio_data);
@@ -254,9 +257,15 @@ void write_hash_end_io(struct bio *bio) {
 // Note: Assumes that merkle_tree_lock is held, and that if the node has a parent, the parent has been verified
 void verify_merkle_node(struct merkle_bio_data *bio_data) {
     struct merkle_bio_data *parent = bio_data->parent;
+    int res;
 
     if (parent == NULL) {
-        // TODO: Verify against root
+        // Verify against root
+        res = memcmp(bio_data->hash, merkle_root_hash_offset(bio_data->device, bio_data), SHA256_SIZE);
+        if (res != 0) {
+            printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d", bio_data->page_num);
+            // Note: Should crash the system and enter recovery
+        }
     }
     else {
         if (bio_data->is_empty) {
@@ -266,7 +275,7 @@ void verify_merkle_node(struct merkle_bio_data *bio_data) {
             }
         }
         else {
-            int res = memcmp(bio_data->hash, bio_data->parent->page_addr + bio_data->parent_page_offset, SHA256_SIZE);
+            res = memcmp(bio_data->hash, bio_data->parent->page_addr + bio_data->parent_page_offset, SHA256_SIZE);
             if (res != 0) {
                 printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, parent: %d", bio_data->page_num, bio_data->parent->page_num);
                 // Note: Should crash the system and enter recovery
@@ -294,7 +303,8 @@ void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool rec
             memcpy(bio_data->parent->page_addr + bio_data->parent_page_offset, bio_data->hash, SHA256_SIZE);
             bio_data->parent->dirtied = true;
         } else {
-            // TODO: Modify in-memory checksum
+            // Modify in-memory checksum
+            memcpy(merkle_root_hash_offset(device, bio_data), bio_data->hash, SHA256_SIZE);
         }
 
         // Reset flags so other nodes don't mistake this for an in-memory page
@@ -549,6 +559,11 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data)
     int parent_page_num, curr_sector, curr_page, num_pages;
     int checksum_offset = 0;
 
+    // Don't need to do anything if the bio is empty
+    if (bio_sectors(bio) == 0) {
+        return;
+    }
+
     // Fast path if the entire tree is in memory
     if (device->merkle_tree_height == 1) {
         curr_page = bio_data->start_sector / SECTORS_PER_PAGE;
@@ -729,6 +744,7 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
     bio_data->start_sector = bio->bi_iter.bi_sector;
     bio_data->end_sector = bio->bi_iter.bi_sector + bio_sectors(bio);
     bio_data->checksum = alloc_bio_checksum(bio_sectors(bio));
+    bio->bi_private = bio_data;
 #ifdef MEMORY_TRACKING
     atomic_inc(&device->num_bio_data_not_freed);
 #endif
