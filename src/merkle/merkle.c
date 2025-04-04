@@ -48,8 +48,6 @@ struct merkle_device {
 
     struct crypto_aead *tfm;
     struct crypto_shash *insecure_hash_alg;
-    struct mutex hash_lock;
-    struct shash_desc *hash_desc;
 
     int merkle_tree_height;        // Number of layers in merkle tree, including the layer in memory
     uint64_t disk_pages_for_merkle_tree;
@@ -66,6 +64,8 @@ struct merkle_device {
 
 #ifdef MEMORY_TRACKING
     atomic_t num_bio_data_not_freed;
+    atomic_t num_pending_reads;
+    atomic_t num_pending_writes;
 #endif
 };
 
@@ -756,6 +756,9 @@ void write_disk_end_io(struct bio *shallow_clone) {
     if (bio_data->end_sector - bio_data->start_sector > 0) {
         remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
     }
+#ifdef MEMORY_TRACKING
+    atomic_dec(&bio_data->device->num_pending_writes);
+#endif
 
     ack_bio_to_user_without_executing(bio_data->bio_src);
 
@@ -774,6 +777,9 @@ void try_read_bio_task(struct work_struct *work) {
     }
     // Unblock pending writes
     remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
+#ifdef MEMORY_TRACKING
+    atomic_dec(&bio_data->device->num_pending_reads);
+#endif
 
     bio_endio(bio_data->bio_src);
     free_bio_data(bio_data);
@@ -864,6 +870,9 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
 
     switch (bio_data_dir(bio)) {
         case WRITE:
+#ifdef MEMORY_TRACKING
+            atomic_inc(&device->num_pending_writes);
+#endif
             // Deep clone for encryption, otherwise we may overwrite buffers from the user and can cause a crash
             bio_data->deep_clone = deep_bio_clone(device, bio);
             if (!bio_data->deep_clone) {
@@ -902,6 +911,9 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
             }
             break;
         case READ:
+#ifdef MEMORY_TRACKING
+            atomic_inc(&device->num_pending_reads);
+#endif
             // Create the disk clone. Necessary because we change the bi_end_io function, so we can't submit the original.
             bio_data->shallow_clone = shallow_bio_clone(device, bio);
             bio_data->shallow_clone->bi_end_io = read_disk_end_io;
@@ -928,13 +940,14 @@ static int merkle_map(struct dm_target *ti, struct bio *bio) {
 }
 
 void hash_buffer(struct merkle_device *device, char *buffer, size_t len, char *out) {
-    // Note: If this becomes a bottleneck, change to per_cpu hash_desc (and maybe disable interrupts to avoid mutexes?)
-    mutex_lock(&device->hash_lock);
-    int ret = crypto_shash_digest(device->hash_desc, buffer, len, out);
-    mutex_unlock(&device->hash_lock);
+    struct shash_desc *hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->insecure_hash_alg), GFP_KERNEL);
+    hash_desc->tfm = device->insecure_hash_alg;
+
+    int ret = crypto_shash_digest(hash_desc, buffer, len, out);
     if (ret) {
         printk_ratelimited(KERN_ERR "Could not hash buffer");
     }
+    kfree(hash_desc);
 }
 
 int enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
@@ -1041,6 +1054,8 @@ static void merkle_status(struct dm_target *ti, status_type_t type, unsigned int
     DMEMIT("\n");
 #ifdef MEMORY_TRACKING
     DMEMIT("Num bio_data not freed: %d\n", atomic_read(&device->num_bio_data_not_freed));
+    DMEMIT("Num pending reads: %d\n", atomic_read(&device->num_pending_reads));
+    DMEMIT("Num pending writes: %d\n", atomic_read(&device->num_pending_writes));
 #endif
 }
 
@@ -1099,13 +1114,6 @@ static int merkle_constructor(struct dm_target *ti, unsigned int argc, char **ar
         printk(KERN_ERR "Error allocating hash");
         return PTR_ERR(device->insecure_hash_alg);
     }
-    mutex_init(&device->hash_lock);
-    device->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->insecure_hash_alg), GFP_KERNEL);
-    if (!device->hash_desc) {
-        printk(KERN_ERR "Error allocating hash desc");
-        return -ENOMEM;
-    }
-    device->hash_desc->tfm = device->insecure_hash_alg;
 
     // Set up AEAD
     device->tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
@@ -1144,7 +1152,6 @@ static void merkle_destructor(struct dm_target *ti) {
 
     crypto_free_aead(device->tfm);
     crypto_free_shash(device->insecure_hash_alg);
-    kfree(device->hash_desc);
     kvfree(device->merkle_tree_root);
     kfree(device->disk_pages_above_merkle_tree_layer);
     kfree(device->merkle_tree_layers);
