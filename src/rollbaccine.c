@@ -26,16 +26,13 @@
 
 #define ROLLBACCINE_MAX_CONNECTIONS 20
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
-#define ROLLBACCINE_ENCRYPTION_GRANULARITY PAGE_SIZE
 #define ROLLBACCINE_MAX_BROADCAST_QUEUE_SIZE 1000000
-// #define ROLLBACCINE_ENCRYPTION_GRANULARITY SECTOR_SIZE
-#define ROLLBACCINE_SECTORS_PER_ENCRYPTION (ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE)
 #define SECTORS_PER_PAGE (PAGE_SIZE / SECTOR_SIZE)
 #define AES_GCM_IV_SIZE 12
 #define AES_GCM_AUTH_SIZE 16
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
-#define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
+#define ROLLBACCINE_METADATA_CHECKSUM_SIZE AES_GCM_AUTH_SIZE * ROLLBACCINE_AVG_HASHES_PER_WRITE
 #define ROLLBACCINE_PENDING_BIO_RING_SIZE 10000000 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
@@ -45,9 +42,6 @@
 
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 // #define LATENCY_TRACKING
-
-// Used to compare against checksums to see if they have been set yet (or if they're all 0)
-static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
 
 enum MsgType { 
     // Critical path messages
@@ -73,8 +67,8 @@ struct metadata_msg {
     // Metadata about the bio
     uint64_t bi_opf;
     sector_t sector;
-    // Hash and IV for each write
-    char checksum_and_iv[ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE];
+    // Hash for each write
+    char checksum[ROLLBACCINE_METADATA_CHECKSUM_SIZE];
 } __attribute__((packed));
 
 // Flexible array since we don't know how many extra checksums we will include. Be very careful when using sizeof()
@@ -84,7 +78,7 @@ struct additional_hash_msg {
     uint64_t sender_socket_id;
     uint64_t recipient_id;
     uint64_t msg_index;
-    char checksum_and_iv[];
+    char checksum[];
 } __attribute__((packed));
 
 // Sent during reconfiguration
@@ -97,7 +91,7 @@ struct hash_msg {
     uint64_t msg_index;
 
     sector_t start_sector;
-    char checksum_and_ivs[ROLLBACCINE_HASHES_PER_MSG * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+    char checksums[ROLLBACCINE_HASHES_PER_MSG * AES_GCM_AUTH_SIZE];
 } __attribute__((packed));
 
 // Used to return a pair from handshake_ids()
@@ -224,7 +218,7 @@ struct rollbaccine_device {
     int num_rb_nodes;
     int num_bio_sector_ranges;
     int num_fsyncs_pending_replication;
-    atomic_t num_checksum_and_ivs;
+    atomic_t num_checksums;
     atomic_t num_bios_in_pending_bio_ring;
     atomic_t submit_bio_queue_size;
     atomic_t replica_disk_end_io_queue_size;
@@ -267,7 +261,7 @@ struct bio_data {
     struct work_struct submit_bio_work; // So this bio can be scheduled for submission after popping off pending ops
     struct rb_node tree_node;           // So this bio can be inserted into a tree
     struct list_head pending_list;      // So this bio can be inserted into pending_ops
-    unsigned char *checksum_and_iv;     // Checksums and IVs for each sector or page, if this is a write
+    unsigned char *checksum;     // Checksums for each sector or page, if this is a write
     // Reconfiguration
     struct multisocket *requester;      // The node that requested this block of disk from this node (for reconfiguration)
     struct page *reconfig_read_page;
@@ -348,7 +342,7 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, cha
                 uint64_t my_id, uint64_t msg_index);
 void hash_metadata(struct socket_data *socket_data, struct metadata_msg *metadata);
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out);
-// Returns array of checksums and IVs for writes, NULL for reads. Sets error = true if there's an error
+// Returns array of checksums for writes, NULL for reads. Sets error = true if there's an error
 unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type, bool *error);
 int submit_pending_bio_ring_prefix(void *args);
 int ack_fsync(void *args);
@@ -371,53 +365,42 @@ int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
 
 
-inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg) + checksum_and_iv_size; }
+inline size_t additional_hash_msg_size(size_t checksum_size) { return sizeof(struct additional_hash_msg) + checksum_size; }
 
-inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
-    return kmalloc(additional_hash_msg_size(checksum_and_iv_size), GFP_KERNEL);
+inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_size) {
+    return kmalloc(additional_hash_msg_size(checksum_size), GFP_KERNEL);
 }
 
-inline bool has_checksum(unsigned char *checksum) {
-    return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
-}
+inline bool mem_is_zero(void *addr, size_t size) { return memchr_inv(addr, 0, size) == NULL; }
 
 inline unsigned char *global_checksum(struct rollbaccine_device *device, sector_t sector) {
-    return &device->checksums[sector / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+    return &device->checksums[sector / SECTORS_PER_PAGE * AES_GCM_AUTH_SIZE];
 }
 
-inline unsigned char *global_iv(struct rollbaccine_device *device, sector_t sector) {
-    return &device->checksums[sector / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
+inline size_t bio_checksum_size(int num_sectors) {
+    return num_sectors / SECTORS_PER_PAGE * AES_GCM_AUTH_SIZE;
 }
 
-inline size_t bio_checksum_and_iv_size(int num_sectors) {
-    return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
-}
-
-inline unsigned char *alloc_bio_checksum_and_iv(struct rollbaccine_device *device, int num_sectors) {
+inline unsigned char *alloc_bio_checksum(struct rollbaccine_device *device, int num_sectors) {
     if (num_sectors != 0) {
 #ifdef MEMORY_TRACKING
-        atomic_inc(&device->num_checksum_and_ivs);
+        atomic_inc(&device->num_checksums);
 #endif
-        return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
+        return kmalloc(bio_checksum_size(num_sectors), GFP_KERNEL);
     }
     else {
         return NULL;
     }
 }
 
-inline unsigned char *get_bio_checksum(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return checksum_and_iv + (current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
+inline unsigned char *get_bio_checksum(unsigned char *checksum, sector_t start_sector, sector_t current_sector) {
+    return checksum + (current_sector - start_sector) / SECTORS_PER_PAGE * AES_GCM_AUTH_SIZE;
 }
 
-inline unsigned char *get_bio_iv(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return checksum_and_iv + (current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE;
-}
-
-inline void update_global_checksum_and_iv(struct rollbaccine_device *device, unsigned char *checksum_and_iv, sector_t start_sector, int num_sectors) {
+inline void update_global_checksum(struct rollbaccine_device *device, unsigned char *checksum, sector_t start_sector, int num_sectors) {
     sector_t curr_sector;
-    for (curr_sector = start_sector; curr_sector < start_sector + num_sectors; curr_sector += ROLLBACCINE_SECTORS_PER_ENCRYPTION) {
-        memcpy(global_checksum(device, curr_sector), get_bio_checksum(checksum_and_iv, start_sector, curr_sector), AES_GCM_AUTH_SIZE);
-        memcpy(global_iv(device, curr_sector), get_bio_iv(checksum_and_iv, start_sector, curr_sector), AES_GCM_IV_SIZE);
+    for (curr_sector = start_sector; curr_sector < start_sector + num_sectors; curr_sector += SECTORS_PER_PAGE) {
+        memcpy(global_checksum(device, curr_sector), get_bio_checksum(checksum, start_sector, curr_sector), AES_GCM_AUTH_SIZE);
     }
 }
 
@@ -555,8 +538,8 @@ void submit_bio_task(struct work_struct *work) {
     struct rollbaccine_device *device = bio_data->device;
     // printk(KERN_INFO "Submitting bio from workqueue: %d", bio_data->write_index);
 
-    if (bio_data->checksum_and_iv != NULL) {
-        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
+    if (bio_data->checksum != NULL) {
+        update_global_checksum(device, bio_data->checksum, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
     }
     if (bio_data->shallow_clone != NULL) {
         submit_bio_noacct(bio_data->shallow_clone);
@@ -798,11 +781,11 @@ void free_pages_end_io(struct bio *received_bio) {
         atomic_max(&device->max_outstanding_num_bio_pages, num_bio_pages + 1);
 #endif
     }
-    if (bio_data->checksum_and_iv != NULL) {
+    if (bio_data->checksum != NULL) {
 #ifdef MEMORY_TRACKING
-        atomic_dec(&device->num_checksum_and_ivs);
+        atomic_dec(&device->num_checksums);
 #endif
-        kfree(bio_data->checksum_and_iv);
+        kfree(bio_data->checksum);
     }
     kmem_cache_free(device->bio_data_cache, bio_data);
     // kfree(bio_data);
@@ -1038,7 +1021,7 @@ bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *s
     struct bio *bio;
     struct page *page;
     struct kvec vec;
-    unsigned char checksum_and_iv[AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE];
+    unsigned char checksum[AES_GCM_AUTH_SIZE];
     bool success, verify_error;
 
     // printk(KERN_INFO "Receiving disk sector %llu", sector);
@@ -1055,7 +1038,7 @@ bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *s
     bio_data->bio_src = bio;
     bio_data->start_sector = sector;
     bio_data->end_sector = sector + SECTORS_PER_PAGE;
-    bio_data->checksum_and_iv = checksum_and_iv;
+    bio_data->checksum = checksum;
     bio->bi_private = bio_data;
 
     page = page_cache_alloc(device);
@@ -1073,12 +1056,11 @@ bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *s
     }
     __bio_add_page(bio, page, PAGE_SIZE, 0);
 
-    // Fill local checksum_and_iv just for the VERIFY function
+    // Fill local checksum just for the VERIFY function
     // We can't use DECRYPT here because it decrypts in place, so we end up writing plaintext to disk
-    memcpy(checksum_and_iv, global_checksum(device, sector), AES_GCM_AUTH_SIZE);
-    memcpy(checksum_and_iv + AES_GCM_AUTH_SIZE, global_iv(device, sector), AES_GCM_IV_SIZE);
+    memcpy(checksum, global_checksum(device, sector), AES_GCM_AUTH_SIZE);
     enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY, &verify_error);
-    bio_data->checksum_and_iv = NULL;
+    bio_data->checksum = NULL;
     if (verify_error) {
         printk(KERN_ERR "Backup received invalid page");
         free_pages_end_io(bio);
@@ -1264,8 +1246,8 @@ void leader_read_disk_end_io_task(struct work_struct *work) {
     atomic_max(&device->max_outstanding_num_bio_data, num_bio_data + 1);
 #endif
     bio_put(bio_data->shallow_clone);
-    if (bio_data->checksum_and_iv != NULL) {
-        kfree(bio_data->checksum_and_iv);
+    if (bio_data->checksum != NULL) {
+        kfree(bio_data->checksum);
     }
     kmem_cache_free(device->bio_data_cache, bio_data);
 }
@@ -1343,9 +1325,9 @@ void broadcast_bio(struct work_struct *work) {
     struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
     int socket_id;
     struct bio *clone = clone_bio_data->deep_clone;
-    unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
-    size_t checksum_and_iv_size = bio_checksum_and_iv_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
-    size_t remaining_checksum_and_iv_size;
+    unsigned char *checksum = clone_bio_data->checksum;
+    size_t checksum_size = bio_checksum_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
+    size_t remaining_checksum_size;
     struct rollbaccine_device *device = clone_bio_data->device;
     struct kvec vec;
     struct multisocket *multisocket;
@@ -1365,8 +1347,8 @@ void broadcast_bio(struct work_struct *work) {
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = clone->bi_opf;
     metadata.sector = clone->bi_iter.bi_sector;
-    // Copy checksum and IV into metadata
-    memcpy(metadata.checksum_and_iv, checksum_and_iv, min(checksum_and_iv_size, ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE));
+    // Copy checksum into metadata
+    memcpy(metadata.checksum, checksum, min(checksum_size, ROLLBACCINE_METADATA_CHECKSUM_SIZE));
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
     WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
@@ -1374,12 +1356,12 @@ void broadcast_bio(struct work_struct *work) {
     // Note: If bi_size is not a multiple of PAGE_SIZE, we have to send by sector chunks
     WARN_ON(metadata.num_pages * PAGE_SIZE != clone->bi_iter.bi_size);
 
-    // Create message for additional hash & IVs if they exceed what could be sent with the metadata
-    if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
-        remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
-        additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
+    // Create message for additional hash if they exceed what could be sent with the metadata
+    if (checksum_size > ROLLBACCINE_METADATA_CHECKSUM_SIZE) {
+        remaining_checksum_size = checksum_size - ROLLBACCINE_METADATA_CHECKSUM_SIZE;
+        additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_size);
         additional_hash_msg->sender_id = device->id;
-        memcpy(additional_hash_msg->checksum_and_iv, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
+        memcpy(additional_hash_msg->checksum, checksum + ROLLBACCINE_METADATA_CHECKSUM_SIZE, remaining_checksum_size);
 
 #ifdef MEMORY_TRACKING
         atomic_inc(&device->num_messages_larger_than_avg);
@@ -1417,22 +1399,22 @@ void broadcast_bio(struct work_struct *work) {
     }
     print_and_update_latency("broadcast_bio: Send metadata", &time);
 
-    // 2. Send hash & IVs if they exceed what could be sent with the metadata
+    // 2. Send hash if they exceed what could be sent with the metadata
     if (additional_hash_msg != NULL) {
         additional_hash_msg->sender_socket_id = socket_id;
         additional_hash_msg->recipient_id = multisocket->sender_id;
         additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
-        hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
+        hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
 
         vec.iov_base = additional_hash_msg;
-        vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
+        vec.iov_len = additional_hash_msg_size(remaining_checksum_size);
         success = send_msg(vec, socket_data->sock);
         if (!success) {
             // printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
             should_disconnect = true;
             goto finish_sending_to_socket;
         }
-        print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
+        print_and_update_latency("broadcast_bio: Sent remaining checksums", &time);
     }
 
     // 3. Send bios
@@ -1591,7 +1573,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
 
                 // Encrypt
-                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT, &encrypt_error);
+                bio_data->checksum = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT, &encrypt_error);
                 if (encrypt_error) {
                     alert_client_of_liveness_problem(device, device->id);
                     // TODO: System panic
@@ -1640,8 +1622,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
                 if (doesnt_conflict_with_other_writes) {
-                    if (bio_data->checksum_and_iv != NULL) {
-                        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
+                    if (bio_data->checksum != NULL) {
+                        update_global_checksum(device, bio_data->checksum, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
                     }
                     submit_bio_noacct(bio_data->shallow_clone);
                     this_cpu_inc(num_ops_on_cpu);
@@ -1737,12 +1719,8 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     struct scatterlist sg[4], sg_verify[4];
     struct page *page_verify;
     DECLARE_CRYPTO_WAIT(wait);
-    unsigned char *bio_checksum_and_iv;
-    unsigned char *iv;
-    // TODO: Reenable when testing on machines with RDRAND
-    // long iv_long;
-    // bool rd_rand_success = false;
-    // size_t iv_copy_num_bytes_remaining;
+    unsigned char *bio_checksum;
+    unsigned char sector_iv[AES_GCM_IV_SIZE];
     unsigned char *checksum;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
@@ -1757,13 +1735,13 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         case ROLLBACCINE_ENCRYPT:
             // Operate on the deep clone, since otherwise we may overwrite buffers from the user and can cause a crash
             bio = bio_data->deep_clone;
-            // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio));
-            if (!bio_checksum_and_iv) {
-                printk(KERN_ERR "Could not allocate checksum and iv for bio");
+            // Store new checksum of write into array (instead of updating global checksum) so the global checksum can be updated in-order later
+            bio_checksum = alloc_bio_checksum(bio_data->device, bio_sectors(bio));
+            if (!bio_checksum) {
+                printk(KERN_ERR "Could not allocate checksum for bio");
                 goto free_and_return;
             }
-            print_and_update_latency("enc_or_dec_bio: ENCRYPT alloc_bio_checksum_and_iv", &time);
+            print_and_update_latency("enc_or_dec_bio: ENCRYPT alloc_bio_checksum", &time);
             break;
         case ROLLBACCINE_DECRYPT:
             bio = bio_data->bio_src;
@@ -1784,44 +1762,27 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         // printk(KERN_INFO "enc/dec starting");
         curr_sector = bio->bi_iter.bi_sector;
         bv = bio_iter_iovec(bio, bio->bi_iter);
+        memcpy(sector_iv, &curr_sector, sizeof(uint64_t));
 
         switch (enc_or_dec) {
             case ROLLBACCINE_ENCRYPT:
-                checksum = get_bio_checksum(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
-                iv = get_bio_iv(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
-                print_and_update_latency("enc_or_dec_bio: ENCRYPT get bio checksum and iv", &time);
-                // Generate a new IV
-                // TODO: Uncomment when testing on machines with RDRAND to see if this works
-                // iv_copy_num_bytes_remaining = AES_GCM_IV_SIZE;
-                // while (iv_copy_num_bytes_remaining > 0) {
-                //     rd_rand_success = rdrand_long(&iv_long);
-                //     if (!rd_rand_success) {
-                //         printk(KERN_ERR "Could not generate random number for IV");
-                //         goto free_and_return;
-                //     }
-                //     memcpy(iv + (AES_GCM_IV_SIZE - iv_copy_num_bytes_remaining), &iv_long, min(iv_copy_num_bytes_remaining, sizeof(long)));
-                //     iv_copy_num_bytes_remaining -= sizeof(long);
-                // }
-                get_random_bytes(iv, AES_GCM_IV_SIZE);
-                print_and_update_latency("enc_or_dec_bio: ENCRYPT get_random_bytes", &time);
+                checksum = get_bio_checksum(bio_checksum, bio_data->start_sector, curr_sector);
+                print_and_update_latency("enc_or_dec_bio: ENCRYPT get bio checksum", &time);
                 break;
             case ROLLBACCINE_DECRYPT:
                 checksum = global_checksum(bio_data->device, curr_sector);
-                iv = global_iv(bio_data->device, curr_sector);
                 // Skip decryption for any block that has not been written to
-                if (!has_checksum(checksum)) {
+                if (mem_is_zero(checksum, AES_GCM_AUTH_SIZE)) {
                     goto enc_or_dec_next_sector;
                 }
                 break;
             case ROLLBACCINE_VERIFY:
                 // Assume the existing checksum is stored in bio_data
-                checksum = get_bio_checksum(bio_data->checksum_and_iv, bio_data->start_sector, curr_sector);
-                iv = get_bio_iv(bio_data->checksum_and_iv, bio_data->start_sector, curr_sector);
-
+                checksum = get_bio_checksum(bio_data->checksum, bio_data->start_sector, curr_sector);
                 sg_init_table(sg_verify, 4);
                 sg_set_buf(&sg_verify[0], &curr_sector, sizeof(uint64_t));
-                sg_set_buf(&sg_verify[1], iv, AES_GCM_IV_SIZE);
-                sg_set_page(&sg_verify[2], page_verify, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
+                sg_set_buf(&sg_verify[1], sector_iv, AES_GCM_IV_SIZE);
+                sg_set_page(&sg_verify[2], page_verify, PAGE_SIZE, bv.bv_offset);
                 sg_set_buf(&sg_verify[3], checksum, AES_GCM_AUTH_SIZE);
                 break;
         }
@@ -1839,8 +1800,8 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         // Set up scatterlist to encrypt/decrypt
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
-        sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
-        sg_set_page(&sg[2], bv.bv_page, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
+        sg_set_buf(&sg[1], sector_iv, AES_GCM_IV_SIZE);
+        sg_set_page(&sg[2], bv.bv_page, PAGE_SIZE, bv.bv_offset);
         sg_set_buf(&sg[3], checksum, AES_GCM_AUTH_SIZE);
 
         // /* AEAD request:
@@ -1853,15 +1814,15 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
         switch (enc_or_dec) {
             case ROLLBACCINE_ENCRYPT:
-                aead_request_set_crypt(req, sg, sg, ROLLBACCINE_ENCRYPTION_GRANULARITY, iv);
+                aead_request_set_crypt(req, sg, sg, PAGE_SIZE, sector_iv);
                 ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
                 break;
             case ROLLBACCINE_DECRYPT:
-                aead_request_set_crypt(req, sg, sg, ROLLBACCINE_ENCRYPTION_GRANULARITY + AES_GCM_AUTH_SIZE, iv);
+                aead_request_set_crypt(req, sg, sg, PAGE_SIZE + AES_GCM_AUTH_SIZE, sector_iv);
                 ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
                 break;
             case ROLLBACCINE_VERIFY: // Write output to page and discard
-                aead_request_set_crypt(req, sg, sg_verify, ROLLBACCINE_ENCRYPTION_GRANULARITY + AES_GCM_AUTH_SIZE, iv);
+                aead_request_set_crypt(req, sg, sg_verify, PAGE_SIZE + AES_GCM_AUTH_SIZE, sector_iv);
                 ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
                 break;
         }
@@ -1878,7 +1839,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         }
 
         enc_or_dec_next_sector:
-        bio_advance_iter(bio, &bio->bi_iter, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+        bio_advance_iter(bio, &bio->bi_iter, PAGE_SIZE);
         reinit_completion(&wait.completion);
     }
 
@@ -1892,7 +1853,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
     bio->bi_iter.bi_idx = 0;
     print_and_update_latency("enc_or_dec_bio", &total_time);
-    return bio_checksum_and_iv; // NOTE: This will be NULL for reads
+    return bio_checksum; // NOTE: This will be NULL for reads
 }
 
 int submit_pending_bio_ring_prefix(void *args) {
@@ -1942,8 +1903,8 @@ int submit_pending_bio_ring_prefix(void *args) {
             should_ack_fsync |= curr_bio_data->is_fsync;
 
             if (no_conflict) {
-                if (curr_bio_data->checksum_and_iv != NULL) {
-                    update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
+                if (curr_bio_data->checksum != NULL) {
+                    update_global_checksum(device, curr_bio_data->checksum, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
                 }
 
                 // If the bio is empty, don't submit, just free it
@@ -2202,14 +2163,13 @@ bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *mult
         hash_msg->msg_index = socket_data->last_sent_msg_index++;
         hash_msg->start_sector = sector;
 
-        // Copy hashes and IVs into the message
+        // Copy hashes into the message
         for (i = 0; i < ROLLBACCINE_HASHES_PER_MSG; i++) {
             if (sector + i >= device->num_sectors) {
                 about_to_complete = true;
                 break;
             }
-            memcpy(hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE), global_checksum(device, sector+i), AES_GCM_AUTH_SIZE);
-            memcpy(hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE, global_iv(device, sector+i), AES_GCM_IV_SIZE);
+            memcpy(hash_msg->checksums + i * AES_GCM_AUTH_SIZE, global_checksum(device, sector+i), AES_GCM_AUTH_SIZE);
         }
         sector += ROLLBACCINE_HASHES_PER_MSG;
         
@@ -2268,12 +2228,11 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
             return false;
         }
 
-        // Copy hashes and IVs into the global checksum and IV
+        // Copy hashes into the global checksum
         // printk(KERN_INFO "Received hashes from %llu sector to %llu", hash_msg->start_sector, hash_msg->start_sector + ROLLBACCINE_HASHES_PER_MSG - 1);
         for (i = 0; i < ROLLBACCINE_HASHES_PER_MSG; i++) {
             sector = hash_msg->start_sector + i;
-            memcpy(global_checksum(device, sector), hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE), AES_GCM_AUTH_SIZE);
-            memcpy(global_iv(device, sector), hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE, AES_GCM_IV_SIZE);
+            memcpy(global_checksum(device, sector), hash_msg->checksums + i * AES_GCM_AUTH_SIZE, AES_GCM_AUTH_SIZE);
             
             if (sector >= device->num_sectors - 1) {
                 about_to_complete = true;
@@ -2338,7 +2297,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
     uint64_t msg_ballot;
     bool success, verify_error;
     int i, num_sectors, index_offset, bio_distance, old_seen_ballot;
-    size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
+    size_t checksum_size, remaining_checksum_size;
     struct additional_hash_msg *additional_hash_msg;
     long replaced_bio_data;
 
@@ -2433,38 +2392,38 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
         received_bio->bi_private = bio_data;
 
-        // Copy hash and IV
+        // Copy hash
         num_sectors = metadata.num_pages * SECTORS_PER_PAGE;
-        checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
-        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(device, num_sectors);
-        memcpy(bio_data->checksum_and_iv, metadata.checksum_and_iv, min(ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, checksum_and_iv_size));
+        checksum_size = bio_checksum_size(num_sectors);
+        bio_data->checksum = alloc_bio_checksum(device, num_sectors);
+        memcpy(bio_data->checksum, metadata.checksum, min(ROLLBACCINE_METADATA_CHECKSUM_SIZE, checksum_size));
 
         // 2. Expect hash if it wasn't done sending
-        if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
-            remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
-            additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
+        if (checksum_size > ROLLBACCINE_METADATA_CHECKSUM_SIZE) {
+            remaining_checksum_size = checksum_size - ROLLBACCINE_METADATA_CHECKSUM_SIZE;
+            additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_size);
 
             vec.iov_base = additional_hash_msg;
-            vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
+            vec.iov_len = additional_hash_msg_size(remaining_checksum_size);
 
-            // printk(KERN_INFO "Receiving checksums and IVs, size: %lu", vec.iov_len);
+            // printk(KERN_INFO "Receiving checksums, size: %lu", vec.iov_len);
             success = receive_msg(vec, socket_data->sock);
             if (!success) {
-                printk(KERN_ERR "Error reading checksum and IV");
+                printk(KERN_ERR "Error reading checksum");
                 free_pages_end_io(received_bio);
                 kfree(additional_hash_msg);
                 goto disconnect_from_sender;
             }
 
             // Verify the message
-            if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->recipient_id, device->id, additional_hash_msg->msg_index)) {
+            if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->recipient_id, device->id, additional_hash_msg->msg_index)) {
                 free_pages_end_io(received_bio);
                 kfree(additional_hash_msg);
                 goto disconnect_from_sender;
             }
 
             // Copy the checksums over
-            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg->checksum_and_iv, remaining_checksum_and_iv_size);
+            memcpy(bio_data->checksum + ROLLBACCINE_METADATA_CHECKSUM_SIZE, additional_hash_msg->checksum, remaining_checksum_size);
             // Free the message
             kfree(additional_hash_msg);
 
@@ -2874,9 +2833,9 @@ int start_server(struct rollbaccine_device *device, ushort port) {
 }
 
 static void rollbaccine_io_hints(struct dm_target *ti, struct queue_limits *limits) {
-    limits->logical_block_size = max_t(unsigned int, limits->logical_block_size, ROLLBACCINE_ENCRYPTION_GRANULARITY);
-    limits->physical_block_size = max_t(unsigned int, limits->physical_block_size, ROLLBACCINE_ENCRYPTION_GRANULARITY);
-    limits->io_min = max_t(unsigned int, limits->io_min, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+    limits->logical_block_size = max_t(unsigned int, limits->logical_block_size, PAGE_SIZE);
+    limits->physical_block_size = max_t(unsigned int, limits->physical_block_size, PAGE_SIZE);
+    limits->io_min = max_t(unsigned int, limits->io_min, PAGE_SIZE);
     limits->dma_alignment = limits->logical_block_size - 1;
 }
 
@@ -2904,7 +2863,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num rb nodes still in tree: %d\n", device->num_rb_nodes);
     DMEMIT("Num bio sectors still in queue: %d\n", device->num_bio_sector_ranges);
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
-    DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
+    DMEMIT("Num checksums not freed: %d\n", atomic_read(&device->num_checksums));
     DMEMIT("Num times broadcast queue blocked on sockets in use: %d\n", atomic_read(&device->next_socket_id));
     DMEMIT("Num bios on submit queue: %d\n", atomic_read(&device->submit_bio_queue_size));
     if (!device->is_leader) {
@@ -2964,7 +2923,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     int error, conf_index, i, earlier_conf_index, j;
     bool should_not_connect_twice;
     unsigned long projected_bytes_used = 0;
-    unsigned long checksum_and_iv_size;
+    unsigned long checksum_size;
 
     device = kzalloc(sizeof(struct rollbaccine_device), GFP_KERNEL);
     if (device == NULL) {
@@ -3109,14 +3068,14 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
 
     device->num_sectors = ti->len;
-    checksum_and_iv_size = (unsigned long)(ti->len / ROLLBACCINE_SECTORS_PER_ENCRYPTION) * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
-    printk(KERN_INFO "Checksums and IVs size: %lu", checksum_and_iv_size);
-    device->checksums = vzalloc(checksum_and_iv_size);
+    checksum_size = (unsigned long)(ti->len / SECTORS_PER_PAGE) * AES_GCM_AUTH_SIZE;
+    printk(KERN_INFO "Checksums size: %lu", checksum_size);
+    device->checksums = vzalloc(checksum_size);
     if (device->checksums == NULL) {
         printk(KERN_ERR "Error allocating checksums");
         return -ENOMEM;
     }
-    projected_bytes_used += checksum_and_iv_size;
+    projected_bytes_used += checksum_size;
 
     // Start server
     error = kstrtou16(argv[5], 10, &port);
@@ -3216,7 +3175,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->num_rb_nodes = 0;
     device->num_bio_sector_ranges = 0;
     device->num_fsyncs_pending_replication = 0;
-    atomic_set(&device->num_checksum_and_ivs, 0);
+    atomic_set(&device->num_checksums, 0);
     atomic_set(&device->num_bios_in_pending_bio_ring, 0);
     atomic_set(&device->submit_bio_queue_size, 0);
     atomic_set(&device->replica_disk_end_io_queue_size, 0);
