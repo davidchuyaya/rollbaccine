@@ -426,14 +426,14 @@ void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
         // This is a leaf, children are pending_checksum_ops
         list_for_each_entry_safe(pending_checksum_op, next_pending_checksum_op, &bio_data->pending_children, list) {
             if (pending_checksum_op->read_bio_data != NULL) {
-                // printk(KERN_INFO "Processing pending read: %p", pending_checksum_op->read_bio_data);
-                // printk(KERN_INFO "Pending read start sector: %llu", pending_checksum_op->read_bio_data->start_sector);
+                // printk(KERN_INFO "Pending read start sector: %llu, offset: %d", pending_checksum_op->read_bio_data->start_sector, pending_checksum_op->parent_page_offset);
                 // Read
                 memcpy(pending_checksum_op->read_bio_data->checksum + pending_checksum_op->read_checksum_offset, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_AUTH_SIZE);
                 // Schedule the read
                 try_read_bio(pending_checksum_op->read_bio_data);
             } else {
                 // Write
+                // printk(KERN_INFO "Processing pending write, offset: %d", pending_checksum_op->parent_page_offset);
                 memcpy(bio_data->page_addr + pending_checksum_op->parent_page_offset, pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
                 bio_data->dirtied = true;
             }
@@ -603,31 +603,39 @@ void add_merkle_leaf_request(struct merkle_device *device, struct pending_checks
                 if (other_pending_checksum_op->parent_page_offset < pending_checksum_op->parent_page_offset) {
                     // Iterating backwards in sorted order, found an op with a smaller offset. We should insert before this op
                     // printk(KERN_INFO "Adding to list: %d", pending_checksum_op->parent_page_offset);
-                    list_add_tail(&pending_checksum_op->list, &other_pending_checksum_op->list);
+                    list_add(&pending_checksum_op->list, &other_pending_checksum_op->list);
                     return;
                 }
                 else if (other_pending_checksum_op->parent_page_offset == pending_checksum_op->parent_page_offset) {
-                    // Conflict. Since there can be at most 1 outgoing op at once, the preexisting op MUST be a write (the read wouldn't have returned yet and allowed a 2nd op)
-                    if (pending_checksum_op->read_bio_data != NULL) {
-                        // printk(KERN_INFO "Conflict, we are a read, fast return: %d", pending_checksum_op->parent_page_offset);
-                        // If we're a read, copy the write's hash for verification once the page is read back from disk
-                        memcpy(pending_checksum_op->read_bio_data->checksum + pending_checksum_op->read_checksum_offset, other_pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
-                        // This read op has been satisfied, so we don't need the pending_checksum_op anymore
-                        atomic_dec(&pending_checksum_op->read_bio_data->ref_counter);
-                        kfree(pending_checksum_op);
+                    // Conflict, resolve based on <other op type, this op type>
+                    if (other_pending_checksum_op->read_bio_data == NULL) {
+                        // <Write, write>: Overwrite
+                        if (pending_checksum_op->read_bio_data == NULL) {
+                            // printk(KERN_INFO "Conflict, we are a write, overwrite the old write: %d", pending_checksum_op->parent_page_offset);
+                            list_replace(&other_pending_checksum_op->list, &pending_checksum_op->list);
+                            kfree(other_pending_checksum_op);
+                        }
+                        // <Write, read>: Overwrite
+                        else {
+                            // printk(KERN_INFO "Conflict, we are a read, fast return: %d", pending_checksum_op->parent_page_offset);
+                            // If we're a read, copy the write's hash for verification once the page is read back from disk
+                            memcpy(pending_checksum_op->read_bio_data->checksum + pending_checksum_op->read_checksum_offset, other_pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
+                            // This read op has been satisfied, so we don't need the pending_checksum_op anymore
+                            atomic_dec(&pending_checksum_op->read_bio_data->ref_counter);
+                            kfree(pending_checksum_op);
+                        }
                     }
                     else {
-                        // printk(KERN_INFO "Conflict, we are a write, overwrite the old write: %d", pending_checksum_op->parent_page_offset);
-                        // If we're a write, overwrite the old write
-                        list_replace(&other_pending_checksum_op->list, &pending_checksum_op->list);
-                        kfree(other_pending_checksum_op);
+                        // <Read, write> or <Read, read>: Add after
+                        // printk(KERN_INFO "Conflict, prior op is read %llu, adding self to tail: %d, write: %d", other_pending_checksum_op->read_bio_data->start_sector, pending_checksum_op->parent_page_offset, pending_checksum_op->read_bio_data == NULL);
+                        list_add(&pending_checksum_op->list, &other_pending_checksum_op->list);
                     }
                     return;
                 }
             }
 
             // List empty, add to head. This is only possible if the page finished processing all children and is en route to disk
-            list_add_tail(&pending_checksum_op->list, &merkle_leaf->pending_children);
+            list_add(&pending_checksum_op->list, &merkle_leaf->pending_children);
             return;
         }
     }
@@ -676,7 +684,7 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data)
     }
 
     mutex_lock(&device->merkle_tree_lock);
-
+    // printk(KERN_INFO "Started adding pending ops for bio %llu, write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
     // Create a pending_checksum_op for each page in the bio
     while (bio->bi_iter.bi_size) {
         curr_sector = bio->bi_iter.bi_sector;
@@ -695,6 +703,7 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data)
                 // If this is a read, leave a reference to the bio so it can be notified when the read is ready
                 pending_checksum_op->read_bio_data = bio_data;
                 atomic_inc(&bio_data->ref_counter);
+                // printk(KERN_INFO "Incrementing ref_counter for read bio %llu, parent page offset: %d", bio_data->start_sector, pending_checksum_op->parent_page_offset);
                 pending_checksum_op->read_checksum_offset = checksum_offset;
                 break;
         }
@@ -708,6 +717,7 @@ void fetch_merkle_nodes(struct merkle_device *device, struct bio_data *bio_data)
         bio_advance_iter(bio, &bio->bi_iter, PAGE_SIZE);
         checksum_offset += AES_GCM_AUTH_SIZE;
     }
+    // printk(KERN_INFO "Finished adding pending ops for bio %llu, write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
     mutex_unlock(&device->merkle_tree_lock);
 
     // Reset bio to start after iterating
@@ -753,6 +763,7 @@ void ack_bio_to_user_without_executing(struct bio *bio) {
 void write_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
 
+    // printk(KERN_INFO "Finished writing bio %llu", bio_data->start_sector);
     if (bio_data->end_sector - bio_data->start_sector > 0) {
         remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
     }
@@ -787,14 +798,18 @@ void try_read_bio_task(struct work_struct *work) {
 
 void try_read_bio(struct bio_data *bio_data) {
     // Ready to read when there are 0 other references
+    // printk(KERN_INFO "Decrementing ref_counter for read bio %llu", bio_data->start_sector);
     if (atomic_dec_and_test(&bio_data->ref_counter)) {
         INIT_WORK(&bio_data->work, try_read_bio_task);
         queue_work(bio_data->device->try_read_bio_queue, &bio_data->work);
+        // printk(KERN_INFO "Decrypting and freeing read bio %llu", bio_data->start_sector);
     }
 }
 
 void read_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
+
+    // printk(KERN_INFO "Finished reading bio %llu", bio_data->start_sector);
     try_read_bio(bio_data);
 }
 
@@ -1026,7 +1041,7 @@ int enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
 
         if (ret) {
             if (ret == -EBADMSG) {
-                printk_ratelimited(KERN_ERR "invalid integrity check");
+                printk_ratelimited(KERN_ERR "invalid integrity check: %llu", bio_data->start_sector);
             } else {
                 printk_ratelimited(KERN_ERR "encryption/decryption failed with error code %d", ret);
             }
