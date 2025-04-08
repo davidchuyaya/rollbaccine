@@ -2105,6 +2105,19 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // Don't allow writes through if ballot != seen_ballot. Wait until it's true
                 wait_event_interruptible(device->ballot_mismatch_wait_queue, atomic_read(&device->ballot) == atomic_read(&device->seen_ballot));
 
+                switch (device->sync_mode) {
+                    case ROLLBACCINE_DEFAULT:
+                        break;
+                    case ROLLBACCINE_SYNC:
+                        // Add sync flags
+                        bio->bi_opf |= REQ_FUA;
+                        break;
+                    case ROLLBACCINE_ASYNC:
+                        // Remove sync flags
+                        bio->bi_opf &= ~(REQ_PREFLUSH | REQ_FUA);
+                        break;
+                }
+
                 bio_data->is_fsync = requires_fsync(bio);
                 // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
                 if (bio_data->is_fsync) {
