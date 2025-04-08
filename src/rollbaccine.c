@@ -131,6 +131,11 @@ struct configuration {
     uint64_t write_indices[2];
 } ____cacheline_aligned;
 
+struct fsync_index_list {
+    uint64_t server_id; // ID of sender
+    int fsync_index;
+};
+
 struct rollbaccine_device {
     struct dm_dev *dev;
     struct bio_set bs;
@@ -171,7 +176,8 @@ struct rollbaccine_device {
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
     struct mutex replica_fsync_lock;
-    int max_replica_fsync_index;
+    struct fsync_index_list *fsync_index_list;
+    int min_acked_fsync_index;
     struct list_head fsyncs_pending_replication;  // List of all fsyncs waiting for replication. Ordered by write index.
 
     // Logic for writes that block on conflicting writes
@@ -375,9 +381,8 @@ struct page *page_cache_alloc(struct rollbaccine_device *device);
 int atomic_max(atomic_t *old, int new);
 struct bio_data *alloc_bio_data(struct rollbaccine_device * device);
 void ack_bio_to_user_without_executing(struct bio * bio);
-void process_follower_fsync_index(struct rollbaccine_device * device, int follower_fsync_index);
+void process_follower_fsync_index(struct rollbaccine_device * device, int follower_fsync_index, int follower_id);
 bool requires_fsync(struct bio * bio);
-unsigned int remove_fsync_flags(unsigned int bio_opf);
 void free_bio_data(struct bio_data *bio_data);
 void try_free_clones(struct bio_data *bio_data);
 void begin_critical_path(struct rollbaccine_device *device);
@@ -1260,30 +1265,44 @@ void ack_bio_to_user_without_executing(struct bio *bio) {
 
 // Returns the max int that a quorum agrees to. Note that since the leader itself must have fsync index >= followers' fsync index, the quorum size is f (not f+1).
 // Assumes that the bio->bi_private field stores the write index
-void process_follower_fsync_index(struct rollbaccine_device *device, int follower_fsync_index) {
-    bool max_index_changed = false;
+void process_follower_fsync_index(struct rollbaccine_device *device, int follower_fsync_index, int follower_id) {
+    bool inserted_index = false;
     struct bio_fsync_list *bio_fsync_data;
+    struct fsync_index_list *fsync_index_entry;
+    int i;
+    int min_fsync_index = INT_MAX;
 
     mutex_lock(&device->replica_fsync_lock);
-    // Special case for f = 1, n <= 3.
-    // What the quorum agrees on = max of what any 1 follower has (plus the leader's fsync index, which must be higher).
-    if (device->max_replica_fsync_index < follower_fsync_index) {
-        device->max_replica_fsync_index = follower_fsync_index;
-        max_index_changed = true;
-#ifdef MEMORY_TRACKING
-        device->last_acked_fsync_index = follower_fsync_index;
-#endif
+    // 1. Insert this follower's fsync index into the fsync index list, if possible
+    // 2. If not possible, create an entry and insert the index
+    // 3. Calculate the min_fsync_index across respondents
+    for (i = 0; i < device->f; i++) {
+        fsync_index_entry = &device->fsync_index_list[i];
+
+        if (fsync_index_entry->server_id == follower_id) {
+            fsync_index_entry->fsync_index = follower_fsync_index;
+            inserted_index = true;
+        }
+        if (fsync_index_entry->server_id == -1 && !inserted_index) {
+            // This server doesn't have an entry, set it
+            fsync_index_entry->server_id = follower_id;
+            fsync_index_entry->fsync_index = follower_fsync_index;
+            inserted_index = true;
+        }
+
+        min_fsync_index = min(min_fsync_index, fsync_index_entry->fsync_index);
     }
 
     // Loop through all blocked fsyncs if the max index has changed
-    if (max_index_changed) {
-        // printk(KERN_INFO "New max quorum write index: %d", device->max_replica_fsync_index);
+    if (device->min_acked_fsync_index < min_fsync_index) {
+        device->min_acked_fsync_index = min_fsync_index;
 #ifdef MEMORY_TRACKING
+        device->last_acked_fsync_index = follower_fsync_index;
         device->max_outstanding_fsyncs_pending_replication = umax(device->max_outstanding_fsyncs_pending_replication, device->num_fsyncs_pending_replication);
 #endif
         while (!list_empty(&device->fsyncs_pending_replication)) {
             bio_fsync_data = list_first_entry(&device->fsyncs_pending_replication, struct bio_fsync_list, list);
-            if (bio_fsync_data->write_index <= device->max_replica_fsync_index) {
+            if (bio_fsync_data->write_index <= min_fsync_index) {
                 // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
                 // Remove from queue
                 list_del(&bio_fsync_data->list);
@@ -1302,8 +1321,6 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
 }
 
 bool requires_fsync(struct bio *bio) { return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA); }
-
-unsigned int remove_fsync_flags(unsigned int bio_opf) { return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA; }
 
 // Because we alloc pages when we receive the bios, we have to free them when it's done writing
 void free_bio_data(struct bio_data *bio_data) {
@@ -1386,7 +1403,7 @@ void begin_critical_path(struct rollbaccine_device *device) {
         printk(KERN_INFO "Flushing all fsyncs");
         // Flush all fsyncs if we are the leader, because we know the backup must have it
         mutex_lock(&device->replica_fsync_lock);
-        device->max_replica_fsync_index = device->write_index;
+        device->min_acked_fsync_index = device->write_index;
         while (!list_empty(&device->fsyncs_pending_replication)) {
             bio_fsync_data = list_first_entry(&device->fsyncs_pending_replication, struct bio_fsync_list, list);
             list_del(&bio_fsync_data->list);
@@ -1807,13 +1824,14 @@ void leader_read_disk_end_io(struct bio *shallow_clone) {
 
 void leader_write_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
+    struct rollbaccine_device *device = bio_data->device;
     // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", bio_data->shallow_clone, bio_data->write_index, bio_data->deep_clone);
     // We only added it to the tree if it was non-empty, so only remove if it's non-empty
     if (bio_data->end_sector - bio_data->start_sector > 0) {
         remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
     }
      // Return to the user. If this is an fsync, wait for replication
-    if (!bio_data->is_fsync) {
+    if (!(bio_data->is_fsync && device->f > 0)) {
         ack_bio_to_user_without_executing(bio_data->bio_src);
     }
     // Unlike replica_disk_end_io, the clone is sharing data with the clone used for networking, so we have to check if we can free
@@ -1915,71 +1933,69 @@ void broadcast_bio(struct work_struct *work) {
 #endif
     }
 
-    multisocket = device->counterpart;
-    if (multisocket == NULL) {
-        printk_ratelimited(KERN_ERR "Attempted to send to counterpart before we were connected");
-        goto finish_no_unlock;
-    }
-    if (atomic_read(&multisocket->disconnected)) {
-        goto finish_no_unlock;
-    }
-    socket_id = lock_on_next_free_socket(device, multisocket);
-    socket_data = &multisocket->socket_data[socket_id];
-    
-    metadata.sender_socket_id = socket_id;
-    // Send the recipient its own ID so it can check that this message was intended for them
-    metadata.recipient_id = multisocket->sender_id;
-    // Create a hash of the message after incrementing msg_index
-    metadata.msg_index = socket_data->last_sent_msg_index++;
-    hash_metadata(socket_data, &metadata);
+    down_read(&device->connected_sockets_sem);
+    list_for_each_entry(multisocket, &device->connected_sockets, list) {
+        if (atomic_read(&multisocket->disconnected)) {
+            continue;
+        }
+        socket_id = lock_on_next_free_socket(device, multisocket);
+        socket_data = &multisocket->socket_data[socket_id];
+        
+        metadata.sender_socket_id = socket_id;
+        // Send the recipient its own ID so it can check that this message was intended for them
+        metadata.recipient_id = multisocket->sender_id;
+        // Create a hash of the message after incrementing msg_index
+        metadata.msg_index = socket_data->last_sent_msg_index++;
+        hash_metadata(socket_data, &metadata);
 
-    vec.iov_base = &metadata;
-    vec.iov_len = sizeof(struct metadata_msg);
-    print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
+        vec.iov_base = &metadata;
+        vec.iov_len = sizeof(struct metadata_msg);
+        print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
 
-    // 1. Send metadata
-    success = send_msg(vec, socket_data->sock);
-    if (!success) {
-        // printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
-        should_disconnect = true;
-        goto finish_sending_to_socket;
-    }
-    print_and_update_latency("broadcast_bio: Send metadata", &time);
-
-    // 2. Send hash if they exceed what could be sent with the metadata
-    if (additional_hash_msg != NULL) {
-        additional_hash_msg->sender_socket_id = socket_id;
-        additional_hash_msg->recipient_id = multisocket->sender_id;
-        additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
-        hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
-
-        vec.iov_base = additional_hash_msg;
-        vec.iov_len = additional_hash_msg_size(remaining_checksum_size);
+        // 1. Send metadata
         success = send_msg(vec, socket_data->sock);
         if (!success) {
-            // printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+            // printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
             should_disconnect = true;
             goto finish_sending_to_socket;
         }
-        print_and_update_latency("broadcast_bio: Sent remaining checksums", &time);
-    }
+        print_and_update_latency("broadcast_bio: Send metadata", &time);
 
-    // 3. Send bios
-    bio_for_each_segment(bvec, clone, iter) {
-        bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
-        success = send_page(chunked_bvec, socket_data->sock);
-        if (!success) {
-            // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
-            should_disconnect = true;
-            goto finish_sending_to_socket;
+        // 2. Send hash if they exceed what could be sent with the metadata
+        if (additional_hash_msg != NULL) {
+            additional_hash_msg->sender_socket_id = socket_id;
+            additional_hash_msg->recipient_id = multisocket->sender_id;
+            additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
+            hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
+
+            vec.iov_base = additional_hash_msg;
+            vec.iov_len = additional_hash_msg_size(remaining_checksum_size);
+            success = send_msg(vec, socket_data->sock);
+            if (!success) {
+                // printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+                should_disconnect = true;
+                goto finish_sending_to_socket;
+            }
+            print_and_update_latency("broadcast_bio: Sent remaining checksums", &time);
         }
-    }
-    print_and_update_latency("broadcast_bio: Send pages", &time);
-    // Label to jump to if socket cannot be written to, so we can iterate the next socket
+
+        // 3. Send bios
+        bio_for_each_segment(bvec, clone, iter) {
+            bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
+            success = send_page(chunked_bvec, socket_data->sock);
+            if (!success) {
+                // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
+                should_disconnect = true;
+                goto finish_sending_to_socket;
+            }
+        }
+        print_and_update_latency("broadcast_bio: Send pages", &time);
+        // Label to jump to if socket cannot be written to, so we can iterate the next socket
 finish_sending_to_socket:
-    mutex_unlock(&socket_data->socket_mutex);
+        mutex_unlock(&socket_data->socket_mutex);
+    }
 finish_no_unlock:
-    
+    up_read(&device->connected_sockets_sem);
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
 
     if (should_disconnect) {
@@ -2119,8 +2135,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
 
                 bio_data->is_fsync = requires_fsync(bio);
-                // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
-                if (bio_data->is_fsync) {
+                if (bio_data->is_fsync && device->f > 0) {
                     bio_fsync_data = kmalloc(sizeof(struct bio_fsync_list), GFP_KERNEL);
                     bio_fsync_data->bio_src = bio;
 #ifdef MEMORY_TRACKING
@@ -2173,7 +2188,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                     fetch_merkle_nodes(device, bio_data);
                 }
                 // printk(KERN_INFO "Inserted write clone %p, write index: %d, conflicts: %d", bio_data->shallow_clone, bio_data->write_index, !doesnt_conflict_with_other_writes);
-                if (bio_data->is_fsync) {
+                if (bio_data->is_fsync && device->f > 0) {
                     // Add original bio to fsyncs blocked on replication
                     mutex_lock(&device->replica_fsync_lock);
                     print_and_update_latency("leader_process_write: index lock -> obtained replica fsync lock", &time);
@@ -2891,7 +2906,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
                 break;
             case ROLLBACCINE_ACK:
                 if (device->is_leader)
-                    process_follower_fsync_index(device, metadata.write_index);
+                    process_follower_fsync_index(device, metadata.write_index, metadata.sender_id);
                 else
                     printk(KERN_ERR "Backup received fsync ACK");
                 continue;
@@ -3225,8 +3240,8 @@ int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id
     int i, error;
 
     // We don't currently have logic for recovery for merkle trees where some parts are on disk
-    if (send_p1a && device->merkle_tree_height > 1) {
-        printk(KERN_ERR "Unsupported: recovery with merkle tree height > 1");
+    if (send_p1a && (device->merkle_tree_height > 1 || device->f != 1)) {
+        printk(KERN_ERR "Unsupported: recovery with merkle tree height %d or f %llu", device->merkle_tree_height, device->f);
         return -1;
     }
 
@@ -3460,7 +3475,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
 /**
  * Arguments:
  * 0 = underlying device name, like /dev/ram0
- * 1 = id (unique per instance)
+ * 1 = id (unique per instance, starts at 1)
  * 2 = seen_ballot
  * 3 = is_leader ("true" or "false")
  * 4 = key
@@ -3598,7 +3613,6 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
     atomic_set(&device->pending_bio_ring_head, ROLLBACCINE_INIT_WRITE_INDEX + 1);
 
-    device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->replica_fsync_lock);
     INIT_LIST_HEAD(&device->fsyncs_pending_replication);
 
@@ -3650,6 +3664,18 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
     printk(KERN_INFO "f: %llu", device->f);
+    if (device->is_leader) {
+        // Note: Don't need to alloc f+1, since we're always the 1
+        device->fsync_index_list = kzalloc(sizeof(struct fsync_index_list) * device->f, GFP_KERNEL);
+        if (!device->fsync_index_list) {
+            printk(KERN_ERR "Error allocating fsync_index_list");
+            return -ENOMEM;
+        }
+
+        // Set server IDs to -1 to signal that the slot is empty
+        for (i = 0; i < device->f; i++)
+            device->fsync_index_list[i].server_id = -1;
+    }
 
     // Set up merkle tree of hashes
     device->num_sectors = ti->len;
@@ -3673,6 +3699,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         printk(KERN_ERR "Error parsing sync mode");
         return -EINVAL;
     }
+    printk(KERN_INFO "sync mode: %d", device->sync_mode);
 
     // Start server
     error = kstrtou16(argv[8], 10, &port);
@@ -3691,14 +3718,13 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     is_recovering = strcmp(argv[9], "true") == 0;
 
-    error = kstrtou64(argv[10], 10, &device->counterpart_id);
-    if (error < 0) {
-        printk(KERN_ERR "Error parsing primary_id");
-        return error;
-    }
-
     // If we're the backup, reach out to the primary
     if (!device->is_leader) {
+        error = kstrtou64(argv[10], 10, &device->counterpart_id);
+        if (error < 0) {
+            printk(KERN_ERR "Error parsing primary_id");
+            return error;
+        }
         error = kstrtou16(argv[12], 10, &primary_port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing counterpart port");
@@ -3716,12 +3742,10 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     mutex_init(&device->prior_confs_lock);
     mutex_init(&device->reconfig_complete_lock);
 
-    // No prior configs = initial launch, can start immediately
-    // TODO: Figure out recovery later
-    // if (argc <= conf_arg_start) {
-        printk(KERN_INFO "No prior configs detected, can start execution");
+    if (!is_recovering) {
+        printk(KERN_INFO "Not recovering, can start execution");
         atomic_set(&device->ballot, seen_ballot);
-    // }
+    }
     // // Connect to machines in prior configs if they are provided
     // else {
     //     mutex_lock(&device->prior_confs_lock);
