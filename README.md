@@ -207,8 +207,8 @@ cd src
 make
 sudo modprobe brd rd_nr=2 rd_size=1048576
 sudo insmod rollbaccine.ko
-echo "0 `sudo blockdev --getsz /dev/ram0` rollbaccine /dev/ram0 1 1 true abcdefghijklmnop 12340 2 127.0.0.1 12350" | sudo dmsetup create rollbaccine1
-echo "0 `sudo blockdev --getsz /dev/ram1` rollbaccine /dev/ram1 2 1 false abcdefghijklmnop 12350 1 127.0.0.1 12340" | sudo dmsetup create rollbaccine2
+echo "0 `sudo blockdev --getsz /dev/ram0` rollbaccine /dev/ram0 1 1 true abcdefghijklmnop 1 0 default 12340 false false 2" | sudo dmsetup create rollbaccine1
+echo "0 `sudo blockdev --getsz /dev/ram1` rollbaccine /dev/ram1 2 1 false abcdefghijklmnop 1 0 default 12350 false false 1 127.0.0.1 12340" | sudo dmsetup create rollbaccine2
 ```
 Here's the syntax, explained:
 - `dmsetup create rollbaccine1`: Create a device mapper and name it rollbaccine1.

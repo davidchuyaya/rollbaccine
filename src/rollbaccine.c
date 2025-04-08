@@ -26,16 +26,14 @@
 
 #define ROLLBACCINE_MAX_CONNECTIONS 20
 #define ROLLBACCINE_INIT_WRITE_INDEX 0
-#define ROLLBACCINE_ENCRYPTION_GRANULARITY PAGE_SIZE
 #define ROLLBACCINE_MAX_BROADCAST_QUEUE_SIZE 1000000
-// #define ROLLBACCINE_ENCRYPTION_GRANULARITY SECTOR_SIZE
-#define ROLLBACCINE_SECTORS_PER_ENCRYPTION (ROLLBACCINE_ENCRYPTION_GRANULARITY / SECTOR_SIZE)
 #define SECTORS_PER_PAGE (PAGE_SIZE / SECTOR_SIZE)
 #define AES_GCM_IV_SIZE 12
 #define AES_GCM_AUTH_SIZE 16
+#define AES_GCM_PER_PAGE (PAGE_SIZE / AES_GCM_AUTH_SIZE)
 #define KEY_SIZE 16
 #define ROLLBACCINE_AVG_HASHES_PER_WRITE 4
-#define ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) * ROLLBACCINE_AVG_HASHES_PER_WRITE
+#define ROLLBACCINE_METADATA_CHECKSUM_SIZE AES_GCM_AUTH_SIZE * ROLLBACCINE_AVG_HASHES_PER_WRITE
 #define ROLLBACCINE_PENDING_BIO_RING_SIZE 10000000 // Max "hole" between writes
 #define SHA256_SIZE 32
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
@@ -46,9 +44,6 @@
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
 // #define LATENCY_TRACKING
 
-// Used to compare against checksums to see if they have been set yet (or if they're all 0)
-static const char ZERO_AUTH[AES_GCM_AUTH_SIZE] = {0};
-
 enum MsgType { 
     // Critical path messages
     ROLLBACCINE_WRITE, ROLLBACCINE_FSYNC, ROLLBACCINE_ACK,
@@ -56,6 +51,8 @@ enum MsgType {
     ROLLBACCINE_P1A, ROLLBACCINE_P1B, ROLLBACCINE_HASH_REQ, ROLLBACCINE_HASH_BEGIN, ROLLBACCINE_DISK_REQ, ROLLBACCINE_DISK_BEGIN, ROLLBACCINE_RECONFIG_COMPLETE, ROLLBACCINE_RECONFIG_COMPLETE_ACK
 };
 enum EncDecType { ROLLBACCINE_ENCRYPT, ROLLBACCINE_DECRYPT, ROLLBACCINE_VERIFY };
+// "Default" respects FUA/PREFLUSH flags, "sync" forces all writes to be FUA, "async" removes all write flags
+enum SyncMode { ROLLBACCINE_DEFAULT, ROLLBACCINE_SYNC, ROLLBACCINE_ASYNC };
 
 struct metadata_msg {
     char msg_hash[SHA256_SIZE];
@@ -73,8 +70,8 @@ struct metadata_msg {
     // Metadata about the bio
     uint64_t bi_opf;
     sector_t sector;
-    // Hash and IV for each write
-    char checksum_and_iv[ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE];
+    // Hash for each write
+    char checksum[ROLLBACCINE_METADATA_CHECKSUM_SIZE];
 } __attribute__((packed));
 
 // Flexible array since we don't know how many extra checksums we will include. Be very careful when using sizeof()
@@ -84,7 +81,7 @@ struct additional_hash_msg {
     uint64_t sender_socket_id;
     uint64_t recipient_id;
     uint64_t msg_index;
-    char checksum_and_iv[];
+    char checksum[];
 } __attribute__((packed));
 
 // Sent during reconfiguration
@@ -96,8 +93,8 @@ struct hash_msg {
     uint64_t recipient_id;
     uint64_t msg_index;
 
-    sector_t start_sector;
-    char checksum_and_ivs[ROLLBACCINE_HASHES_PER_MSG * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+    sector_t start_page;
+    char checksums[ROLLBACCINE_HASHES_PER_MSG * AES_GCM_AUTH_SIZE];
 } __attribute__((packed));
 
 // Used to return a pair from handshake_ids()
@@ -134,6 +131,11 @@ struct configuration {
     uint64_t write_indices[2];
 } ____cacheline_aligned;
 
+struct fsync_index_list {
+    uint64_t server_id; // ID of sender
+    int fsync_index;
+};
+
 struct rollbaccine_device {
     struct dm_dev *dev;
     struct bio_set bs;
@@ -143,6 +145,9 @@ struct rollbaccine_device {
     int page_cache_size;
     sector_t num_sectors;
 
+    uint64_t f;
+    enum SyncMode sync_mode;
+    bool only_replicate_checksums; // Only replicate checksums
     bool is_leader;
     bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     uint64_t id; // Unique to each Rollbaccine instance
@@ -172,7 +177,8 @@ struct rollbaccine_device {
     // Logic for fsyncs blocking on replication
     // IMPORTANT: If both replica_fsync_lock and index_lock must be obtained, obtain index_lock first.
     struct mutex replica_fsync_lock;
-    int max_replica_fsync_index;
+    struct fsync_index_list *fsync_index_list;
+    int min_acked_fsync_index;
     struct list_head fsyncs_pending_replication;  // List of all fsyncs waiting for replication. Ordered by write index.
 
     // Logic for writes that block on conflicting writes
@@ -189,6 +195,8 @@ struct rollbaccine_device {
     struct workqueue_struct *verify_disk_end_io_queue;
     struct workqueue_struct *fetch_disk_end_io_queue;
     struct workqueue_struct *reconfig_write_disk_end_io_queue;
+    struct workqueue_struct *read_hash_end_io_queue;
+    struct workqueue_struct *write_hash_end_io_queue;
 
     // Sockets, tracked so we can kill them on exit.
     struct socket *server_socket;
@@ -202,10 +210,19 @@ struct rollbaccine_device {
 
     // AEAD
     struct crypto_aead *tfm;
-    char *checksums;
 
     // Hashing
-    struct crypto_shash *hash_alg;
+    struct crypto_shash *signed_hash_alg;
+    struct crypto_shash *unsigned_hash_alg;
+
+    // Merkle tree for checksums
+    int merkle_tree_height;        // Number of layers in merkle tree, including the layer in memory
+    uint64_t disk_pages_for_merkle_tree;
+    int *disk_pages_above_merkle_tree_layer;  // Note: [0] = 0 since there is no layer above the root, and [1] = 0 since the root is in memory
+
+    char *merkle_tree_root;  // Layer "0" of the merkle tree
+    struct mutex merkle_tree_lock;
+    struct rb_root *merkle_tree_layers;  // Note: [0] = NULL always, since that layer is represented by merkle_tree_root in memory
 
     // Replica threads
     struct semaphore replica_submit_bio_sema;
@@ -224,7 +241,7 @@ struct rollbaccine_device {
     int num_rb_nodes;
     int num_bio_sector_ranges;
     int num_fsyncs_pending_replication;
-    atomic_t num_checksum_and_ivs;
+    atomic_t num_checksums;
     atomic_t num_bios_in_pending_bio_ring;
     atomic_t submit_bio_queue_size;
     atomic_t replica_disk_end_io_queue_size;
@@ -262,15 +279,46 @@ struct bio_data {
     sector_t end_sector;
     int write_index;
     bool is_fsync;
-    atomic_t ref_counter;               // The number of clones. Once it hits 0, the bio can be freed
+    atomic_t ref_counter;               // The number of clones AND number of pending_checksum_ops with references to this bio. Once it hits 0, the bio can be freed
     struct work_struct broadcast_work;  // So this bio can be scheduled as a job
     struct work_struct submit_bio_work; // So this bio can be scheduled for submission after popping off pending ops
     struct rb_node tree_node;           // So this bio can be inserted into a tree
     struct list_head pending_list;      // So this bio can be inserted into pending_ops
-    unsigned char *checksum_and_iv;     // Checksums and IVs for each sector or page, if this is a write
+    unsigned char *checksum;     // Checksums for each sector or page, if this is a write
     // Reconfiguration
     struct multisocket *requester;      // The node that requested this block of disk from this node (for reconfiguration)
     struct page *reconfig_read_page;
+};
+
+
+struct merkle_bio_data {
+    struct rollbaccine_device *device;
+    struct bio *bio_src;
+    int layer;
+    int page_num;
+    bool hashed; // True if this page has been loaded into memory and "hash" has been populated
+    bool is_empty; // True if this page is all zeros
+    bool verified;
+    bool dirtied;
+    
+    struct merkle_bio_data *parent;  // Null if the parent is merkle_tree_root
+    int parent_page_offset;
+
+    char hash[SHA256_SIZE];      // Read: The hash of this node once loaded
+    void *page_addr;
+    struct list_head pending_children; // If this is a merkle leaf, then this is a list of pending_checksum_op. Otherwise,this is a list of merkle_bio_data from lower levels
+
+    struct rb_node tree_node; // For merkle_tree_layers
+    struct list_head list; // So this bio can be stored in the parent's pending_children
+    struct work_struct work;  // So this bio can be queued in read/write_hash_end_io_queue
+};
+
+struct pending_checksum_op {
+    int parent_page_offset; // Offset into the parent
+    int read_checksum_offset; // Read: Within the read_bio, the offset of the checksum
+    char checksum[AES_GCM_AUTH_SIZE]; // Write: The hash of the written page
+    struct bio_data *read_bio_data;     // NULL if this is a write, since writes can ACK early and don't need to wait here
+    struct list_head list; // For the pending_children list in merkle_bio_data
 };
 
 // For keeping track of pending fsyncs
@@ -297,6 +345,25 @@ struct accepted_thread_params {
     struct socket_data *socket_data;
 };
 
+void submit_merkle_bio_task(struct work_struct *work);
+void submit_bio_task(struct work_struct *work);
+void init_merkle_tree(struct rollbaccine_device *device);
+
+void recursive_remove_merkle_node(struct merkle_bio_data *bio_data, bool recursive);
+void write_hash_end_io_task(struct work_struct *work);
+void write_hash_end_io(struct bio *bio);
+void verify_merkle_node(struct merkle_bio_data *bio_data);
+void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool recursive);
+void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data);
+void read_hash_end_io_task(struct work_struct *work);
+void read_hash_end_io(struct bio *bio);
+
+void free_merkle_bio(struct merkle_bio_data *bio_data);
+struct merkle_bio_data *create_and_submit_merkle_bio(struct rollbaccine_device *device, int layer, int page_num, int page_offset);
+void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset);
+void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num);
+void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data, int data_dir);
+
 bool send_msg(struct kvec vec, struct socket *sock);
 bool receive_msg(struct kvec vec, struct socket *sock);
 bool send_page(struct bio_vec vec, struct socket *sock);
@@ -315,11 +382,10 @@ struct page *page_cache_alloc(struct rollbaccine_device *device);
 int atomic_max(atomic_t *old, int new);
 struct bio_data *alloc_bio_data(struct rollbaccine_device * device);
 void ack_bio_to_user_without_executing(struct bio * bio);
-void process_follower_fsync_index(struct rollbaccine_device * device, int follower_fsync_index);
+void process_follower_fsync_index(struct rollbaccine_device * device, int follower_fsync_index, int follower_id);
 bool requires_fsync(struct bio * bio);
-unsigned int remove_fsync_flags(unsigned int bio_opf);
-void free_pages_end_io(struct bio * received_bio);
-void try_free_clones(struct bio * clone);
+void free_bio_data(struct bio_data *bio_data);
+void try_free_clones(struct bio_data *bio_data);
 void begin_critical_path(struct rollbaccine_device *device);
 void send_reconfig_complete_ack(struct rollbaccine_device *device);
 void handle_reconfig_complete(struct rollbaccine_device *device, struct multisocket *counterpart, struct metadata_msg *metadata);
@@ -334,10 +400,11 @@ void send_disk_req(struct rollbaccine_device *device, sector_t sector);
 void verify_disk_end_io_task(struct work_struct *work);
 void verify_disk_end_io(struct bio *bio);
 void leader_write_disk_end_io_task(struct work_struct *work);
-void leader_read_disk_end_io_task(struct work_struct *work);
-void replica_disk_end_io_task(struct work_struct *work);
 void leader_write_disk_end_io(struct bio * shallow_clone);
+void try_read_bio_task(struct work_struct *work);
+void try_read_bio(struct bio_data *bio_data);
 void leader_read_disk_end_io(struct bio * shallow_clone);
+void replica_disk_end_io_task(struct work_struct *work);
 void replica_disk_end_io(struct bio * received_bio);
 void network_end_io(struct bio * deep_clone);
 int lock_on_next_free_socket(struct rollbaccine_device *device, struct multisocket *multisocket);
@@ -346,10 +413,11 @@ struct bio *shallow_bio_clone(struct rollbaccine_device * device, struct bio * b
 struct bio *deep_bio_clone(struct rollbaccine_device * device, struct bio * bio_src);
 bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, char *expected_hash, uint64_t sender_id, uint64_t sender_socket_id, uint64_t intended_recipient_id,
                 uint64_t my_id, uint64_t msg_index);
+void hash_merkle_page(struct rollbaccine_device *device, struct merkle_bio_data *bio_data);
 void hash_metadata(struct socket_data *socket_data, struct metadata_msg *metadata);
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out);
-// Returns array of checksums and IVs for writes, NULL for reads. Sets error = true if there's an error
-unsigned char *enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type, bool *error);
+// Returns array of checksums for writes, NULL for reads. Sets error = true if there's an error
+int enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 int submit_pending_bio_ring_prefix(void *args);
 int ack_fsync(void *args);
 bool handle_p1a(struct rollbaccine_device *device, struct multisocket *multisocket, struct metadata_msg p1a);
@@ -370,55 +438,35 @@ int start_server(struct rollbaccine_device *device, ushort port);
 int __init rollbaccine_init_module(void);
 void rollbaccine_exit_module(void);
 
-
-inline size_t additional_hash_msg_size(size_t checksum_and_iv_size) { return sizeof(struct additional_hash_msg) + checksum_and_iv_size; }
-
-inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_and_iv_size) {
-    return kmalloc(additional_hash_msg_size(checksum_and_iv_size), GFP_KERNEL);
+inline char *merkle_root_hash_offset(struct rollbaccine_device *device, struct merkle_bio_data *bio_data) {
+    int page_num = bio_data->page_num - device->disk_pages_above_merkle_tree_layer[bio_data->layer];
+    return device->merkle_tree_root + page_num * SHA256_SIZE;
 }
 
-inline bool has_checksum(unsigned char *checksum) {
-    return memcmp(checksum, ZERO_AUTH, AES_GCM_AUTH_SIZE) != 0;
+inline size_t additional_hash_msg_size(size_t checksum_size) { return sizeof(struct additional_hash_msg) + checksum_size; }
+
+inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_device *device, size_t checksum_size) {
+    return kmalloc(additional_hash_msg_size(checksum_size), GFP_KERNEL);
 }
 
-inline unsigned char *global_checksum(struct rollbaccine_device *device, sector_t sector) {
-    return &device->checksums[sector / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE)];
+inline bool mem_is_zero(void *addr, size_t size) { return memchr_inv(addr, 0, size) == NULL; }
+
+inline size_t bio_checksum_size(int num_sectors) {
+    return num_sectors / SECTORS_PER_PAGE * AES_GCM_AUTH_SIZE;
 }
 
-inline unsigned char *global_iv(struct rollbaccine_device *device, sector_t sector) {
-    return &device->checksums[sector / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE];
-}
-
-inline size_t bio_checksum_and_iv_size(int num_sectors) {
-    return num_sectors / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
-}
-
-inline unsigned char *alloc_bio_checksum_and_iv(struct rollbaccine_device *device, int num_sectors) {
+inline void alloc_bio_checksum(struct rollbaccine_device *device, struct bio_data *bio_data) {
+    int num_sectors = bio_data->end_sector - bio_data->start_sector;
     if (num_sectors != 0) {
 #ifdef MEMORY_TRACKING
-        atomic_inc(&device->num_checksum_and_ivs);
+        atomic_inc(&device->num_checksums);
 #endif
-        return kmalloc(bio_checksum_and_iv_size(num_sectors), GFP_KERNEL);
-    }
-    else {
-        return NULL;
+        bio_data->checksum = kmalloc(bio_checksum_size(num_sectors), GFP_KERNEL);
     }
 }
 
-inline unsigned char *get_bio_checksum(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return checksum_and_iv + (current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
-}
-
-inline unsigned char *get_bio_iv(unsigned char *checksum_and_iv, sector_t start_sector, sector_t current_sector) {
-    return checksum_and_iv + (current_sector - start_sector) / ROLLBACCINE_SECTORS_PER_ENCRYPTION * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE;
-}
-
-inline void update_global_checksum_and_iv(struct rollbaccine_device *device, unsigned char *checksum_and_iv, sector_t start_sector, int num_sectors) {
-    sector_t curr_sector;
-    for (curr_sector = start_sector; curr_sector < start_sector + num_sectors; curr_sector += ROLLBACCINE_SECTORS_PER_ENCRYPTION) {
-        memcpy(global_checksum(device, curr_sector), get_bio_checksum(checksum_and_iv, start_sector, curr_sector), AES_GCM_AUTH_SIZE);
-        memcpy(global_iv(device, curr_sector), get_bio_iv(checksum_and_iv, start_sector, curr_sector), AES_GCM_IV_SIZE);
-    }
+inline unsigned char *get_bio_checksum(struct bio_data *bio_data, sector_t current_sector) {
+    return bio_data->checksum + (current_sector - bio_data->start_sector) / SECTORS_PER_PAGE * AES_GCM_AUTH_SIZE;
 }
 
 inline cycles_t get_cycles_if_flag_on(void) {
@@ -427,6 +475,486 @@ inline cycles_t get_cycles_if_flag_on(void) {
 #else
     return 0;
 #endif
+}
+
+void submit_merkle_bio_task(struct work_struct *work) {
+    struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
+    submit_bio_noacct(bio_data->bio_src);
+}
+
+void init_merkle_tree(struct rollbaccine_device *device) {
+    int i, j;
+    int total_checksum_pages = device->num_sectors / SECTORS_PER_PAGE / AES_GCM_PER_PAGE;
+    int pages_in_memory = total_checksum_pages;
+    int pages_on_disk = 0;
+
+    device->merkle_tree_height = 1;
+
+    while (pages_on_disk + pages_in_memory < device->disk_pages_for_merkle_tree && pages_in_memory > 1) {
+        pages_on_disk += pages_in_memory;
+        pages_in_memory = (pages_in_memory + SHA256_SIZE - 1) / SHA256_SIZE;
+        device->merkle_tree_height++;
+    }
+
+    printk(KERN_INFO "num_sectors: %llu, disk_pages_for_merkle_tree: %llu, pages_on_disk: %d, pages_in_memory: %d, height: %d", device->num_sectors, device->disk_pages_for_merkle_tree, pages_on_disk, pages_in_memory, device->merkle_tree_height);
+
+    device->merkle_tree_root = vzalloc(pages_in_memory * PAGE_SIZE);
+    if (!device->merkle_tree_root) {
+        printk(KERN_ERR "Could not allocate merkle tree root");
+        return;
+    }
+
+    device->disk_pages_above_merkle_tree_layer = kzalloc(device->merkle_tree_height * sizeof(int), GFP_KERNEL);
+
+    // Note: [0] = 0 since there is no layer above the root, and [1] = 0 since the root is in memory
+    pages_in_memory = total_checksum_pages;
+    for (i = device->merkle_tree_height - 1; i > 1; i--) {
+        pages_in_memory = (pages_in_memory + SHA256_SIZE - 1) / SHA256_SIZE;
+        for (j = i; j < device->merkle_tree_height; j++) {
+            device->disk_pages_above_merkle_tree_layer[j] += pages_in_memory;
+        }
+    }
+
+    device->merkle_tree_layers = kzalloc(device->merkle_tree_height * sizeof(struct rb_root), GFP_KERNEL);
+    // Note: [0] = NULL always, since that layer is represented by merkle_tree_root in memory
+    for (i = 1; i < device->merkle_tree_height; i++) {
+        device->merkle_tree_layers[i] = RB_ROOT;
+    }
+    printk(KERN_INFO "Finished init_merkle_tree");
+}
+
+
+void recursive_remove_merkle_node(struct merkle_bio_data *bio_data, bool recursive) {
+    struct rollbaccine_device *device = bio_data->device;
+
+    rb_erase(&bio_data->tree_node, &device->merkle_tree_layers[bio_data->layer]);
+    // Remove from parent's pending_children
+    if (bio_data->parent != NULL) {
+        list_del(&bio_data->list);
+        if (recursive) {
+            // Check if any ancestor can also be evicted
+            recursive_evict_merkle_ancestors(bio_data->parent, recursive);
+        }
+    }
+
+    free_merkle_bio(bio_data);
+}
+
+void write_hash_end_io_task(struct work_struct *work) {
+    struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
+    struct bio *bio = bio_data->bio_src;
+    struct rollbaccine_device *device = bio_data->device;
+    sector_t start_sector;
+
+    mutex_lock(&device->merkle_tree_lock);
+    if (list_empty(&bio_data->pending_children)) {
+        // The hash has been written to disk and there are no more children; remove the data structure and attempt to evict parents
+        recursive_remove_merkle_node(bio_data, true);
+    }
+    else {
+        // Read from disk (again)
+        start_sector = bio->bi_iter.bi_sector;
+        bio_reset(bio, device->dev->bdev, REQ_OP_READ);
+        bio->bi_iter.bi_sector = start_sector;
+        bio->bi_iter.bi_size = PAGE_SIZE;
+        bio->bi_end_io = read_hash_end_io;
+        bio->bi_private = bio_data;
+        INIT_WORK(&bio_data->work, submit_merkle_bio_task);
+        queue_work(device->submit_bio_queue, &bio_data->work);
+    }
+    mutex_unlock(&device->merkle_tree_lock);
+}
+
+void write_hash_end_io(struct bio *bio) {
+    struct merkle_bio_data *bio_data = bio->bi_private;
+    INIT_WORK(&bio_data->work, write_hash_end_io_task);
+    queue_work(bio_data->device->write_hash_end_io_queue, &bio_data->work);
+}
+
+// Note: Assumes that merkle_tree_lock is held, and that if the node has a parent, the parent has been verified
+void verify_merkle_node(struct merkle_bio_data *bio_data) {
+    struct merkle_bio_data *parent = bio_data->parent;
+    int res;
+
+    if (parent == NULL) {
+        // Verify against root
+        // printk(KERN_INFO "Expected hash: %s", bio_data->hash);
+        res = memcmp(bio_data->hash, merkle_root_hash_offset(bio_data->device, bio_data), SHA256_SIZE);
+        // printk(KERN_INFO "Actual hash: %s", bio_data->hash);
+        if (res != 0) {
+            printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d", bio_data->page_num);
+            // Note: Should crash the system and enter recovery
+        }
+    }
+    else {
+        if (bio_data->is_empty) {
+            if (!parent->is_empty) {
+                printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, parent: %d, child is all zeros but parent is not", bio_data->page_num, bio_data->parent->page_num);
+                // Note: Should crash the system and enter recovery
+            }
+        }
+        else {
+            res = memcmp(bio_data->hash, bio_data->parent->page_addr + bio_data->parent_page_offset, SHA256_SIZE);
+            if (res != 0) {
+                printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, parent: %d", bio_data->page_num, bio_data->parent->page_num);
+                // Note: Should crash the system and enter recovery
+            }
+        }
+    }
+}
+
+// Note: Assumes that merkle_tree_lock is held. Caller must check if bio_data is NULL after this funciton returns
+void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool recursive) {
+    struct rollbaccine_device *device = bio_data->device;
+    struct bio *bio = bio_data->bio_src;
+    sector_t start_sector;
+
+    // Only evict once there are no more dependents
+    if (!list_empty(&bio_data->pending_children)) {
+        return;
+    }
+
+    if (bio_data->dirtied) {
+        // Lower levels have been modified. Modify the parent's hash, then flush to disk. Don't remove the data structure yet (to prevent concurrent reads)
+        hash_merkle_page(device, bio_data);
+
+        if (bio_data->parent != NULL) {
+            // Modify parent's page
+            memcpy(bio_data->parent->page_addr + bio_data->parent_page_offset, bio_data->hash, SHA256_SIZE);
+            bio_data->parent->dirtied = true;
+        } else {
+            // Modify in-memory checksum
+            // printk(KERN_INFO "Overwriting root hash: %s", bio_data->hash);
+            memcpy(merkle_root_hash_offset(device, bio_data), bio_data->hash, SHA256_SIZE);
+        }
+
+        // Reset flags so other nodes don't mistake this for an in-memory page
+        bio_data->verified = false;
+        bio_data->hashed = false;
+        bio_data->dirtied = false;
+        kunmap(bio_page(bio));
+
+        // Write to disk
+        start_sector = bio->bi_iter.bi_sector;
+        bio_reset(bio, device->dev->bdev, REQ_OP_WRITE);
+        bio->bi_iter.bi_sector = start_sector;
+        bio->bi_iter.bi_size = PAGE_SIZE;
+        bio->bi_end_io = write_hash_end_io;
+        bio->bi_private = bio_data;
+        INIT_WORK(&bio_data->work, submit_merkle_bio_task);
+        queue_work(device->submit_bio_queue, &bio_data->work);
+    } else {
+        // Lower levels have NOT been modified, remove the data structure and check if parents can be freed too
+        recursive_remove_merkle_node(bio_data, recursive);
+    }
+}
+
+void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
+    struct rollbaccine_device *device = bio_data->device;
+    struct pending_checksum_op *pending_checksum_op, *next_pending_checksum_op;
+    struct merkle_bio_data *merkle_child;
+
+    // 1. Verify self
+    verify_merkle_node(bio_data);
+    bio_data->verified = true;
+
+    // 2. Process children
+    if (bio_data->layer == device->merkle_tree_height - 1) {
+        // This is a leaf, children are pending_checksum_ops
+        list_for_each_entry_safe(pending_checksum_op, next_pending_checksum_op, &bio_data->pending_children, list) {
+            if (pending_checksum_op->read_bio_data != NULL) {
+                // printk(KERN_INFO "Pending read start sector: %llu, offset: %d", pending_checksum_op->read_bio_data->start_sector, pending_checksum_op->parent_page_offset);
+                // Read
+                memcpy(pending_checksum_op->read_bio_data->checksum + pending_checksum_op->read_checksum_offset, bio_data->page_addr + pending_checksum_op->parent_page_offset, AES_GCM_AUTH_SIZE);
+                // Schedule the read
+                try_read_bio(pending_checksum_op->read_bio_data);
+            } else {
+                // Write
+                // printk(KERN_INFO "Processing pending write, offset: %d", pending_checksum_op->parent_page_offset);
+                memcpy(bio_data->page_addr + pending_checksum_op->parent_page_offset, pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
+                bio_data->dirtied = true;
+            }
+            list_del(&pending_checksum_op->list);
+            kfree(pending_checksum_op);
+        }
+    } else {
+        // This is a node, children are merkle_bio_data
+        list_for_each_entry(merkle_child, &bio_data->pending_children, list) {
+            // Process children once they have been read from disk
+            if (merkle_child->hashed) {
+                recursive_process_merkle_descendants(merkle_child);
+
+                // 3. See if the child should be evicted (not recursively, since we're already recusively walking down the tree)
+                recursive_evict_merkle_ancestors(merkle_child, false);
+            }
+        }
+    }
+}
+
+void read_hash_end_io_task(struct work_struct *work) {
+    struct merkle_bio_data *bio_data = container_of(work, struct merkle_bio_data, work);
+    struct bio *bio = bio_data->bio_src;
+    struct rollbaccine_device *device = bio_data->device;
+
+    // printk(KERN_INFO "Read hash end io task: %d", bio_data->page_num);
+    bio_data->page_addr = kmap(bio_page(bio));
+
+    // 1. Hash ourselves (unless this page is all zeros, in which case the hash should also be all zeros)
+    bio_data->is_empty = mem_is_zero(bio_data->page_addr, PAGE_SIZE);
+    if (!bio_data->is_empty) {
+        // printk(KERN_INFO "Page is non-empty: %d", bio_data->page_num);
+        hash_merkle_page(device, bio_data);
+    }
+
+    mutex_lock(&device->merkle_tree_lock);
+    bio_data->hashed = true;
+
+    // 2. Check if the parent was verified
+    if (bio_data->parent != NULL) {
+        if (!bio_data->parent->verified) {
+            goto unlock_and_exit;
+        }
+    }
+
+    // 3. Verify self, then check descendants, evicting when necessary
+    // printk(KERN_INFO "Recursively processing merkle descendants: %d", bio_data->page_num);
+    recursive_process_merkle_descendants(bio_data);
+
+    // 4. Evict ancestors
+    // printk(KERN_INFO "Recursively evicting merkle ancestors: %d", bio_data->page_num);
+    recursive_evict_merkle_ancestors(bio_data, true);
+
+    unlock_and_exit:
+    mutex_unlock(&device->merkle_tree_lock);
+}
+
+void read_hash_end_io(struct bio *bio) {
+    struct merkle_bio_data *bio_data = bio->bi_private;
+    INIT_WORK(&bio_data->work, read_hash_end_io_task);
+    queue_work(bio_data->device->read_hash_end_io_queue, &bio_data->work);
+}
+
+void free_merkle_bio(struct merkle_bio_data *bio_data) {
+    struct bio *bio = bio_data->bio_src;
+    struct page *page = bio_page(bio);
+    kunmap(page);
+    __free_page(page);
+    bio_put(bio);
+    kfree(bio_data);
+}
+
+struct merkle_bio_data *create_and_submit_merkle_bio(struct rollbaccine_device *device, int layer, int page_num, int page_offset) {
+    struct merkle_bio_data *bio_data;
+    struct page *page;
+    struct bio *bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
+    bio->bi_iter.bi_sector = page_num * SECTORS_PER_PAGE;
+
+    page = alloc_page(GFP_KERNEL);
+    if (!page) {
+        printk(KERN_ERR "Could not allocate page");
+        return NULL;
+    }
+    __bio_add_page(bio, page, PAGE_SIZE, 0);
+    bio->bi_end_io = read_hash_end_io;
+
+    bio_data = kzalloc(sizeof(struct merkle_bio_data), GFP_KERNEL);
+    bio_data->device = device;
+    bio_data->bio_src = bio;
+    bio_data->page_num = page_num;
+    bio_data->layer = layer;
+    // Note: parent should be filled in once the parent bio is created
+    bio_data->parent_page_offset = page_offset;
+    INIT_LIST_HEAD(&bio_data->pending_children);
+    INIT_WORK(&bio_data->work, submit_merkle_bio_task);
+
+    // Submit in queue (so we don't block mutexes)
+    queue_work(device->submit_bio_queue, &bio_data->work);
+
+    bio->bi_private = bio_data;
+
+    return bio_data;
+}
+
+void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset) {
+    struct rb_node **tree_node_location;
+    struct rb_node *tree_node;
+    struct merkle_bio_data *merkle_node;
+
+    tree_node_location = &(device->merkle_tree_layers[layer].rb_node);
+
+    // See if the parent page has already been requested
+    while (*tree_node_location != NULL) {
+        merkle_node = container_of(*tree_node_location, struct merkle_bio_data, tree_node);
+        tree_node = *tree_node_location;
+
+        if (parent_page_num < merkle_node->page_num)
+            tree_node_location = &tree_node->rb_left;
+        else if (parent_page_num > merkle_node->page_num)
+            tree_node_location = &tree_node->rb_right;
+        else {
+            // printk(KERN_INFO "Found existing merkle node: %d", parent_page_num);
+            // Request for this merkle node exists, add to the tail and stop
+            list_add_tail(&child->list, &merkle_node->pending_children);
+            child->parent = merkle_node;
+            return;
+        }
+    }
+
+    // Page hasn't been requested, add it
+    // printk(KERN_INFO "Creating new merkle node: %d", parent_page_num);
+    merkle_node = create_and_submit_merkle_bio(device, layer, parent_page_num, parent_page_offset);
+    rb_link_node(&merkle_node->tree_node, tree_node, tree_node_location);
+    rb_insert_color(&merkle_node->tree_node, &device->merkle_tree_layers[layer]);
+
+    child->parent = merkle_node;
+
+    // Iterate through all ancestors to fetch the pages if necessary
+    if (layer - 1 > 0) {
+        parent_page_num -= device->disk_pages_above_merkle_tree_layer[layer];  // Remove padding
+        // printk(KERN_INFO "Recursively requesting new merkle parent: %d", parent_page_num);
+        add_merkle_node_request(device, merkle_node, layer - 1, parent_page_num / SHA256_SIZE + device->disk_pages_above_merkle_tree_layer[layer - 1], parent_page_num % SHA256_SIZE);
+    }
+}
+
+void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num) {
+    int layer = device->merkle_tree_height - 1;
+    struct rb_node **tree_node_location = &(device->merkle_tree_layers[layer].rb_node);
+    struct rb_node *tree_node;
+    struct merkle_bio_data *merkle_leaf;
+    struct pending_checksum_op *other_pending_checksum_op;
+
+    // See if the parent page has already been requested
+    while (*tree_node_location != NULL) {
+        merkle_leaf = container_of(*tree_node_location, struct merkle_bio_data, tree_node);
+        tree_node = *tree_node_location;
+
+        if (parent_page_num < merkle_leaf->page_num)
+            tree_node_location = &tree_node->rb_left;
+        else if (parent_page_num > merkle_leaf->page_num)
+            tree_node_location = &tree_node->rb_right;
+        else {
+            // Request for this merkle node exists, add this pending op to its list, looking for conflicts
+            // Optimize by maintaining order based on offset and iterating backwards to reduce search time, assuming ops are mostly fetched in order
+            // printk(KERN_INFO "Existing pending op, our offset: %d", pending_checksum_op->parent_page_offset);
+            list_for_each_entry_reverse(other_pending_checksum_op, &merkle_leaf->pending_children, list) {
+                if (other_pending_checksum_op->parent_page_offset < pending_checksum_op->parent_page_offset) {
+                    // Iterating backwards in sorted order, found an op with a smaller offset. We should insert before this op
+                    // printk(KERN_INFO "Adding to list: %d", pending_checksum_op->parent_page_offset);
+                    list_add(&pending_checksum_op->list, &other_pending_checksum_op->list);
+                    return;
+                }
+                else if (other_pending_checksum_op->parent_page_offset == pending_checksum_op->parent_page_offset) {
+                    // Conflict, resolve based on <other op type, this op type>
+                    if (other_pending_checksum_op->read_bio_data == NULL) {
+                        // <Write, write>: Overwrite
+                        if (pending_checksum_op->read_bio_data == NULL) {
+                            // printk(KERN_INFO "Conflict, we are a write, overwrite the old write: %d", pending_checksum_op->parent_page_offset);
+                            list_replace(&other_pending_checksum_op->list, &pending_checksum_op->list);
+                            kfree(other_pending_checksum_op);
+                        }
+                        // <Write, read>: Overwrite
+                        else {
+                            // printk(KERN_INFO "Conflict, we are a read, fast return: %d", pending_checksum_op->parent_page_offset);
+                            // If we're a read, copy the write's hash for verification once the page is read back from disk
+                            memcpy(pending_checksum_op->read_bio_data->checksum + pending_checksum_op->read_checksum_offset, other_pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
+                            // This read op has been satisfied, so we don't need the pending_checksum_op anymore
+                            atomic_dec(&pending_checksum_op->read_bio_data->ref_counter);
+                            kfree(pending_checksum_op);
+                        }
+                    }
+                    else {
+                        // <Read, write> or <Read, read>: Add after
+                        // printk(KERN_INFO "Conflict, prior op is read %llu, adding self to tail: %d, write: %d", other_pending_checksum_op->read_bio_data->start_sector, pending_checksum_op->parent_page_offset, pending_checksum_op->read_bio_data == NULL);
+                        list_add(&pending_checksum_op->list, &other_pending_checksum_op->list);
+                    }
+                    return;
+                }
+            }
+
+            // List empty, add to head. This is only possible if the page finished processing all children and is en route to disk
+            list_add(&pending_checksum_op->list, &merkle_leaf->pending_children);
+            return;
+        }
+    }
+
+    // Page hasn't been requested, add it
+    // printk(KERN_INFO "Creating new merkle leaf: %d", parent_page_num);
+    merkle_leaf = create_and_submit_merkle_bio(device, layer, parent_page_num, pending_checksum_op->parent_page_offset);
+    rb_link_node(&merkle_leaf->tree_node, tree_node, tree_node_location);
+    rb_insert_color(&merkle_leaf->tree_node, &device->merkle_tree_layers[layer]);
+
+    // Add this pending op to the new page
+    list_add_tail(&pending_checksum_op->list, &merkle_leaf->pending_children);
+
+    // Iterate through all ancestors to fetch the pages if necessary
+    if (layer - 1 > 0) {
+        parent_page_num -= device->disk_pages_above_merkle_tree_layer[layer];  // Remove padding
+        // printk(KERN_INFO "Requesting new merkle parent: %d", parent_page_num);
+        add_merkle_node_request(device, merkle_leaf, layer - 1, parent_page_num / SHA256_SIZE + device->disk_pages_above_merkle_tree_layer[layer - 1], parent_page_num % SHA256_SIZE);
+    }
+}
+
+void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data, int data_dir) {
+    struct pending_checksum_op *pending_checksum_op;
+    sector_t curr_sector;
+    int parent_page_num, curr_page, num_pages;
+    int checksum_offset = 0;
+
+    // Don't need to do anything if the bio is empty
+    if (bio_data->start_sector == bio_data->end_sector) {
+        return;
+    }
+
+    // Fast path if the entire tree is in memory
+    if (device->merkle_tree_height == 1) {
+        curr_page = bio_data->start_sector / SECTORS_PER_PAGE;
+        num_pages = (bio_data->end_sector - bio_data->start_sector) / SECTORS_PER_PAGE;
+        // printk(KERN_INFO "Hash fast path, start sector: %llu, is write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
+        switch (data_dir) {
+            case WRITE:
+                memcpy(device->merkle_tree_root + curr_page * AES_GCM_AUTH_SIZE, bio_data->checksum, num_pages * AES_GCM_AUTH_SIZE);
+                break;
+            case READ:
+                memcpy(bio_data->checksum, device->merkle_tree_root + curr_page * AES_GCM_AUTH_SIZE, num_pages * AES_GCM_AUTH_SIZE);
+                break;
+        }
+        return;
+    }
+
+    mutex_lock(&device->merkle_tree_lock);
+    // printk(KERN_INFO "Started adding pending ops for bio %llu, write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
+    // Create a pending_checksum_op for each page in the bio
+    for (curr_sector = bio_data->start_sector; curr_sector < bio_data->end_sector; curr_sector += SECTORS_PER_PAGE) {
+        // Remove merkle tree padding in calculations
+        curr_page = curr_sector / SECTORS_PER_PAGE - device->disk_pages_for_merkle_tree;
+
+        pending_checksum_op = kmalloc(sizeof(struct pending_checksum_op), GFP_KERNEL);
+        pending_checksum_op->parent_page_offset = (curr_page % AES_GCM_PER_PAGE) * AES_GCM_AUTH_SIZE;
+
+        switch (data_dir) {
+            case WRITE:
+                // If this is a write, copy the relevant part of the checksum to write to the parent
+                memcpy(pending_checksum_op->checksum, bio_data->checksum + checksum_offset, AES_GCM_AUTH_SIZE);
+                break;
+            case READ:
+                // If this is a read, leave a reference to the bio so it can be notified when the read is ready
+                pending_checksum_op->read_bio_data = bio_data;
+                atomic_inc(&bio_data->ref_counter);
+                // printk(KERN_INFO "Incrementing ref_counter for read bio %llu, parent page offset: %d", bio_data->start_sector, pending_checksum_op->parent_page_offset);
+                pending_checksum_op->read_checksum_offset = checksum_offset;
+                break;
+        }
+        
+        parent_page_num = curr_page / AES_GCM_PER_PAGE + device->disk_pages_above_merkle_tree_layer[device->merkle_tree_height - 1];
+
+        // Add to pending ops, check if the parent's parent also needs to be fetched
+        // printk(KERN_INFO "Requesting parent for read: %d, parent: %d", curr_sector, parent_page_num);
+        add_merkle_leaf_request(device, pending_checksum_op, parent_page_num);
+
+        checksum_offset += AES_GCM_AUTH_SIZE;
+    }
+    // printk(KERN_INFO "Finished adding pending ops for bio %llu, write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
+    mutex_unlock(&device->merkle_tree_lock);
 }
 
 bool send_msg(struct kvec vec, struct socket *sock) {
@@ -523,7 +1051,7 @@ void disconnect(struct rollbaccine_device *device, struct multisocket *multisock
         for (i = 0; i < ROLLBACCINE_PENDING_BIO_RING_SIZE; i++) {
             bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[i], 0);
             if (bio_data != NULL) {
-                free_pages_end_io(bio_data->bio_src);
+                free_bio_data(bio_data);
             }
         }
 #ifdef MEMORY_TRACKING
@@ -555,9 +1083,6 @@ void submit_bio_task(struct work_struct *work) {
     struct rollbaccine_device *device = bio_data->device;
     // printk(KERN_INFO "Submitting bio from workqueue: %d", bio_data->write_index);
 
-    if (bio_data->checksum_and_iv != NULL) {
-        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
-    }
     if (bio_data->shallow_clone != NULL) {
         submit_bio_noacct(bio_data->shallow_clone);
     }
@@ -734,30 +1259,44 @@ void ack_bio_to_user_without_executing(struct bio *bio) {
 
 // Returns the max int that a quorum agrees to. Note that since the leader itself must have fsync index >= followers' fsync index, the quorum size is f (not f+1).
 // Assumes that the bio->bi_private field stores the write index
-void process_follower_fsync_index(struct rollbaccine_device *device, int follower_fsync_index) {
-    bool max_index_changed = false;
+void process_follower_fsync_index(struct rollbaccine_device *device, int follower_fsync_index, int follower_id) {
+    bool inserted_index = false;
     struct bio_fsync_list *bio_fsync_data;
+    struct fsync_index_list *fsync_index_entry;
+    int i;
+    int min_fsync_index = INT_MAX;
 
     mutex_lock(&device->replica_fsync_lock);
-    // Special case for f = 1, n <= 3.
-    // What the quorum agrees on = max of what any 1 follower has (plus the leader's fsync index, which must be higher).
-    if (device->max_replica_fsync_index < follower_fsync_index) {
-        device->max_replica_fsync_index = follower_fsync_index;
-        max_index_changed = true;
-#ifdef MEMORY_TRACKING
-        device->last_acked_fsync_index = follower_fsync_index;
-#endif
+    // 1. Insert this follower's fsync index into the fsync index list, if possible
+    // 2. If not possible, create an entry and insert the index
+    // 3. Calculate the min_fsync_index across respondents
+    for (i = 0; i < device->f; i++) {
+        fsync_index_entry = &device->fsync_index_list[i];
+
+        if (fsync_index_entry->server_id == follower_id) {
+            fsync_index_entry->fsync_index = follower_fsync_index;
+            inserted_index = true;
+        }
+        if (fsync_index_entry->server_id == -1 && !inserted_index) {
+            // This server doesn't have an entry, set it
+            fsync_index_entry->server_id = follower_id;
+            fsync_index_entry->fsync_index = follower_fsync_index;
+            inserted_index = true;
+        }
+
+        min_fsync_index = min(min_fsync_index, fsync_index_entry->fsync_index);
     }
 
     // Loop through all blocked fsyncs if the max index has changed
-    if (max_index_changed) {
-        // printk(KERN_INFO "New max quorum write index: %d", device->max_replica_fsync_index);
+    if (device->min_acked_fsync_index < min_fsync_index) {
+        device->min_acked_fsync_index = min_fsync_index;
 #ifdef MEMORY_TRACKING
+        device->last_acked_fsync_index = follower_fsync_index;
         device->max_outstanding_fsyncs_pending_replication = umax(device->max_outstanding_fsyncs_pending_replication, device->num_fsyncs_pending_replication);
 #endif
         while (!list_empty(&device->fsyncs_pending_replication)) {
             bio_fsync_data = list_first_entry(&device->fsyncs_pending_replication, struct bio_fsync_list, list);
-            if (bio_fsync_data->write_index <= device->max_replica_fsync_index) {
+            if (bio_fsync_data->write_index <= min_fsync_index) {
                 // printk(KERN_INFO "Fsync with write index %d satisfied", bio_data->write_index);
                 // Remove from queue
                 list_del(&bio_fsync_data->list);
@@ -777,57 +1316,61 @@ void process_follower_fsync_index(struct rollbaccine_device *device, int followe
 
 bool requires_fsync(struct bio *bio) { return bio->bi_opf & (REQ_PREFLUSH | REQ_FUA); }
 
-unsigned int remove_fsync_flags(unsigned int bio_opf) { return bio_opf & ~REQ_PREFLUSH & ~REQ_FUA; }
-
 // Because we alloc pages when we receive the bios, we have to free them when it's done writing
-void free_pages_end_io(struct bio *received_bio) {
-    struct bio_data *bio_data = received_bio->bi_private;
+void free_bio_data(struct bio_data *bio_data) {
     struct rollbaccine_device *device = bio_data->device;
     struct bio_vec bvec;
     struct bvec_iter iter;
+    int num_bio_pages;
 
-    // Free each page. Reset bio to start first, in case it's pointing to the end
-    received_bio->bi_iter.bi_sector = bio_data->start_sector;
-    received_bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
-    received_bio->bi_iter.bi_idx = 0;
-    bio_for_each_segment(bvec, received_bio, iter) {
-        page_cache_free(device, bvec.bv_page);
-        // __free_page(bvec.bv_page);
+    // Free the deep_clone
+    if (bio_data->deep_clone != NULL) {
+        // Free each page. Reset bio to start first, in case it's pointing to the end
+        bio_data->deep_clone->bi_iter.bi_sector = bio_data->start_sector;
+        bio_data->deep_clone->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
+        bio_data->deep_clone->bi_iter.bi_idx = 0;
+        bio_for_each_segment(bvec, bio_data->deep_clone, iter) {
+            page_cache_free(device, bvec.bv_page);
+            // __free_page(bvec.bv_page);
 #ifdef MEMORY_TRACKING
-        int num_bio_pages = atomic_dec_return(&device->num_bio_pages_not_freed);
-        atomic_max(&device->max_outstanding_num_bio_pages, num_bio_pages + 1);
+            num_bio_pages = atomic_dec_return(&device->num_bio_pages_not_freed);
+            atomic_max(&device->max_outstanding_num_bio_pages, num_bio_pages + 1);
 #endif
+        }
+        bio_put(bio_data->deep_clone);
     }
-    if (bio_data->checksum_and_iv != NULL) {
+
+    // Free the shallow_clone
+    if (bio_data->shallow_clone != NULL) {
 #ifdef MEMORY_TRACKING
-        atomic_dec(&device->num_checksum_and_ivs);
+        int num_shallow_clones = atomic_dec_return(&bio_data->device->num_shallow_clones_not_freed);
+        atomic_max(&bio_data->device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
 #endif
-        kfree(bio_data->checksum_and_iv);
+        bio_put(bio_data->shallow_clone);
     }
+
+    // Free the checksum
+    if (bio_data->checksum != NULL) {
+#ifdef MEMORY_TRACKING
+        atomic_dec(&device->num_checksums);
+#endif
+        kfree(bio_data->checksum);
+    }
+
+    // Free the bio_data
     kmem_cache_free(device->bio_data_cache, bio_data);
     // kfree(bio_data);
 #ifdef MEMORY_TRACKING
     int num_bio_data = atomic_dec_return(&device->num_bio_data_not_freed);
     atomic_max(&device->max_outstanding_num_bio_data, num_bio_data + 1);
 #endif
-    bio_put(received_bio);
 }
 
 // Decrement the reference counter tracking the number of clones. Free both deep & shallow clones when it hits 0.
-void try_free_clones(struct bio *clone) {
-    struct bio_data *bio_data = clone->bi_private;
+void try_free_clones(struct bio_data *bio_data) {
     // If ref_counter == 0
     if (atomic_dec_and_test(&bio_data->ref_counter)) {
-        // printk(KERN_INFO "Freeing clone, write index: %d", deep_clone_bio_data->write_index);
-#ifdef MEMORY_TRACKING
-        // Note: Decrement first, because after the function executes, bio_data will be freed and we won't have a valid pointer to device
-        int num_shallow_clones = atomic_dec_return(&bio_data->device->num_shallow_clones_not_freed);
-        atomic_max(&bio_data->device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
-        int num_deep_clones = atomic_dec_return(&bio_data->device->num_deep_clones_not_freed);
-        atomic_max(&bio_data->device->max_outstanding_num_deep_clones, num_deep_clones + 1);
-#endif
-        bio_put(bio_data->shallow_clone);
-        free_pages_end_io(bio_data->deep_clone);
+        free_bio_data(bio_data);
     } else {
         // printk(KERN_INFO "Decrementing clone ref count to %d, write index: %d", atomic_read(&deep_clone_bio_data->ref_counter), deep_clone_bio_data->write_index);
     }
@@ -835,6 +1378,7 @@ void try_free_clones(struct bio *clone) {
 
 void begin_critical_path(struct rollbaccine_device *device) {
     struct bio_fsync_list *bio_fsync_data;
+    int i;
 
     printk(KERN_INFO "Beginning critical path");
 
@@ -854,7 +1398,11 @@ void begin_critical_path(struct rollbaccine_device *device) {
         printk(KERN_INFO "Flushing all fsyncs");
         // Flush all fsyncs if we are the leader, because we know the backup must have it
         mutex_lock(&device->replica_fsync_lock);
-        device->max_replica_fsync_index = device->write_index;
+        device->min_acked_fsync_index = device->write_index;
+        for (i = 0; i < device->f; i++) {
+            device->fsync_index_list[i].server_id = -1;
+            device->fsync_index_list[i].fsync_index = 0;
+        }
         while (!list_empty(&device->fsyncs_pending_replication)) {
             bio_fsync_data = list_first_entry(&device->fsyncs_pending_replication, struct bio_fsync_list, list);
             list_del(&bio_fsync_data->list);
@@ -1024,7 +1572,7 @@ void inc_verified_pages(struct rollbaccine_device *device) {
 
 void reconfig_write_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
-    free_pages_end_io(bio_data->bio_src);
+    free_bio_data(bio_data);
 }
     
 void reconfig_write_disk_end_io(struct bio *bio) {
@@ -1038,8 +1586,9 @@ bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *s
     struct bio *bio;
     struct page *page;
     struct kvec vec;
-    unsigned char checksum_and_iv[AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE];
-    bool success, verify_error;
+    unsigned char checksum[AES_GCM_AUTH_SIZE];
+    bool success;
+    int error;
 
     // printk(KERN_INFO "Receiving disk sector %llu", sector);
 #ifdef MEMORY_TRACKING
@@ -1053,9 +1602,10 @@ bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *s
     bio_data = alloc_bio_data(device);
     bio_data->device = device;
     bio_data->bio_src = bio;
+    bio_data->deep_clone = bio;
     bio_data->start_sector = sector;
     bio_data->end_sector = sector + SECTORS_PER_PAGE;
-    bio_data->checksum_and_iv = checksum_and_iv;
+    bio_data->checksum = checksum;
     bio->bi_private = bio_data;
 
     page = page_cache_alloc(device);
@@ -1068,20 +1618,19 @@ bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *s
     success = receive_msg(vec, socket_data->sock);
     if (!success) {
         printk(KERN_ERR "Error reading from socket");
-        free_pages_end_io(bio);
+        free_bio_data(bio_data);
         return false;
     }
     __bio_add_page(bio, page, PAGE_SIZE, 0);
 
-    // Fill local checksum_and_iv just for the VERIFY function
+    // Fill local checksum just for the VERIFY function
     // We can't use DECRYPT here because it decrypts in place, so we end up writing plaintext to disk
-    memcpy(checksum_and_iv, global_checksum(device, sector), AES_GCM_AUTH_SIZE);
-    memcpy(checksum_and_iv + AES_GCM_AUTH_SIZE, global_iv(device, sector), AES_GCM_IV_SIZE);
-    enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY, &verify_error);
-    bio_data->checksum_and_iv = NULL;
-    if (verify_error) {
+    memcpy(checksum, device->merkle_tree_root + sector / SECTORS_PER_PAGE, AES_GCM_AUTH_SIZE);
+    error = enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
+    bio_data->checksum = NULL;
+    if (error != 0) {
         printk(KERN_ERR "Backup received invalid page");
-        free_pages_end_io(bio);
+        free_bio_data(bio_data);
         return false;
     }
 
@@ -1138,8 +1687,7 @@ unlock_and_free:
     mutex_unlock(&socket_data->socket_mutex);
     up_read(&device->connected_sockets_sem);
 
-    bio_put(bio_data->shallow_clone);
-    free_pages_end_io(bio_data->bio_src);
+    free_bio_data(bio_data);
 }
 
 void fetch_disk_end_io(struct bio *bio) {
@@ -1167,10 +1715,12 @@ void handle_disk_req(struct rollbaccine_device *device, struct multisocket *mult
     bio_data = alloc_bio_data(device);
     bio_data->device = device;
     bio_data->bio_src = bio;
+    bio_data->deep_clone = bio;
     bio_data->start_sector = sector;
     bio_data->end_sector = sector + SECTORS_PER_PAGE;
     bio_data->requester = multisocket;
     bio_data->reconfig_read_page = page;
+    alloc_bio_checksum(device, bio_data);
     bio->bi_private = bio_data;
 
     bio_data->shallow_clone = shallow_bio_clone(device, bio);
@@ -1221,17 +1771,14 @@ void send_disk_req(struct rollbaccine_device *device, sector_t sector) {
 void verify_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     struct rollbaccine_device *device = bio_data->device;
-    bool error;
-
-    enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT, &error);
-
-    if (error)
+    
+    int error = enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT);
+    if (error != 0)
         send_disk_req(device, bio_data->start_sector);
     else
         inc_verified_pages(device);
 
-    bio_put(bio_data->shallow_clone);
-    free_pages_end_io(bio_data->bio_src);
+    free_bio_data(bio_data);
 }
 
 void verify_disk_end_io(struct bio *bio) {
@@ -1240,14 +1787,14 @@ void verify_disk_end_io(struct bio *bio) {
     queue_work(bio_data->device->verify_disk_end_io_queue, &bio_data->submit_bio_work);
 }
 
-void leader_read_disk_end_io_task(struct work_struct *work) {
+void try_read_bio_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     struct rollbaccine_device *device = bio_data->device;
-    bool error;
+    int error;
 
     // Decrypt
-    enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT, &error);
-    if (error) {
+    error = enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT);
+    if (error != 0) {
         alert_client_of_liveness_problem(device, device->id);
         // TODO: Panic and crash
     }
@@ -1256,39 +1803,38 @@ void leader_read_disk_end_io_task(struct work_struct *work) {
     // Return to user
     bio_endio(bio_data->bio_src);
 
-    // Free shallow clone and bio_data
-#ifdef MEMORY_TRACKING
-    int num_shallow_clones = atomic_dec_return(&bio_data->device->num_shallow_clones_not_freed);
-    atomic_max(&bio_data->device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
-    int num_bio_data = atomic_dec_return(&device->num_bio_data_not_freed);
-    atomic_max(&device->max_outstanding_num_bio_data, num_bio_data + 1);
-#endif
-    bio_put(bio_data->shallow_clone);
-    if (bio_data->checksum_and_iv != NULL) {
-        kfree(bio_data->checksum_and_iv);
+    free_bio_data(bio_data);
+}
+
+void try_read_bio(struct bio_data *bio_data) {
+    // Ready to read when there are 0 other references
+    // printk(KERN_INFO "Decrementing ref_counter for read bio %llu", bio_data->start_sector);
+    if (atomic_dec_and_test(&bio_data->ref_counter)) {
+        INIT_WORK(&bio_data->submit_bio_work, try_read_bio_task);
+        queue_work(bio_data->device->leader_read_disk_end_io_queue, &bio_data->submit_bio_work);
+        // printk(KERN_INFO "Decrypting and freeing read bio %llu", bio_data->start_sector);
     }
-    kmem_cache_free(device->bio_data_cache, bio_data);
 }
 
 void leader_read_disk_end_io(struct bio *shallow_clone) {
     struct bio_data *bio_data = shallow_clone->bi_private;
-    INIT_WORK(&bio_data->submit_bio_work, leader_read_disk_end_io_task);
-    queue_work(bio_data->device->leader_read_disk_end_io_queue, &bio_data->submit_bio_work);
+    try_read_bio(bio_data);
 }
 
 void leader_write_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
-    // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", shallow_clone, bio_data->write_index, bio_data->deep_clone);
+    struct rollbaccine_device *device = bio_data->device;
+    // printk(KERN_INFO "Leader end_io shallow clone %p bio data write index: %d, deep clone: %p", bio_data->shallow_clone, bio_data->write_index, bio_data->deep_clone);
     // We only added it to the tree if it was non-empty, so only remove if it's non-empty
     if (bio_data->end_sector - bio_data->start_sector > 0) {
         remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->shallow_clone);
     }
      // Return to the user. If this is an fsync, wait for replication
-    if (!bio_data->is_fsync) {
+    if (!(bio_data->is_fsync && device->f > 0)) {
         ack_bio_to_user_without_executing(bio_data->bio_src);
     }
     // Unlike replica_disk_end_io, the clone is sharing data with the clone used for networking, so we have to check if we can free
-    try_free_clones(bio_data->shallow_clone);
+    try_free_clones(bio_data);
 }
 
 void leader_write_disk_end_io(struct bio *shallow_clone) {
@@ -1299,14 +1845,14 @@ void leader_write_disk_end_io(struct bio *shallow_clone) {
 
 void replica_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
-    // printk(KERN_INFO "Replica clone ended, freeing");
+    // printk(KERN_INFO "Replica clone ended, freeing: %d", bio_data->write_index);
     remove_from_outstanding_ops_and_unblock(bio_data->device, bio_data->bio_src);
-    // Note: Must do memory tracking before free_pages_end_io, since that frees bio_data
+    // Note: Must do memory tracking before free_bio_data, since that frees bio_data
 #ifdef MEMORY_TRACKING
     int queue_size = atomic_dec_return(&bio_data->device->replica_disk_end_io_queue_size);
     atomic_max(&bio_data->device->max_replica_disk_end_io_queue_size, queue_size + 1);
 #endif
-    free_pages_end_io(bio_data->bio_src);
+    free_bio_data(bio_data);
 }
 
 void replica_disk_end_io(struct bio *received_bio) {
@@ -1320,8 +1866,8 @@ void replica_disk_end_io(struct bio *received_bio) {
 
 void network_end_io(struct bio *deep_clone) {
     // See if we can free
-    // printk(KERN_INFO "Network broadcast %d completed", deep_clone_bio_data->write_index);
-    try_free_clones(deep_clone);
+    // printk(KERN_INFO "Network broadcast %d completed", ((struct bio_data *)(deep_clone->bi_private))->write_index);
+    try_free_clones(deep_clone->bi_private);
 }
 
 // Decide which socket to use based on which one is not currently in use
@@ -1343,9 +1889,9 @@ void broadcast_bio(struct work_struct *work) {
     struct bio_data *clone_bio_data = container_of(work, struct bio_data, broadcast_work);
     int socket_id;
     struct bio *clone = clone_bio_data->deep_clone;
-    unsigned char *checksum_and_iv = clone_bio_data->checksum_and_iv;
-    size_t checksum_and_iv_size = bio_checksum_and_iv_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
-    size_t remaining_checksum_and_iv_size;
+    unsigned char *checksum = clone_bio_data->checksum;
+    size_t checksum_size = bio_checksum_size(clone_bio_data->end_sector - clone_bio_data->start_sector);
+    size_t remaining_checksum_size;
     struct rollbaccine_device *device = clone_bio_data->device;
     struct kvec vec;
     struct multisocket *multisocket;
@@ -1365,8 +1911,8 @@ void broadcast_bio(struct work_struct *work) {
     metadata.num_pages = clone->bi_iter.bi_size / PAGE_SIZE;
     metadata.bi_opf = clone->bi_opf;
     metadata.sector = clone->bi_iter.bi_sector;
-    // Copy checksum and IV into metadata
-    memcpy(metadata.checksum_and_iv, checksum_and_iv, min(checksum_and_iv_size, ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE));
+    // Copy checksum into metadata
+    memcpy(metadata.checksum, checksum, min(checksum_size, ROLLBACCINE_METADATA_CHECKSUM_SIZE));
 
     // printk(KERN_INFO "Broadcasting write with write_index: %llu, is fsync: %d, bi_opf: %llu", metadata.write_index, requires_fsync(clone), metadata.bi_opf);
     WARN_ON(metadata.write_index == 0);  // Should be at least one. Means that bio_data was retrieved incorrectly
@@ -1374,83 +1920,82 @@ void broadcast_bio(struct work_struct *work) {
     // Note: If bi_size is not a multiple of PAGE_SIZE, we have to send by sector chunks
     WARN_ON(metadata.num_pages * PAGE_SIZE != clone->bi_iter.bi_size);
 
-    // Create message for additional hash & IVs if they exceed what could be sent with the metadata
-    if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
-        remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
-        additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
+    // Create message for additional hash if they exceed what could be sent with the metadata
+    if (checksum_size > ROLLBACCINE_METADATA_CHECKSUM_SIZE) {
+        remaining_checksum_size = checksum_size - ROLLBACCINE_METADATA_CHECKSUM_SIZE;
+        additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_size);
         additional_hash_msg->sender_id = device->id;
-        memcpy(additional_hash_msg->checksum_and_iv, checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, remaining_checksum_and_iv_size);
+        memcpy(additional_hash_msg->checksum, checksum + ROLLBACCINE_METADATA_CHECKSUM_SIZE, remaining_checksum_size);
 
 #ifdef MEMORY_TRACKING
         atomic_inc(&device->num_messages_larger_than_avg);
 #endif
     }
 
-    multisocket = device->counterpart;
-    if (multisocket == NULL) {
-        printk_ratelimited(KERN_ERR "Attempted to send to counterpart before we were connected");
-        goto finish_no_unlock;
-    }
-    if (atomic_read(&multisocket->disconnected)) {
-        goto finish_no_unlock;
-    }
-    socket_id = lock_on_next_free_socket(device, multisocket);
-    socket_data = &multisocket->socket_data[socket_id];
-    
-    metadata.sender_socket_id = socket_id;
-    // Send the recipient its own ID so it can check that this message was intended for them
-    metadata.recipient_id = multisocket->sender_id;
-    // Create a hash of the message after incrementing msg_index
-    metadata.msg_index = socket_data->last_sent_msg_index++;
-    hash_metadata(socket_data, &metadata);
+    down_read(&device->connected_sockets_sem);
+    list_for_each_entry(multisocket, &device->connected_sockets, list) {
+        if (atomic_read(&multisocket->disconnected)) {
+            continue;
+        }
+        socket_id = lock_on_next_free_socket(device, multisocket);
+        socket_data = &multisocket->socket_data[socket_id];
+        
+        metadata.sender_socket_id = socket_id;
+        // Send the recipient its own ID so it can check that this message was intended for them
+        metadata.recipient_id = multisocket->sender_id;
+        // Create a hash of the message after incrementing msg_index
+        metadata.msg_index = socket_data->last_sent_msg_index++;
+        hash_metadata(socket_data, &metadata);
 
-    vec.iov_base = &metadata;
-    vec.iov_len = sizeof(struct metadata_msg);
-    print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
+        vec.iov_base = &metadata;
+        vec.iov_len = sizeof(struct metadata_msg);
+        print_and_update_latency("broadcast_bio: Set up broadcast message", &time);
 
-    // 1. Send metadata
-    success = send_msg(vec, socket_data->sock);
-    if (!success) {
-        // printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
-        should_disconnect = true;
-        goto finish_sending_to_socket;
-    }
-    print_and_update_latency("broadcast_bio: Send metadata", &time);
-
-    // 2. Send hash & IVs if they exceed what could be sent with the metadata
-    if (additional_hash_msg != NULL) {
-        additional_hash_msg->sender_socket_id = socket_id;
-        additional_hash_msg->recipient_id = multisocket->sender_id;
-        additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
-        hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
-
-        vec.iov_base = additional_hash_msg;
-        vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
+        // 1. Send metadata
         success = send_msg(vec, socket_data->sock);
         if (!success) {
-            // printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+            // printk_ratelimited(KERN_ERR "Error broadcasting message header, aborting");
             should_disconnect = true;
             goto finish_sending_to_socket;
         }
-        print_and_update_latency("broadcast_bio: Sent remaining checksums and IVs", &time);
-    }
+        print_and_update_latency("broadcast_bio: Send metadata", &time);
 
-    // 3. Send bios
-    bio_for_each_segment(bvec, clone, iter) {
-        bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
-        success = send_page(chunked_bvec, socket_data->sock);
-        if (!success) {
-            // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
-            should_disconnect = true;
-            goto finish_sending_to_socket;
+        // 2. Send hash if they exceed what could be sent with the metadata
+        if (additional_hash_msg != NULL) {
+            additional_hash_msg->sender_socket_id = socket_id;
+            additional_hash_msg->recipient_id = multisocket->sender_id;
+            additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
+            hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
+
+            vec.iov_base = additional_hash_msg;
+            vec.iov_len = additional_hash_msg_size(remaining_checksum_size);
+            success = send_msg(vec, socket_data->sock);
+            if (!success) {
+                // printk_ratelimited(KERN_ERR "Error broadcasting additional hash message, aborting");
+                should_disconnect = true;
+                goto finish_sending_to_socket;
+            }
+            print_and_update_latency("broadcast_bio: Sent remaining checksums", &time);
         }
-    }
-    print_and_update_latency("broadcast_bio: Send pages", &time);
-    // Label to jump to if socket cannot be written to, so we can iterate the next socket
+
+        // 3. Send bios
+        if (!device->only_replicate_checksums) {
+            bio_for_each_segment(bvec, clone, iter) {
+                bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
+                success = send_page(chunked_bvec, socket_data->sock);
+                if (!success) {
+                    // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
+                    should_disconnect = true;
+                    goto finish_sending_to_socket;
+                }
+            }
+            print_and_update_latency("broadcast_bio: Send pages", &time);
+        }
+        // Label to jump to if socket cannot be written to, so we can iterate the next socket
 finish_sending_to_socket:
-    mutex_unlock(&socket_data->socket_mutex);
-finish_no_unlock:
-    
+        mutex_unlock(&socket_data->socket_mutex);
+    }
+    up_read(&device->connected_sockets_sem);
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
 
     if (should_disconnect) {
@@ -1527,7 +2072,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     bool is_cloned = false;
     bool doesnt_conflict_with_other_writes = true;
     bool is_empty = bio_sectors(bio) == 0;
-    bool encrypt_error;
+    int error;
     struct rollbaccine_device *device = ti->private;
     struct bio_data *bio_data;
     struct bio_fsync_list *bio_fsync_data;
@@ -1535,7 +2080,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
     cycles_t total_time = get_cycles_if_flag_on();
 
     bio_set_dev(bio, device->dev->bdev);
-    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+    bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector) + device->disk_pages_for_merkle_tree * SECTORS_PER_PAGE;
 
     // Big problems if the write is smaller than a page
     if (!is_empty && bio_sectors(bio) < SECTORS_PER_PAGE) {
@@ -1553,6 +2098,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 #endif
 
     // Copy bio if it's a write. Permit non-leaders to read as well for ACE testing; can turn off in production.
+    // printk(KERN_INFO "Processing bio %p, is_write: %d, is_leader: %d, sector: %llu", bio, bio_data_dir(bio) == WRITE, device->is_leader, bio->bi_iter.bi_sector);
     if (device->is_leader || bio_data_dir(bio) == READ) {
         is_cloned = true;
 
@@ -1561,6 +2107,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
         bio_data->bio_src = bio;
         bio_data->start_sector = bio->bi_iter.bi_sector;
         bio_data->end_sector = bio->bi_iter.bi_sector + bio_sectors(bio);
+        alloc_bio_checksum(device, bio_data);
+        bio->bi_private = bio_data;
         
         switch (bio_data_dir(bio)) {
             case WRITE:
@@ -1573,9 +2121,21 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // Don't allow writes through if ballot != seen_ballot. Wait until it's true
                 wait_event_interruptible(device->ballot_mismatch_wait_queue, atomic_read(&device->ballot) == atomic_read(&device->seen_ballot));
 
+                switch (device->sync_mode) {
+                    case ROLLBACCINE_DEFAULT:
+                        break;
+                    case ROLLBACCINE_SYNC:
+                        // Add sync flags
+                        bio->bi_opf |= REQ_FUA;
+                        break;
+                    case ROLLBACCINE_ASYNC:
+                        // Remove sync flags
+                        bio->bi_opf &= ~(REQ_PREFLUSH | REQ_FUA);
+                        break;
+                }
+
                 bio_data->is_fsync = requires_fsync(bio);
-                // bio->bi_opf = remove_fsync_flags(bio->bi_opf);  // All fsyncs become logical fsyncs
-                if (bio_data->is_fsync) {
+                if (bio_data->is_fsync && device->f > 0) {
                     bio_fsync_data = kmalloc(sizeof(struct bio_fsync_list), GFP_KERNEL);
                     bio_fsync_data->bio_src = bio;
 #ifdef MEMORY_TRACKING
@@ -1591,8 +2151,8 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 }
 
                 // Encrypt
-                bio_data->checksum_and_iv = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT, &encrypt_error);
-                if (encrypt_error) {
+                error = enc_or_dec_bio(bio_data, ROLLBACCINE_ENCRYPT);
+                if (error != 0) {
                     alert_client_of_liveness_problem(device, device->id);
                     // TODO: System panic
                 }
@@ -1623,9 +2183,12 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                     if (!doesnt_conflict_with_other_writes) {
                         add_to_pending_ops_tail(device, bio_data);
                     }
+
+                    // Can fetch the merkle nodes regardless of conflict
+                    fetch_merkle_nodes(device, bio_data, WRITE);
                 }
-                // printk(KERN_INFO "Inserted clone %p, write index: %d", bio_data->shallow_clone, bio_data->write_index);
-                if (bio_data->is_fsync) {
+                // printk(KERN_INFO "Inserted write clone %p, write index: %d, conflicts: %d", bio_data->shallow_clone, bio_data->write_index, !doesnt_conflict_with_other_writes);
+                if (bio_data->is_fsync && device->f > 0) {
                     // Add original bio to fsyncs blocked on replication
                     mutex_lock(&device->replica_fsync_lock);
                     print_and_update_latency("leader_process_write: index lock -> obtained replica fsync lock", &time);
@@ -1640,9 +2203,6 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
 
                 // Even though submit order != write index order, any conflicting writes will only be submitted later so any concurrency here is fine
                 if (doesnt_conflict_with_other_writes) {
-                    if (bio_data->checksum_and_iv != NULL) {
-                        update_global_checksum_and_iv(device, bio_data->checksum_and_iv, bio_data->start_sector, bio_data->end_sector - bio_data->start_sector);
-                    }
                     submit_bio_noacct(bio_data->shallow_clone);
                     this_cpu_inc(num_ops_on_cpu);
                     print_and_update_latency("leader_process_write: submit", &time);
@@ -1661,6 +2221,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // Set end_io so once this cloned read completes, we can decrypt and send the original read along
                 bio_data->shallow_clone->bi_end_io = leader_read_disk_end_io;
                 bio_data->shallow_clone->bi_private = bio_data;
+                atomic_set(&bio_data->ref_counter, 1);
 
                 // Block read if it conflicts with any other outstanding operations
                 mutex_lock(&device->index_lock);
@@ -1668,6 +2229,10 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 if (!doesnt_conflict_with_other_writes) {
                     add_to_pending_ops_tail(device, bio_data);
                 }
+                // printk(KERN_INFO "Inserted read clone %p, conflicts: %d", bio_data->shallow_clone, !doesnt_conflict_with_other_writes);
+
+                // Can fetch the merkle nodes regardless of conflict
+                fetch_merkle_nodes(device, bio_data, READ);
                 mutex_unlock(&device->index_lock);
 
                 if (doesnt_conflict_with_other_writes) {
@@ -1728,7 +2293,19 @@ void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char
     print_and_update_latency("hash_buffer", &time);
 }
 
-unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec, bool *error) {
+void hash_merkle_page(struct rollbaccine_device *device, struct merkle_bio_data *bio_data) {
+    struct shash_desc *hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->unsigned_hash_alg), GFP_KERNEL);
+    hash_desc->tfm = device->unsigned_hash_alg;
+
+    // Requires page_addr to be mapped
+    int ret = crypto_shash_digest(hash_desc, bio_data->page_addr, PAGE_SIZE, bio_data->hash);
+    if (ret) {
+        printk_ratelimited(KERN_ERR "Could not hash buffer");
+    }
+    kfree(hash_desc);
+}
+
+int enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
     int ret = 0;
     struct bio *bio;
     struct bio_vec bv;
@@ -1737,33 +2314,20 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     struct scatterlist sg[4], sg_verify[4];
     struct page *page_verify;
     DECLARE_CRYPTO_WAIT(wait);
-    unsigned char *bio_checksum_and_iv;
-    unsigned char *iv;
-    // TODO: Reenable when testing on machines with RDRAND
-    // long iv_long;
-    // bool rd_rand_success = false;
-    // size_t iv_copy_num_bytes_remaining;
-    unsigned char *checksum;
+    unsigned char *sector_checksum;
+    unsigned char sector_iv[AES_GCM_IV_SIZE];
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
-    *error = false;
 
     if (bio_data->end_sector == bio_data->start_sector) {
         // printk(KERN_INFO "Skipping encryption/decryption for empty bio");
-        return NULL;
+        return 0;
     }
 
     switch (enc_or_dec) {
         case ROLLBACCINE_ENCRYPT:
             // Operate on the deep clone, since otherwise we may overwrite buffers from the user and can cause a crash
             bio = bio_data->deep_clone;
-            // Store new checksum and IV of write into array (instead of updating global checksum/iv) so the global checksum/iv can be updated in-order later
-            bio_checksum_and_iv = alloc_bio_checksum_and_iv(bio_data->device, bio_sectors(bio));
-            if (!bio_checksum_and_iv) {
-                printk(KERN_ERR "Could not allocate checksum and iv for bio");
-                goto free_and_return;
-            }
-            print_and_update_latency("enc_or_dec_bio: ENCRYPT alloc_bio_checksum_and_iv", &time);
             break;
         case ROLLBACCINE_DECRYPT:
             bio = bio_data->bio_src;
@@ -1774,7 +2338,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
             page_verify = page_cache_alloc(bio_data->device);
             if (!page_verify) {
                 printk(KERN_ERR "Could not allocate page for verification");
-                return NULL;
+                return 1;
             }
             print_and_update_latency("enc_or_dec_bio: VERIFY page_cache_alloc", &time);
             break;
@@ -1785,44 +2349,24 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         curr_sector = bio->bi_iter.bi_sector;
         bv = bio_iter_iovec(bio, bio->bi_iter);
 
+        sector_checksum = get_bio_checksum(bio_data, curr_sector);
+        memcpy(sector_iv, &curr_sector, sizeof(uint64_t));
+
         switch (enc_or_dec) {
             case ROLLBACCINE_ENCRYPT:
-                checksum = get_bio_checksum(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
-                iv = get_bio_iv(bio_checksum_and_iv, bio_data->start_sector, curr_sector);
-                print_and_update_latency("enc_or_dec_bio: ENCRYPT get bio checksum and iv", &time);
-                // Generate a new IV
-                // TODO: Uncomment when testing on machines with RDRAND to see if this works
-                // iv_copy_num_bytes_remaining = AES_GCM_IV_SIZE;
-                // while (iv_copy_num_bytes_remaining > 0) {
-                //     rd_rand_success = rdrand_long(&iv_long);
-                //     if (!rd_rand_success) {
-                //         printk(KERN_ERR "Could not generate random number for IV");
-                //         goto free_and_return;
-                //     }
-                //     memcpy(iv + (AES_GCM_IV_SIZE - iv_copy_num_bytes_remaining), &iv_long, min(iv_copy_num_bytes_remaining, sizeof(long)));
-                //     iv_copy_num_bytes_remaining -= sizeof(long);
-                // }
-                get_random_bytes(iv, AES_GCM_IV_SIZE);
-                print_and_update_latency("enc_or_dec_bio: ENCRYPT get_random_bytes", &time);
                 break;
             case ROLLBACCINE_DECRYPT:
-                checksum = global_checksum(bio_data->device, curr_sector);
-                iv = global_iv(bio_data->device, curr_sector);
                 // Skip decryption for any block that has not been written to
-                if (!has_checksum(checksum)) {
+                if (mem_is_zero(sector_checksum, AES_GCM_AUTH_SIZE)) {
                     goto enc_or_dec_next_sector;
                 }
                 break;
             case ROLLBACCINE_VERIFY:
-                // Assume the existing checksum is stored in bio_data
-                checksum = get_bio_checksum(bio_data->checksum_and_iv, bio_data->start_sector, curr_sector);
-                iv = get_bio_iv(bio_data->checksum_and_iv, bio_data->start_sector, curr_sector);
-
                 sg_init_table(sg_verify, 4);
                 sg_set_buf(&sg_verify[0], &curr_sector, sizeof(uint64_t));
-                sg_set_buf(&sg_verify[1], iv, AES_GCM_IV_SIZE);
-                sg_set_page(&sg_verify[2], page_verify, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
-                sg_set_buf(&sg_verify[3], checksum, AES_GCM_AUTH_SIZE);
+                sg_set_buf(&sg_verify[1], sector_iv, AES_GCM_IV_SIZE);
+                sg_set_page(&sg_verify[2], page_verify, PAGE_SIZE, bv.bv_offset);
+                sg_set_buf(&sg_verify[3], sector_checksum, AES_GCM_AUTH_SIZE);
                 break;
         }
 
@@ -1831,7 +2375,7 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
             req = aead_request_alloc(bio_data->device->tfm, GFP_KERNEL);
             if (!req) {
                 printk(KERN_ERR "aead request allocation failed");
-                return NULL;
+                return 1;
             }
             print_and_update_latency("enc_or_dec_bio: aead_request_alloc", &time);
         }
@@ -1839,9 +2383,9 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         // Set up scatterlist to encrypt/decrypt
         sg_init_table(sg, 4);
         sg_set_buf(&sg[0], &curr_sector, sizeof(uint64_t));
-        sg_set_buf(&sg[1], iv, AES_GCM_IV_SIZE);
-        sg_set_page(&sg[2], bv.bv_page, ROLLBACCINE_ENCRYPTION_GRANULARITY, bv.bv_offset);
-        sg_set_buf(&sg[3], checksum, AES_GCM_AUTH_SIZE);
+        sg_set_buf(&sg[1], sector_iv, AES_GCM_IV_SIZE);
+        sg_set_page(&sg[2], bv.bv_page, PAGE_SIZE, bv.bv_offset);
+        sg_set_buf(&sg[3], sector_checksum, AES_GCM_AUTH_SIZE);
 
         // /* AEAD request:
         //  *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
@@ -1853,15 +2397,15 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
         aead_request_set_ad(req, sizeof(uint64_t) + AES_GCM_IV_SIZE);
         switch (enc_or_dec) {
             case ROLLBACCINE_ENCRYPT:
-                aead_request_set_crypt(req, sg, sg, ROLLBACCINE_ENCRYPTION_GRANULARITY, iv);
+                aead_request_set_crypt(req, sg, sg, PAGE_SIZE, sector_iv);
                 ret = crypto_wait_req(crypto_aead_encrypt(req), &wait);
                 break;
             case ROLLBACCINE_DECRYPT:
-                aead_request_set_crypt(req, sg, sg, ROLLBACCINE_ENCRYPTION_GRANULARITY + AES_GCM_AUTH_SIZE, iv);
+                aead_request_set_crypt(req, sg, sg, PAGE_SIZE + AES_GCM_AUTH_SIZE, sector_iv);
                 ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
                 break;
             case ROLLBACCINE_VERIFY: // Write output to page and discard
-                aead_request_set_crypt(req, sg, sg_verify, ROLLBACCINE_ENCRYPTION_GRANULARITY + AES_GCM_AUTH_SIZE, iv);
+                aead_request_set_crypt(req, sg, sg_verify, PAGE_SIZE + AES_GCM_AUTH_SIZE, sector_iv);
                 ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
                 break;
         }
@@ -1873,12 +2417,11 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
             } else {
                 printk_ratelimited(KERN_ERR "encryption/decryption failed with error code %d", ret);
             }
-            *error = true;
             goto free_and_return;
         }
 
         enc_or_dec_next_sector:
-        bio_advance_iter(bio, &bio->bi_iter, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+        bio_advance_iter(bio, &bio->bi_iter, PAGE_SIZE);
         reinit_completion(&wait.completion);
     }
 
@@ -1892,14 +2435,14 @@ unsigned char *enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_
     bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
     bio->bi_iter.bi_idx = 0;
     print_and_update_latency("enc_or_dec_bio", &total_time);
-    return bio_checksum_and_iv; // NOTE: This will be NULL for reads
+    return ret;
 }
 
 int submit_pending_bio_ring_prefix(void *args) {
     struct rollbaccine_device *device = args;
     struct bio_data *curr_bio_data;
     struct blk_plug plug; // Used to merge bios
-    bool no_conflict, should_ack_fsync;
+    bool is_empty, no_conflict, should_ack_fsync;
     int signal, curr_head, bios_between_plug;
     cycles_t time = get_cycles_if_flag_on();
     cycles_t total_time = get_cycles_if_flag_on();
@@ -1921,13 +2464,18 @@ int submit_pending_bio_ring_prefix(void *args) {
         blk_start_plug(&plug);
         // Pop as much of the bio prefix off the pending bio ring as possible
         while ((curr_bio_data = (struct bio_data*) atomic_long_xchg(&device->pending_bio_ring[curr_head], 0)) != NULL) {
+            is_empty = curr_bio_data->end_sector == curr_bio_data->start_sector;
             mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
             // Only check for concurrent writes if it's non-empty
-            if (curr_bio_data->end_sector != curr_bio_data->start_sector) {
-                no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
-                if (!no_conflict) {
-                    add_to_pending_ops_tail(device, curr_bio_data);
+            if (!is_empty) {
+                if (!device->only_replicate_checksums) {
+                    no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
+                    if (!no_conflict) {
+                        add_to_pending_ops_tail(device, curr_bio_data);
+                    }
                 }
+
+                fetch_merkle_nodes(device, curr_bio_data, WRITE);
             }
             else {
                 no_conflict = true;
@@ -1941,23 +2489,24 @@ int submit_pending_bio_ring_prefix(void *args) {
             // Record if we should ack the fsync
             should_ack_fsync |= curr_bio_data->is_fsync;
 
-            if (no_conflict) {
-                if (curr_bio_data->checksum_and_iv != NULL) {
-                    update_global_checksum_and_iv(device, curr_bio_data->checksum_and_iv, curr_bio_data->start_sector, curr_bio_data->end_sector - curr_bio_data->start_sector);
-                }
-
-                // If the bio is empty, don't submit, just free it
-                if (bio_sectors(curr_bio_data->bio_src) == 0)
-                    free_pages_end_io(curr_bio_data->bio_src);
-                else {
-                    submit_bio_noacct(curr_bio_data->bio_src);
-                    bios_between_plug++;
-                    if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
-                        blk_finish_plug(&plug);
-                        blk_start_plug(&plug);
-                        bios_between_plug = 0;
+            if (!device->only_replicate_checksums) {
+                if (no_conflict) {
+                    // If the bio is empty, don't submit, just free it
+                    if (is_empty)
+                        free_bio_data(curr_bio_data);
+                    else {
+                        submit_bio_noacct(curr_bio_data->bio_src);
+                        bios_between_plug++;
+                        if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+                            blk_finish_plug(&plug);
+                            blk_start_plug(&plug);
+                            bios_between_plug = 0;
+                        }
                     }
                 }
+            }
+            else {
+                free_bio_data(curr_bio_data);
             }
 
             // Increment index and wrap around if necessary
@@ -2163,9 +2712,8 @@ bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *mult
     struct kvec vec;
     struct socket_data *socket_data;
     int socket_id;
-    sector_t sector = 0, i;
+    sector_t hashes_to_send, num_pages, page = 0;
     bool success;
-    bool about_to_complete = false;
 
     hash_msg = kmalloc(sizeof(struct hash_msg), GFP_KERNEL);
 
@@ -2198,20 +2746,15 @@ bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *mult
     hash_msg->recipient_id = multisocket->sender_id;
 
     printk(KERN_INFO "Sending all hashes");
-    while (!about_to_complete) {
+    num_pages = device->num_sectors / SECTORS_PER_PAGE;
+    while (page < num_pages) {
         hash_msg->msg_index = socket_data->last_sent_msg_index++;
-        hash_msg->start_sector = sector;
+        hash_msg->start_page = page;
 
-        // Copy hashes and IVs into the message
-        for (i = 0; i < ROLLBACCINE_HASHES_PER_MSG; i++) {
-            if (sector + i >= device->num_sectors) {
-                about_to_complete = true;
-                break;
-            }
-            memcpy(hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE), global_checksum(device, sector+i), AES_GCM_AUTH_SIZE);
-            memcpy(hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE, global_iv(device, sector+i), AES_GCM_IV_SIZE);
-        }
-        sector += ROLLBACCINE_HASHES_PER_MSG;
+        // Copy hashes into the message
+        hashes_to_send = min(num_pages - page, ROLLBACCINE_HASHES_PER_MSG);
+        memcpy(hash_msg->checksums, device->merkle_tree_root + page, hashes_to_send * AES_GCM_AUTH_SIZE);
+        page += hashes_to_send;
         
         hash_buffer(socket_data, (char *)hash_msg + SHA256_SIZE, sizeof(struct hash_msg) - SHA256_SIZE, hash_msg->msg_hash);
 
@@ -2234,7 +2777,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
     struct hash_msg *hash_msg;
     struct kvec vec;
     bool success, about_to_complete = false;
-    sector_t i, sector = 0;
+    sector_t hashes_to_copy, num_pages, page;
     struct bio_data *bio_data;
     struct bio *bio;
     struct blk_plug plug;
@@ -2244,6 +2787,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
 
     // 1. Receive all hash messages
     printk(KERN_INFO "Begin receiving hashes");
+    num_pages = device->num_sectors / SECTORS_PER_PAGE;
     while (!about_to_complete) {
         vec.iov_base = hash_msg;
         vec.iov_len = sizeof(struct hash_msg);
@@ -2268,21 +2812,13 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
             return false;
         }
 
-        // Copy hashes and IVs into the global checksum and IV
-        // printk(KERN_INFO "Received hashes from %llu sector to %llu", hash_msg->start_sector, hash_msg->start_sector + ROLLBACCINE_HASHES_PER_MSG - 1);
-        for (i = 0; i < ROLLBACCINE_HASHES_PER_MSG; i++) {
-            sector = hash_msg->start_sector + i;
-            memcpy(global_checksum(device, sector), hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE), AES_GCM_AUTH_SIZE);
-            memcpy(global_iv(device, sector), hash_msg->checksum_and_ivs + i * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE) + AES_GCM_AUTH_SIZE, AES_GCM_IV_SIZE);
-            
-            if (sector >= device->num_sectors - 1) {
-                about_to_complete = true;
-                break;
-            }
-        }
+        // Copy hashes into the global checksum
+        hashes_to_copy = min(num_pages - hash_msg->start_page, ROLLBACCINE_HASHES_PER_MSG);
+        memcpy(device->merkle_tree_root + hash_msg->start_page, hash_msg->checksums, hashes_to_copy * AES_GCM_AUTH_SIZE);
+        about_to_complete = hash_msg->start_page + hashes_to_copy >= num_pages - 1;
 
 #ifdef MEMORY_TRACKING
-        device->num_hashes_received_during_recovery = sector + 1;
+        device->num_hashes_received_during_recovery += hashes_to_copy;
 #endif
     }
     kfree(hash_msg);
@@ -2290,11 +2826,10 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
 
     // 2. Scan the disk to verify the hashes
     atomic_set(&device->num_verified_sectors, 0);
-    sector = 0;
     blk_start_plug(&plug);
-    while (sector < device->num_sectors) {
+    for (page = 0; page < num_pages; page++) {
         bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
-        bio->bi_iter.bi_sector = sector;
+        bio->bi_iter.bi_sector = page * SECTORS_PER_PAGE;
         __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
 #ifdef MEMORY_TRACKING
         atomic_inc(&device->num_bio_pages_not_freed);
@@ -2303,8 +2838,10 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->bio_src = bio;
-        bio_data->start_sector = sector;
-        bio_data->end_sector = sector + SECTORS_PER_PAGE;
+        bio_data->deep_clone = bio;
+        bio_data->start_sector = page * SECTORS_PER_PAGE;
+        bio_data->end_sector = bio_data->start_sector + SECTORS_PER_PAGE;
+        alloc_bio_checksum(device, bio_data);
         bio->bi_private = bio_data;
 
         bio_data->shallow_clone = shallow_bio_clone(device, bio);
@@ -2312,8 +2849,6 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
         bio_data->shallow_clone->bi_private = bio_data;
 
         submit_bio_noacct(bio_data->shallow_clone);
-
-        sector += SECTORS_PER_PAGE;
 
         bios_between_plug++;
         if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
@@ -2336,9 +2871,9 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
     struct page *page;
     struct kvec vec;
     uint64_t msg_ballot;
-    bool success, verify_error;
-    int i, num_sectors, index_offset, bio_distance, old_seen_ballot;
-    size_t checksum_and_iv_size, remaining_checksum_and_iv_size;
+    bool success;
+    int i, error, index_offset, bio_distance, old_seen_ballot;
+    size_t checksum_size, remaining_checksum_size;
     struct additional_hash_msg *additional_hash_msg;
     long replaced_bio_data;
 
@@ -2378,7 +2913,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
                 break;
             case ROLLBACCINE_ACK:
                 if (device->is_leader)
-                    process_follower_fsync_index(device, metadata.write_index);
+                    process_follower_fsync_index(device, metadata.write_index, metadata.sender_id);
                 else
                     printk(KERN_ERR "Backup received fsync ACK");
                 continue;
@@ -2419,52 +2954,45 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         }
 
         // Critical path processing
-        received_bio = bio_alloc_bioset(device->dev->bdev, metadata.num_pages, metadata.bi_opf, GFP_NOIO, &device->bs);
-        received_bio->bi_iter.bi_sector = metadata.sector;
-        received_bio->bi_end_io = replica_disk_end_io;
-
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
-        bio_data->bio_src = received_bio;
         bio_data->start_sector = metadata.sector;
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
         bio_data->is_fsync = metadata.type == ROLLBACCINE_FSYNC;
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
-        received_bio->bi_private = bio_data;
 
-        // Copy hash and IV
-        num_sectors = metadata.num_pages * SECTORS_PER_PAGE;
-        checksum_and_iv_size = bio_checksum_and_iv_size(num_sectors);
-        bio_data->checksum_and_iv = alloc_bio_checksum_and_iv(device, num_sectors);
-        memcpy(bio_data->checksum_and_iv, metadata.checksum_and_iv, min(ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, checksum_and_iv_size));
+        // Copy hash
+        checksum_size = bio_checksum_size(metadata.num_pages * SECTORS_PER_PAGE);
+        alloc_bio_checksum(device, bio_data);
+        memcpy(bio_data->checksum, metadata.checksum, min(ROLLBACCINE_METADATA_CHECKSUM_SIZE, checksum_size));
 
         // 2. Expect hash if it wasn't done sending
-        if (checksum_and_iv_size > ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE) {
-            remaining_checksum_and_iv_size = checksum_and_iv_size - ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE;
-            additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_and_iv_size);
+        if (checksum_size > ROLLBACCINE_METADATA_CHECKSUM_SIZE) {
+            remaining_checksum_size = checksum_size - ROLLBACCINE_METADATA_CHECKSUM_SIZE;
+            additional_hash_msg = alloc_additional_hash_msg(device, remaining_checksum_size);
 
             vec.iov_base = additional_hash_msg;
-            vec.iov_len = additional_hash_msg_size(remaining_checksum_and_iv_size);
+            vec.iov_len = additional_hash_msg_size(remaining_checksum_size);
 
-            // printk(KERN_INFO "Receiving checksums and IVs, size: %lu", vec.iov_len);
+            // printk(KERN_INFO "Receiving checksums, size: %lu", vec.iov_len);
             success = receive_msg(vec, socket_data->sock);
             if (!success) {
-                printk(KERN_ERR "Error reading checksum and IV");
-                free_pages_end_io(received_bio);
+                printk(KERN_ERR "Error reading checksum");
+                free_bio_data(bio_data);
                 kfree(additional_hash_msg);
                 goto disconnect_from_sender;
             }
 
             // Verify the message
-            if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_and_iv_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->recipient_id, device->id, additional_hash_msg->msg_index)) {
-                free_pages_end_io(received_bio);
+            if (!verify_msg(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash, additional_hash_msg->sender_id, additional_hash_msg->sender_socket_id, additional_hash_msg->recipient_id, device->id, additional_hash_msg->msg_index)) {
+                free_bio_data(bio_data);
                 kfree(additional_hash_msg);
                 goto disconnect_from_sender;
             }
 
             // Copy the checksums over
-            memcpy(bio_data->checksum_and_iv + ROLLBACCINE_METADATA_CHECKSUM_IV_SIZE, additional_hash_msg->checksum_and_iv, remaining_checksum_and_iv_size);
+            memcpy(bio_data->checksum + ROLLBACCINE_METADATA_CHECKSUM_SIZE, additional_hash_msg->checksum, remaining_checksum_size);
             // Free the message
             kfree(additional_hash_msg);
 
@@ -2473,44 +3001,53 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
 #endif
         }
 
-        // 3. Receive pages of bio (over the regular socket now, not TLS)
-        for (i = 0; i < metadata.num_pages; i++) {
-            page = page_cache_alloc(device);
-            // page = alloc_page(GFP_KERNEL);
-            // if (page == NULL) {
-            //     printk(KERN_ERR "Error allocating page");
-            //     break;
-            // }
-#ifdef MEMORY_TRACKING
-            atomic_inc(&device->num_bio_pages_not_freed);
-#endif
-            vec.iov_base = page_address(page);
-            vec.iov_len = PAGE_SIZE;
+        if (!device->only_replicate_checksums) {
+            // 3. Receive pages of bio (over the regular socket now, not TLS)
+            received_bio = bio_alloc_bioset(device->dev->bdev, metadata.num_pages, metadata.bi_opf, GFP_NOIO, &device->bs);
+            received_bio->bi_iter.bi_sector = metadata.sector;
+            received_bio->bi_end_io = replica_disk_end_io;
+            bio_data->bio_src = received_bio;
+            bio_data->deep_clone = received_bio;
+            received_bio->bi_private = bio_data;
 
-            success = receive_msg(vec, socket_data->sock);
-            if (!success) {
-                printk(KERN_ERR "Error reading from socket");
-                free_pages_end_io(received_bio);
+            for (i = 0; i < metadata.num_pages; i++) {
+                page = page_cache_alloc(device);
+                // page = alloc_page(GFP_KERNEL);
+                // if (page == NULL) {
+                //     printk(KERN_ERR "Error allocating page");
+                //     break;
+                // }
+#ifdef MEMORY_TRACKING
+                atomic_inc(&device->num_bio_pages_not_freed);
+#endif
+                vec.iov_base = page_address(page);
+                vec.iov_len = PAGE_SIZE;
+
+                success = receive_msg(vec, socket_data->sock);
+                if (!success) {
+                    printk(KERN_ERR "Error reading from socket");
+                    free_bio_data(bio_data);
+                    goto disconnect_from_sender;
+                }
+                // printk(KERN_INFO "Received bio page: %i", i);
+                __bio_add_page(received_bio, page, PAGE_SIZE, 0);
+            }
+
+            // 4. Verify against hash
+            error = enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
+            if (error != 0) {
+                printk(KERN_ERR "Backup received invalid page");
+                free_bio_data(bio_data);
+                alert_client_of_liveness_problem(device, multisocket->sender_id);
                 goto disconnect_from_sender;
             }
-            // printk(KERN_INFO "Received bio page: %i", i);
-            __bio_add_page(received_bio, page, PAGE_SIZE, 0);
-        }
-
-        // 4. Verify against hash
-        enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY, &verify_error);
-        if (verify_error) {
-            printk(KERN_ERR "Backup received invalid page");
-            free_pages_end_io(received_bio);
-            alert_client_of_liveness_problem(device, multisocket->sender_id);
-            goto disconnect_from_sender;
         }
 
         // 5. Add bio to pending_bio_ring
         bio_distance = bio_data->write_index - atomic_read(&device->pending_bio_ring_head);
         if (bio_distance > ROLLBACCINE_PENDING_BIO_RING_SIZE) {
             printk(KERN_ERR "Pending bio ring overflowing, bio distance: %d", bio_distance);
-            free_pages_end_io(received_bio);
+            free_bio_data(bio_data);
             alert_client_of_liveness_problem(device, multisocket->sender_id);
             goto disconnect_from_sender;
         }
@@ -2519,7 +3056,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         replaced_bio_data = atomic_long_cmpxchg(&device->pending_bio_ring[index_offset], 0, (long)bio_data);
         if (replaced_bio_data != 0) {
             printk(KERN_ERR "Pending bio ring overflowing, attempted to replace non-NULL element, bio distance: %d", bio_distance);
-            free_pages_end_io(received_bio);
+            free_bio_data(bio_data);
             alert_client_of_liveness_problem(device, multisocket->sender_id);
             goto disconnect_from_sender;
         }
@@ -2556,12 +3093,12 @@ void init_socket_data(struct rollbaccine_device *device, struct socket_data *soc
     socket_data->sender_id = sender_id;
     socket_data->sender_socket_id = sender_socket_id;
     mutex_init(&socket_data->hash_mutex);
-    socket_data->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->hash_alg), GFP_KERNEL);
+    socket_data->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->signed_hash_alg), GFP_KERNEL);
     if (socket_data->hash_desc == NULL) {
         printk(KERN_ERR "Error allocating hash desc");
         return;
     }
-    socket_data->hash_desc->tfm = device->hash_alg;
+    socket_data->hash_desc->tfm = device->signed_hash_alg;
 }
 
 struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id) {
@@ -2710,6 +3247,12 @@ int start_client_to_server(struct rollbaccine_device *device, uint64_t server_id
     struct client_thread_params *thread_params;
     struct task_struct *connect_thread;
     int i, error;
+
+    // We don't currently have logic for recovery for merkle trees where some parts are on disk
+    if (send_p1a && (device->merkle_tree_height > 1 || device->f != 1)) {
+        printk(KERN_ERR "Unsupported: recovery with merkle tree height %d or f %llu", device->merkle_tree_height, device->f);
+        return -1;
+    }
 
     // Start a thread on each CPU
     for (i = 0; i < NUM_NICS; i++) {
@@ -2874,9 +3417,9 @@ int start_server(struct rollbaccine_device *device, ushort port) {
 }
 
 static void rollbaccine_io_hints(struct dm_target *ti, struct queue_limits *limits) {
-    limits->logical_block_size = max_t(unsigned int, limits->logical_block_size, ROLLBACCINE_ENCRYPTION_GRANULARITY);
-    limits->physical_block_size = max_t(unsigned int, limits->physical_block_size, ROLLBACCINE_ENCRYPTION_GRANULARITY);
-    limits->io_min = max_t(unsigned int, limits->io_min, ROLLBACCINE_ENCRYPTION_GRANULARITY);
+    limits->logical_block_size = max_t(unsigned int, limits->logical_block_size, PAGE_SIZE);
+    limits->physical_block_size = max_t(unsigned int, limits->physical_block_size, PAGE_SIZE);
+    limits->io_min = max_t(unsigned int, limits->io_min, PAGE_SIZE);
     limits->dma_alignment = limits->logical_block_size - 1;
 }
 
@@ -2904,7 +3447,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num rb nodes still in tree: %d\n", device->num_rb_nodes);
     DMEMIT("Num bio sectors still in queue: %d\n", device->num_bio_sector_ranges);
     DMEMIT("Num fsyncs still pending replication: %d\n", device->num_fsyncs_pending_replication);
-    DMEMIT("Num checksums and IVs not freed: %d\n", atomic_read(&device->num_checksum_and_ivs));
+    DMEMIT("Num checksums not freed: %d\n", atomic_read(&device->num_checksums));
     DMEMIT("Num times broadcast queue blocked on sockets in use: %d\n", atomic_read(&device->next_socket_id));
     DMEMIT("Num bios on submit queue: %d\n", atomic_read(&device->submit_bio_queue_size));
     if (!device->is_leader) {
@@ -2941,30 +3484,29 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
 /**
  * Arguments:
  * 0 = underlying device name, like /dev/ram0
- * 1 = id (unique per instance)
+ * 1 = id (unique per instance, starts at 1)
  * 2 = seen_ballot
  * 3 = is_leader ("true" or "false")
  * 4 = key
  * 5 = f (can be 0 to verify reads only)
- * 6 = Hash cache size, in number of pages
+ * 6 = Disk pages for merkle tree
  * 7 = sync mode ("default", "sync", "async"). "Default" respects FUA/PREFLUSH flags, "sync" forces all writes to be FUA, "async" removes all write flags.
  * 8 = listen port
+ * 9 = only_replicate_checksums ("true" or "false")
+ * 10 = is_recovering ("true" or "false")
+ * 11 = counterpart id (ID of other node in current config, assuming f=1. If f>1, then the primary's recovery logic won't work.)
  * 
- * The remaining arguments are optional:
- * 9 = server id (if this is a backup, then the server is the primary to connect to. If this is a primary, and it's recovering, then the server is a backup to connect to)
- * 10 = server addr
- * 11 = server port
- * 12 ... (additional server id, addr, port, if this is a primary, for each f-1 backup)
- * Additional server id, addr, port, for each server in the previous configuration, to connect to during recovery
+ * The remaining arguments are used for backups or during recovery:
+ * 12 = server addr
+ * 13 = server port
+ * 14 ... (additional server id, addr, port)
  */
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
-    ushort port, counterpart_port;
+    ushort port, primary_port;
     uint64_t id, seen_ballot;
-    int error, conf_index, i, earlier_conf_index, j;
-    bool should_not_connect_twice;
-    unsigned long projected_bytes_used = 0;
-    unsigned long checksum_and_iv_size;
+    int error, conf_arg_start, num_conf_args, conf_index, i, earlier_conf_index, j;
+    bool is_recovering, should_not_connect_twice;
 
     device = kzalloc(sizeof(struct rollbaccine_device), GFP_KERNEL);
     if (device == NULL) {
@@ -3038,6 +3580,18 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
 
+    device->read_hash_end_io_queue = alloc_workqueue("read_hash_end_io_queue", 0, 0);
+    if (!device->read_hash_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate read_hash_end_io_queue");
+        return -ENOMEM;
+    }
+
+    device->write_hash_end_io_queue = alloc_workqueue("write_hash_end_io_queue", 0, 0);
+    if (!device->write_hash_end_io_queue) {
+        printk(KERN_ERR "Cannot allocate write_hash_end_io_queue");
+        return -ENOMEM;
+    }
+
     // Get the device from argv[0] and store it in device->dev
     if (dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &device->dev)) {
         printk(KERN_ERR "Error getting device");
@@ -3068,9 +3622,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return -ENOMEM;
     }
     atomic_set(&device->pending_bio_ring_head, ROLLBACCINE_INIT_WRITE_INDEX + 1);
-    projected_bytes_used += sizeof(struct bio_data *) * ROLLBACCINE_PENDING_BIO_RING_SIZE;
 
-    device->max_replica_fsync_index = ROLLBACCINE_INIT_WRITE_INDEX;
     mutex_init(&device->replica_fsync_lock);
     INIT_LIST_HEAD(&device->fsyncs_pending_replication);
 
@@ -3078,6 +3630,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     INIT_LIST_HEAD(&device->pending_ops);
 
     device->is_leader = strcmp(argv[3], "true") == 0;
+    printk(KERN_INFO "is_leader: %d", device->is_leader);
 
     if (!device->is_leader) {
         sema_init(&device->replica_submit_bio_sema, 0);
@@ -3087,11 +3640,17 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     }
 
     // Set up hashing
-    device->hash_alg = crypto_alloc_shash("hmac(sha256)", 0, 0);
-    crypto_shash_setkey(device->hash_alg, argv[4], KEY_SIZE);
-    if (IS_ERR(device->hash_alg)) {
-        printk(KERN_ERR "Error allocating hash");
-        return PTR_ERR(device->hash_alg);
+    device->signed_hash_alg = crypto_alloc_shash("hmac(sha256)", 0, 0);
+    crypto_shash_setkey(device->signed_hash_alg, argv[4], KEY_SIZE);
+    if (IS_ERR(device->signed_hash_alg)) {
+        printk(KERN_ERR "Error allocating hmac(sha256) hash");
+        return PTR_ERR(device->signed_hash_alg);
+    }
+
+    device->unsigned_hash_alg = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(device->unsigned_hash_alg)) {
+        printk(KERN_ERR "Error allocating sha256 hash");
+        return PTR_ERR(device->unsigned_hash_alg);
     }
 
     // Set up AEAD
@@ -3108,18 +3667,52 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
 
-    device->num_sectors = ti->len;
-    checksum_and_iv_size = (unsigned long)(ti->len / ROLLBACCINE_SECTORS_PER_ENCRYPTION) * (AES_GCM_AUTH_SIZE + AES_GCM_IV_SIZE);
-    printk(KERN_INFO "Checksums and IVs size: %lu", checksum_and_iv_size);
-    device->checksums = vzalloc(checksum_and_iv_size);
-    if (device->checksums == NULL) {
-        printk(KERN_ERR "Error allocating checksums");
-        return -ENOMEM;
+    // Get f
+    error = kstrtou64(argv[5], 10, &device->f);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing f");
+        return error;
     }
-    projected_bytes_used += checksum_and_iv_size;
+    printk(KERN_INFO "f: %llu", device->f);
+    if (device->is_leader) {
+        // Note: Don't need to alloc f+1, since we're always the 1
+        device->fsync_index_list = kzalloc(sizeof(struct fsync_index_list) * device->f, GFP_KERNEL);
+        if (!device->fsync_index_list) {
+            printk(KERN_ERR "Error allocating fsync_index_list");
+            return -ENOMEM;
+        }
+
+        // Set server IDs to -1 to signal that the slot is empty
+        for (i = 0; i < device->f; i++)
+            device->fsync_index_list[i].server_id = -1;
+    }
+
+    // Set up merkle tree of hashes
+    device->num_sectors = ti->len;
+    error = kstrtou64(argv[6], 10, &device->disk_pages_for_merkle_tree);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing disk_pages_for_merkle_tree");
+        return error;
+    }
+
+    mutex_init(&device->merkle_tree_lock);
+    init_merkle_tree(device);
+
+    // Configure sync mode
+    if (strcmp(argv[7], "default") == 0) {
+        device->sync_mode = ROLLBACCINE_DEFAULT;
+    } else if (strcmp(argv[7], "sync") == 0) {
+        device->sync_mode = ROLLBACCINE_SYNC;
+    } else if (strcmp(argv[7], "async") == 0) {
+        device->sync_mode = ROLLBACCINE_ASYNC;
+    } else {
+        printk(KERN_ERR "Error parsing sync mode");
+        return -EINVAL;
+    }
+    printk(KERN_INFO "sync mode: %d", device->sync_mode);
 
     // Start server
-    error = kstrtou16(argv[5], 10, &port);
+    error = kstrtou16(argv[8], 10, &port);
     if (error < 0) {
         printk(KERN_ERR "Error parsing port");
         return error;
@@ -3133,31 +3726,45 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
 
-    // Set counterpart_id
-    error = kstrtou64(argv[6], 10, &device->counterpart_id);
+    device->only_replicate_checksums = strcmp(argv[9], "true") == 0;
+    printk(KERN_INFO "only_replicate_checksums: %d", device->only_replicate_checksums);
+    is_recovering = strcmp(argv[10], "true") == 0;
+
+    error = kstrtou64(argv[11], 10, &device->counterpart_id);
     if (error < 0) {
-        printk(KERN_ERR "Error parsing counterpart id");
+        printk(KERN_ERR "Error parsing counterpart_id");
         return error;
+    }
+    
+    if (!device->is_leader || is_recovering) {
+        conf_arg_start = 14;
+    }
+    else {
+        conf_arg_start = 12;
     }
 
     mutex_init(&device->prior_confs_lock);
     mutex_init(&device->reconfig_complete_lock);
 
-    // No prior configs = initial launch, can start immediately
-    if (argc <= 9) {
-        printk(KERN_INFO "No prior configs detected, can start execution");
+    if (!is_recovering) {
+        printk(KERN_INFO "Not recovering, can start execution");
         atomic_set(&device->ballot, seen_ballot);
     }
     // Connect to machines in prior configs if they are provided
     else {
+        if (device->f > 1) {
+            printk(KERN_ERR "Error: Cannot recover with f > 1");
+            return -EINVAL;
+        }
+
         mutex_lock(&device->prior_confs_lock);
-        device->num_prior_confs = (argc - 9) / 6;  // 6 args per prior config (primary id, addr, port, backup id, addr, port)
+        device->num_prior_confs = (argc - conf_arg_start) / 6;
         device->prior_confs = kzalloc(sizeof(struct configuration) * device->num_prior_confs, GFP_KERNEL);
         printk(KERN_INFO "Num prior confs: %d", device->num_prior_confs);
 
         for (conf_index = 0; conf_index < device->num_prior_confs; conf_index++) {
             for (i = 0; i < 2; i++) {
-                error = kstrtou64(argv[9 + i * 3 + conf_index * 6], 10, &id);
+                error = kstrtou64(argv[conf_arg_start + i * 3 + conf_index * num_conf_args], 10, &id);
                 if (error < 0) {
                     printk(KERN_ERR "Error parsing server id");
                     return error;
@@ -3186,26 +3793,26 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
                 }
 
                 // Otherwise, connect
-                error = kstrtou16(argv[11 + i * 3 + conf_index * 6], 10, &port);
+                error = kstrtou16(argv[conf_arg_start + 2 + i * 3 + conf_index * num_conf_args], 10, &port);
                 if (error < 0) {
                     printk(KERN_ERR "Error parsing port");
                     return error;
                 }
-                printk(KERN_INFO "Starting thread to connect to server %llu at %s:%u in conf %d", device->prior_confs[conf_index].ids[i], argv[10 + i * 3 + conf_index * 6], port, conf_index);
-                start_client_to_server(device, device->prior_confs[conf_index].ids[i], argv[10 + i * 3 + conf_index * 6], port, true);
+                printk(KERN_INFO "Starting thread to connect to server %llu at %s:%u in conf %d", device->prior_confs[conf_index].ids[i], argv[conf_arg_start + 1 + i * 3 + conf_index * num_conf_args], port, conf_index);
+                start_client_to_server(device, device->prior_confs[conf_index].ids[i], argv[conf_arg_start + 1 + i * 3 + conf_index * num_conf_args], port, true);
             }
         }
         mutex_unlock(&device->prior_confs_lock);
     }
-    // If we're the backup or a node in a new config, need to reach out to our counterpart
-    if (!device->is_leader || argc > 9) {
-        error = kstrtou16(argv[8], 10, &counterpart_port);
+
+    if (!device->is_leader || is_recovering) {
+        error = kstrtou16(argv[13], 10, &primary_port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing counterpart port");
             return error;
         }
-        printk(KERN_INFO "Starting thread to connect to counterpart %llu at %s:%u", device->counterpart_id, argv[7], counterpart_port);
-        start_client_to_server(device, device->counterpart_id, argv[7], counterpart_port, argc > 9);
+        printk(KERN_INFO "Starting thread to connect to primary %llu at %s:%u", device->counterpart_id, argv[12], primary_port);
+        start_client_to_server(device, device->counterpart_id, argv[12], primary_port, is_recovering);
     }
 
 #ifdef MEMORY_TRACKING
@@ -3216,7 +3823,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     device->num_rb_nodes = 0;
     device->num_bio_sector_ranges = 0;
     device->num_fsyncs_pending_replication = 0;
-    atomic_set(&device->num_checksum_and_ivs, 0);
+    atomic_set(&device->num_checksums, 0);
     atomic_set(&device->num_bios_in_pending_bio_ring, 0);
     atomic_set(&device->submit_bio_queue_size, 0);
     atomic_set(&device->replica_disk_end_io_queue_size, 0);
@@ -3244,7 +3851,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
 
     ti->private = device;
 
-    printk(KERN_INFO "Server %llu constructed, projected to use %luMB", device->id, projected_bytes_used >> 20);
+    printk(KERN_INFO "Server %llu constructed", device->id);
     return 0;
 }
 
@@ -3273,9 +3880,9 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     }
 
     printk(KERN_INFO "Freeing remaining structures");
-    kvfree(device->checksums);
+    kvfree(device->merkle_tree_root);
     crypto_free_aead(device->tfm);
-    crypto_free_shash(device->hash_alg);
+    crypto_free_shash(device->signed_hash_alg);
     // Note: I'm not sure how to free theses queues which may have outstanding bios. Hopefully nothing breaks horribly
     destroy_workqueue(device->submit_bio_queue);
     destroy_workqueue(device->leader_write_disk_end_io_queue);
@@ -3285,6 +3892,8 @@ static void rollbaccine_destructor(struct dm_target *ti) {
     destroy_workqueue(device->verify_disk_end_io_queue);
     destroy_workqueue(device->fetch_disk_end_io_queue);
     destroy_workqueue(device->reconfig_write_disk_end_io_queue);
+    destroy_workqueue(device->read_hash_end_io_queue);
+    destroy_workqueue(device->write_hash_end_io_queue);
     dm_put_device(ti, device->dev);
     bioset_exit(&device->bs);
     kmem_cache_destroy(device->bio_data_cache);
