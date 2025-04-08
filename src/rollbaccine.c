@@ -147,6 +147,7 @@ struct rollbaccine_device {
 
     uint64_t f;
     enum SyncMode sync_mode;
+    bool only_replicate_checksums; // Only replicate checksums
     bool is_leader;
     bool shutting_down;  // Set to true when user triggers shutdown. All threads check this and abort if true. Used instead of kthread_should_stop(), since the function that flips that boolean to true (kthread_stop()) is blocking, which creates a race condition when we kill the socket & also wait for the thread to stop.
     uint64_t id; // Unique to each Rollbaccine instance
@@ -361,7 +362,7 @@ void free_merkle_bio(struct merkle_bio_data *bio_data);
 struct merkle_bio_data *create_and_submit_merkle_bio(struct rollbaccine_device *device, int layer, int page_num, int page_offset);
 void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset);
 void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num);
-void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data);
+void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data, int data_dir);
 
 bool send_msg(struct kvec vec, struct socket *sock);
 bool receive_msg(struct kvec vec, struct socket *sock);
@@ -893,14 +894,14 @@ void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_c
     }
 }
 
-void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data) {
-    struct bio *bio = bio_data->bio_src;
+void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data, int data_dir) {
     struct pending_checksum_op *pending_checksum_op;
-    int parent_page_num, curr_sector, curr_page, num_pages;
+    sector_t curr_sector;
+    int parent_page_num, curr_page, num_pages;
     int checksum_offset = 0;
 
     // Don't need to do anything if the bio is empty
-    if (bio_sectors(bio) == 0) {
+    if (bio_data->start_sector == bio_data->end_sector) {
         return;
     }
 
@@ -909,7 +910,7 @@ void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_
         curr_page = bio_data->start_sector / SECTORS_PER_PAGE;
         num_pages = (bio_data->end_sector - bio_data->start_sector) / SECTORS_PER_PAGE;
         // printk(KERN_INFO "Hash fast path, start sector: %llu, is write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
-        switch (bio_data_dir(bio)) {
+        switch (data_dir) {
             case WRITE:
                 memcpy(device->merkle_tree_root + curr_page * AES_GCM_AUTH_SIZE, bio_data->checksum, num_pages * AES_GCM_AUTH_SIZE);
                 break;
@@ -923,15 +924,14 @@ void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_
     mutex_lock(&device->merkle_tree_lock);
     // printk(KERN_INFO "Started adding pending ops for bio %llu, write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
     // Create a pending_checksum_op for each page in the bio
-    while (bio->bi_iter.bi_size) {
-        curr_sector = bio->bi_iter.bi_sector;
+    for (curr_sector = bio_data->start_sector; curr_sector < bio_data->end_sector; curr_sector += SECTORS_PER_PAGE) {
         // Remove merkle tree padding in calculations
         curr_page = curr_sector / SECTORS_PER_PAGE - device->disk_pages_for_merkle_tree;
 
         pending_checksum_op = kmalloc(sizeof(struct pending_checksum_op), GFP_KERNEL);
         pending_checksum_op->parent_page_offset = (curr_page % AES_GCM_PER_PAGE) * AES_GCM_AUTH_SIZE;
 
-        switch (bio_data_dir(bio)) {
+        switch (data_dir) {
             case WRITE:
                 // If this is a write, copy the relevant part of the checksum to write to the parent
                 memcpy(pending_checksum_op->checksum, bio_data->checksum + checksum_offset, AES_GCM_AUTH_SIZE);
@@ -951,16 +951,10 @@ void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_
         // printk(KERN_INFO "Requesting parent for read: %d, parent: %d", curr_sector, parent_page_num);
         add_merkle_leaf_request(device, pending_checksum_op, parent_page_num);
 
-        bio_advance_iter(bio, &bio->bi_iter, PAGE_SIZE);
         checksum_offset += AES_GCM_AUTH_SIZE;
     }
     // printk(KERN_INFO "Finished adding pending ops for bio %llu, write: %d", bio_data->start_sector, bio_data_dir(bio) == WRITE);
     mutex_unlock(&device->merkle_tree_lock);
-
-    // Reset bio to start after iterating
-    bio->bi_iter.bi_sector = bio_data->start_sector;
-    bio->bi_iter.bi_size = (bio_data->end_sector - bio_data->start_sector) * SECTOR_SIZE;
-    bio->bi_iter.bi_idx = 0;
 }
 
 bool send_msg(struct kvec vec, struct socket *sock) {
@@ -1980,16 +1974,18 @@ void broadcast_bio(struct work_struct *work) {
         }
 
         // 3. Send bios
-        bio_for_each_segment(bvec, clone, iter) {
-            bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
-            success = send_page(chunked_bvec, socket_data->sock);
-            if (!success) {
-                // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
-                should_disconnect = true;
-                goto finish_sending_to_socket;
+        if (!device->only_replicate_checksums) {
+            bio_for_each_segment(bvec, clone, iter) {
+                bvec_set_page(&chunked_bvec, bvec.bv_page, bvec.bv_len, bvec.bv_offset);
+                success = send_page(chunked_bvec, socket_data->sock);
+                if (!success) {
+                    // printk_ratelimited(KERN_ERR "Error broadcasting pages, aborting");
+                    should_disconnect = true;
+                    goto finish_sending_to_socket;
+                }
             }
+            print_and_update_latency("broadcast_bio: Send pages", &time);
         }
-        print_and_update_latency("broadcast_bio: Send pages", &time);
         // Label to jump to if socket cannot be written to, so we can iterate the next socket
 finish_sending_to_socket:
         mutex_unlock(&socket_data->socket_mutex);
@@ -2185,7 +2181,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                     }
 
                     // Can fetch the merkle nodes regardless of conflict
-                    fetch_merkle_nodes(device, bio_data);
+                    fetch_merkle_nodes(device, bio_data, WRITE);
                 }
                 // printk(KERN_INFO "Inserted write clone %p, write index: %d, conflicts: %d", bio_data->shallow_clone, bio_data->write_index, !doesnt_conflict_with_other_writes);
                 if (bio_data->is_fsync && device->f > 0) {
@@ -2232,7 +2228,7 @@ static int rollbaccine_map(struct dm_target *ti, struct bio *bio) {
                 // printk(KERN_INFO "Inserted read clone %p, conflicts: %d", bio_data->shallow_clone, !doesnt_conflict_with_other_writes);
 
                 // Can fetch the merkle nodes regardless of conflict
-                fetch_merkle_nodes(device, bio_data);
+                fetch_merkle_nodes(device, bio_data, READ);
                 mutex_unlock(&device->index_lock);
 
                 if (doesnt_conflict_with_other_writes) {
@@ -2468,12 +2464,14 @@ int submit_pending_bio_ring_prefix(void *args) {
             mutex_lock(&device->index_lock);  // Necessary to modify outstanding_ops
             // Only check for concurrent writes if it's non-empty
             if (!is_empty) {
-                no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
-                if (!no_conflict) {
-                    add_to_pending_ops_tail(device, curr_bio_data);
+                if (!device->only_replicate_checksums) {
+                    no_conflict = try_insert_into_outstanding_ops(device, curr_bio_data, true);
+                    if (!no_conflict) {
+                        add_to_pending_ops_tail(device, curr_bio_data);
+                    }
                 }
 
-                fetch_merkle_nodes(device, curr_bio_data);
+                fetch_merkle_nodes(device, curr_bio_data, WRITE);
             }
             else {
                 no_conflict = true;
@@ -2487,19 +2485,24 @@ int submit_pending_bio_ring_prefix(void *args) {
             // Record if we should ack the fsync
             should_ack_fsync |= curr_bio_data->is_fsync;
 
-            if (no_conflict) {
-                // If the bio is empty, don't submit, just free it
-                if (is_empty)
-                    free_bio_data(curr_bio_data);
-                else {
-                    submit_bio_noacct(curr_bio_data->bio_src);
-                    bios_between_plug++;
-                    if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
-                        blk_finish_plug(&plug);
-                        blk_start_plug(&plug);
-                        bios_between_plug = 0;
+            if (!device->only_replicate_checksums) {
+                if (no_conflict) {
+                    // If the bio is empty, don't submit, just free it
+                    if (is_empty)
+                        free_bio_data(curr_bio_data);
+                    else {
+                        submit_bio_noacct(curr_bio_data->bio_src);
+                        bios_between_plug++;
+                        if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+                            blk_finish_plug(&plug);
+                            blk_start_plug(&plug);
+                            bios_between_plug = 0;
+                        }
                     }
                 }
+            }
+            else {
+                free_bio_data(curr_bio_data);
             }
 
             // Increment index and wrap around if necessary
@@ -2947,20 +2950,13 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         }
 
         // Critical path processing
-        received_bio = bio_alloc_bioset(device->dev->bdev, metadata.num_pages, metadata.bi_opf, GFP_NOIO, &device->bs);
-        received_bio->bi_iter.bi_sector = metadata.sector;
-        received_bio->bi_end_io = replica_disk_end_io;
-
         bio_data = alloc_bio_data(device);
         bio_data->device = device;
         bio_data->write_index = metadata.write_index;
-        bio_data->bio_src = received_bio;
-        bio_data->deep_clone = received_bio;
         bio_data->start_sector = metadata.sector;
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
         bio_data->is_fsync = metadata.type == ROLLBACCINE_FSYNC;
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
-        received_bio->bi_private = bio_data;
 
         // Copy hash
         checksum_size = bio_checksum_size(metadata.num_pages * SECTORS_PER_PAGE);
@@ -3001,37 +2997,46 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
 #endif
         }
 
-        // 3. Receive pages of bio (over the regular socket now, not TLS)
-        for (i = 0; i < metadata.num_pages; i++) {
-            page = page_cache_alloc(device);
-            // page = alloc_page(GFP_KERNEL);
-            // if (page == NULL) {
-            //     printk(KERN_ERR "Error allocating page");
-            //     break;
-            // }
-#ifdef MEMORY_TRACKING
-            atomic_inc(&device->num_bio_pages_not_freed);
-#endif
-            vec.iov_base = page_address(page);
-            vec.iov_len = PAGE_SIZE;
+        if (!device->only_replicate_checksums) {
+            // 3. Receive pages of bio (over the regular socket now, not TLS)
+            received_bio = bio_alloc_bioset(device->dev->bdev, metadata.num_pages, metadata.bi_opf, GFP_NOIO, &device->bs);
+            received_bio->bi_iter.bi_sector = metadata.sector;
+            received_bio->bi_end_io = replica_disk_end_io;
+            bio_data->bio_src = received_bio;
+            bio_data->deep_clone = received_bio;
+            received_bio->bi_private = bio_data;
 
-            success = receive_msg(vec, socket_data->sock);
-            if (!success) {
-                printk(KERN_ERR "Error reading from socket");
+            for (i = 0; i < metadata.num_pages; i++) {
+                page = page_cache_alloc(device);
+                // page = alloc_page(GFP_KERNEL);
+                // if (page == NULL) {
+                //     printk(KERN_ERR "Error allocating page");
+                //     break;
+                // }
+#ifdef MEMORY_TRACKING
+                atomic_inc(&device->num_bio_pages_not_freed);
+#endif
+                vec.iov_base = page_address(page);
+                vec.iov_len = PAGE_SIZE;
+
+                success = receive_msg(vec, socket_data->sock);
+                if (!success) {
+                    printk(KERN_ERR "Error reading from socket");
+                    free_bio_data(bio_data);
+                    goto disconnect_from_sender;
+                }
+                // printk(KERN_INFO "Received bio page: %i", i);
+                __bio_add_page(received_bio, page, PAGE_SIZE, 0);
+            }
+
+            // 4. Verify against hash
+            error = enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
+            if (error != 0) {
+                printk(KERN_ERR "Backup received invalid page");
                 free_bio_data(bio_data);
+                alert_client_of_liveness_problem(device, multisocket->sender_id);
                 goto disconnect_from_sender;
             }
-            // printk(KERN_INFO "Received bio page: %i", i);
-            __bio_add_page(received_bio, page, PAGE_SIZE, 0);
-        }
-
-        // 4. Verify against hash
-        error = enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
-        if (error != 0) {
-            printk(KERN_ERR "Backup received invalid page");
-            free_bio_data(bio_data);
-            alert_client_of_liveness_problem(device, multisocket->sender_id);
-            goto disconnect_from_sender;
         }
 
         // 5. Add bio to pending_bio_ring
@@ -3483,13 +3488,14 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
  * 6 = Disk pages for merkle tree
  * 7 = sync mode ("default", "sync", "async"). "Default" respects FUA/PREFLUSH flags, "sync" forces all writes to be FUA, "async" removes all write flags.
  * 8 = listen port
- * 9 = is_recovering ("true" or "false")
+ * 9 = only_replicate_checksums ("true" or "false")
+ * 10 = is_recovering ("true" or "false")
  * 
  * The remaining arguments are used for backups or during recovery:
- * 10 = server id
- * 11 = server addr
- * 12 = server port
- * 13 ... (additional server id, addr, port)
+ * 11 = server id
+ * 12 = server addr
+ * 13 = server port
+ * 14 ... (additional server id, addr, port)
  */
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
@@ -3716,27 +3722,29 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         return error;
     }
 
-    is_recovering = strcmp(argv[9], "true") == 0;
+    device->only_replicate_checksums = strcmp(argv[9], "true") == 0;
+    printk(KERN_INFO "only_replicate_checksums: %d", device->only_replicate_checksums);
+    is_recovering = strcmp(argv[10], "true") == 0;
 
     // If we're the backup, reach out to the primary
     if (!device->is_leader) {
-        error = kstrtou64(argv[10], 10, &device->counterpart_id);
+        error = kstrtou64(argv[11], 10, &device->counterpart_id);
         if (error < 0) {
             printk(KERN_ERR "Error parsing primary_id");
             return error;
         }
-        error = kstrtou16(argv[12], 10, &primary_port);
+        error = kstrtou16(argv[13], 10, &primary_port);
         if (error < 0) {
             printk(KERN_ERR "Error parsing counterpart port");
             return error;
         }
-        printk(KERN_INFO "Starting thread to connect to primary %llu at %s:%u", device->counterpart_id, argv[11], primary_port);
-        start_client_to_server(device, device->counterpart_id, argv[11], primary_port, false);
+        printk(KERN_INFO "Starting thread to connect to primary %llu at %s:%u", device->counterpart_id, argv[12], primary_port);
+        start_client_to_server(device, device->counterpart_id, argv[12], primary_port, false);
 
-        conf_arg_start = 13;
+        conf_arg_start = 14;
     }
     else {
-        conf_arg_start = 10;
+        conf_arg_start = 11;
     }
 
     mutex_init(&device->prior_confs_lock);
