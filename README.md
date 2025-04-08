@@ -257,15 +257,16 @@ For those who are curious, none of the other folders in `src` are used in `rollb
 
 ## Running on Azure
 
-If you haven't already, install the Azure CLI and log in:
+If you haven't already, install the Azure CLI and log in. The instructions below are for Linux; [install the right one for your OS architecture](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli):
 ```bash
 curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 az login
 ```
 
-TODO: Include instructions for setting up venv  
-Install Python dependencies:
+Create a Python venv and install the dependencies:
 ```bash
+python -m venv .
+source bin/activate
 pip install -r src/tools/benchmarking/requirements.txt
 ```
 If your keys in `~/.ssh/id_rsa` are password-protected, create password-less SSH keys (clicking Enter on all options):
@@ -273,6 +274,8 @@ If your keys in `~/.ssh/id_rsa` are password-protected, create password-less SSH
 cd ~/.ssh
 ssh-keygen -t rsa -b 4096
 ```
+
+Note that each time you restart the terminal, you will need to reactivate the venv with `source bin/activate`.
 
 ### Launching VMs and cleaning up
 

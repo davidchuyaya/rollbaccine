@@ -71,12 +71,13 @@ compile_commands.json
 .env.*
 
 # Virtual environment
-rollbaccine/
 venv/
 env/
 *.venv
 .Python
 pyvenv.cfg
+bin/
+share/
 
 # Python bytecode
 __pycache__/

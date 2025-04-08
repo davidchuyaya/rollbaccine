@@ -26,7 +26,7 @@ def log_primary_or_backup(ssh: SSHClient, is_primary: bool, timeout=0, exit_on_r
         filename = BACKUP_OUTFILE
         dm_name = "rollbaccine2"
 
-    print(f"\033[92mPlease run `tail -f {filename}` to see how the {"primary" if is_primary else "bakcup"} is progressing.\033[0m")
+    print(f"\033[92mPlease run `tail -f {filename}` to see how the {"primary" if is_primary else "backup"} is progressing.\033[0m")
     start = time.time()
     with open(filename, "a") as stdout_file:
         while True:

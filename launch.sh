@@ -102,9 +102,6 @@ launch_vm () {
     --location $LOCATION \
     --zone $ZONE \
     --size $2 \
-    --priority Spot \
-    --max-price -1 \
-    --eviction-policy Delete \
     --image Canonical:ubuntu-24_04-lts:cvm:latest \
     --security-type ConfidentialVM \
     --os-disk-security-encryption-type VMGuestStateOnly \
