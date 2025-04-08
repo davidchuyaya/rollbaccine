@@ -1378,6 +1378,7 @@ void try_free_clones(struct bio_data *bio_data) {
 
 void begin_critical_path(struct rollbaccine_device *device) {
     struct bio_fsync_list *bio_fsync_data;
+    int i;
 
     printk(KERN_INFO "Beginning critical path");
 
@@ -1398,6 +1399,10 @@ void begin_critical_path(struct rollbaccine_device *device) {
         // Flush all fsyncs if we are the leader, because we know the backup must have it
         mutex_lock(&device->replica_fsync_lock);
         device->min_acked_fsync_index = device->write_index;
+        for (i = 0; i < device->f; i++) {
+            device->fsync_index_list[i].server_id = -1;
+            device->fsync_index_list[i].fsync_index = 0;
+        }
         while (!list_empty(&device->fsyncs_pending_replication)) {
             bio_fsync_data = list_first_entry(&device->fsyncs_pending_replication, struct bio_fsync_list, list);
             list_del(&bio_fsync_data->list);
@@ -1990,7 +1995,6 @@ void broadcast_bio(struct work_struct *work) {
 finish_sending_to_socket:
         mutex_unlock(&socket_data->socket_mutex);
     }
-finish_no_unlock:
     up_read(&device->connected_sockets_sem);
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
 
@@ -2814,7 +2818,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
         about_to_complete = hash_msg->start_page + hashes_to_copy >= num_pages - 1;
 
 #ifdef MEMORY_TRACKING
-        device->num_hashes_received_during_recovery = hashes_to_copy + 1;
+        device->num_hashes_received_during_recovery += hashes_to_copy;
 #endif
     }
     kfree(hash_msg);
@@ -3490,9 +3494,9 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
  * 8 = listen port
  * 9 = only_replicate_checksums ("true" or "false")
  * 10 = is_recovering ("true" or "false")
+ * 11 = counterpart id (ID of other node in current config, assuming f=1. If f>1, then the primary's recovery logic won't work.)
  * 
  * The remaining arguments are used for backups or during recovery:
- * 11 = server id
  * 12 = server addr
  * 13 = server port
  * 14 ... (additional server id, addr, port)
@@ -3500,7 +3504,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
 static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char **argv) {
     struct rollbaccine_device *device;
     ushort port, primary_port;
-    uint64_t id, seen_ballot, primary_id;
+    uint64_t id, seen_ballot;
     int error, conf_arg_start, num_conf_args, conf_index, i, earlier_conf_index, j;
     bool is_recovering, should_not_connect_twice;
 
@@ -3726,25 +3730,17 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     printk(KERN_INFO "only_replicate_checksums: %d", device->only_replicate_checksums);
     is_recovering = strcmp(argv[10], "true") == 0;
 
-    // If we're the backup, reach out to the primary
-    if (!device->is_leader) {
-        error = kstrtou64(argv[11], 10, &device->counterpart_id);
-        if (error < 0) {
-            printk(KERN_ERR "Error parsing primary_id");
-            return error;
-        }
-        error = kstrtou16(argv[13], 10, &primary_port);
-        if (error < 0) {
-            printk(KERN_ERR "Error parsing counterpart port");
-            return error;
-        }
-        printk(KERN_INFO "Starting thread to connect to primary %llu at %s:%u", device->counterpart_id, argv[12], primary_port);
-        start_client_to_server(device, device->counterpart_id, argv[12], primary_port, false);
-
+    error = kstrtou64(argv[11], 10, &device->counterpart_id);
+    if (error < 0) {
+        printk(KERN_ERR "Error parsing counterpart_id");
+        return error;
+    }
+    
+    if (!device->is_leader || is_recovering) {
         conf_arg_start = 14;
     }
     else {
-        conf_arg_start = 11;
+        conf_arg_start = 12;
     }
 
     mutex_init(&device->prior_confs_lock);
@@ -3754,56 +3750,70 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
         printk(KERN_INFO "Not recovering, can start execution");
         atomic_set(&device->ballot, seen_ballot);
     }
-    // // Connect to machines in prior configs if they are provided
-    // else {
-    //     mutex_lock(&device->prior_confs_lock);
-    //     num_conf_args = 3 * (device->f + 1);  // 3 args: id, addr, port for each node in the prior config, f+1 nodes per config
-    //     device->num_prior_confs = conf_arg_start / num_conf_args;
-    //     device->prior_confs = kzalloc(sizeof(struct configuration) * device->num_prior_confs, GFP_KERNEL);
-    //     printk(KERN_INFO "Num prior confs: %d", device->num_prior_confs);
+    // Connect to machines in prior configs if they are provided
+    else {
+        if (device->f > 1) {
+            printk(KERN_ERR "Error: Cannot recover with f > 1");
+            return -EINVAL;
+        }
 
-    //     for (conf_index = 0; conf_index < device->num_prior_confs; conf_index++) {
-    //         for (i = 0; i < device->f + 1; i++) {
-    //             error = kstrtou64(argv[conf_arg_start + i * 3 + conf_index * num_conf_args], 10, &id);
-    //             if (error < 0) {
-    //                 printk(KERN_ERR "Error parsing server id");
-    //                 return error;
-    //             }
+        mutex_lock(&device->prior_confs_lock);
+        device->num_prior_confs = (argc - conf_arg_start) / 6;
+        device->prior_confs = kzalloc(sizeof(struct configuration) * device->num_prior_confs, GFP_KERNEL);
+        printk(KERN_INFO "Num prior confs: %d", device->num_prior_confs);
 
-    //             // Check if we were already going to connect to this node, or this is ourself
-    //             should_not_connect_twice = false;
-    //             if (id == device->counterpart_id || id == device->id) {
-    //                 should_not_connect_twice = true;
-    //                 goto earlier_confs_checked;
-    //             }
-    //             for (earlier_conf_index = 0; earlier_conf_index <= conf_index; earlier_conf_index++) {
-    //                 for (j = 0; j < 2; j++) {
-    //                     if (device->prior_confs[earlier_conf_index].ids[j] == id) {
-    //                         should_not_connect_twice = true;
-    //                         goto earlier_confs_checked;
-    //                     }
-    //                 }
-    //             }
+        for (conf_index = 0; conf_index < device->num_prior_confs; conf_index++) {
+            for (i = 0; i < 2; i++) {
+                error = kstrtou64(argv[conf_arg_start + i * 3 + conf_index * num_conf_args], 10, &id);
+                if (error < 0) {
+                    printk(KERN_ERR "Error parsing server id");
+                    return error;
+                }
 
-    //         earlier_confs_checked:
-    //             device->prior_confs[conf_index].ids[i] = id;
-    //             if (should_not_connect_twice) {
-    //                 printk(KERN_INFO "Not connecting to server %llu in conf %d because we already did", id, conf_index);
-    //                 continue;
-    //             }
+                // Check if we were already going to connect to this node, or this is ourself
+                should_not_connect_twice = false;
+                if (id == device->counterpart_id || id == device->id) {
+                    should_not_connect_twice = true;
+                    goto earlier_confs_checked;
+                }
+                for (earlier_conf_index = 0; earlier_conf_index <= conf_index; earlier_conf_index++) {
+                    for (j = 0; j < 2; j++) {
+                        if (device->prior_confs[earlier_conf_index].ids[j] == id) {
+                            should_not_connect_twice = true;
+                            goto earlier_confs_checked;
+                        }
+                    }
+                }
 
-    //             // Otherwise, connect
-    //             error = kstrtou16(argv[conf_arg_start + 2 + i * 3 + conf_index * num_conf_args], 10, &port);
-    //             if (error < 0) {
-    //                 printk(KERN_ERR "Error parsing port");
-    //                 return error;
-    //             }
-    //             printk(KERN_INFO "Starting thread to connect to server %llu at %s:%u in conf %d", device->prior_confs[conf_index].ids[i], argv[conf_arg_start + 1 + i * 3 + conf_index * num_conf_args], port, conf_index);
-    //             start_client_to_server(device, device->prior_confs[conf_index].ids[i], argv[conf_arg_start + 1 + i * 3 + conf_index * num_conf_args], port, true);
-    //         }
-    //     }
-    //     mutex_unlock(&device->prior_confs_lock);
-    // }
+            earlier_confs_checked:
+                device->prior_confs[conf_index].ids[i] = id;
+                if (should_not_connect_twice) {
+                    printk(KERN_INFO "Not connecting to server %llu in conf %d because we already did", id, conf_index);
+                    continue;
+                }
+
+                // Otherwise, connect
+                error = kstrtou16(argv[conf_arg_start + 2 + i * 3 + conf_index * num_conf_args], 10, &port);
+                if (error < 0) {
+                    printk(KERN_ERR "Error parsing port");
+                    return error;
+                }
+                printk(KERN_INFO "Starting thread to connect to server %llu at %s:%u in conf %d", device->prior_confs[conf_index].ids[i], argv[conf_arg_start + 1 + i * 3 + conf_index * num_conf_args], port, conf_index);
+                start_client_to_server(device, device->prior_confs[conf_index].ids[i], argv[conf_arg_start + 1 + i * 3 + conf_index * num_conf_args], port, true);
+            }
+        }
+        mutex_unlock(&device->prior_confs_lock);
+    }
+
+    if (!device->is_leader || is_recovering) {
+        error = kstrtou16(argv[13], 10, &primary_port);
+        if (error < 0) {
+            printk(KERN_ERR "Error parsing counterpart port");
+            return error;
+        }
+        printk(KERN_INFO "Starting thread to connect to primary %llu at %s:%u", device->counterpart_id, argv[12], primary_port);
+        start_client_to_server(device, device->counterpart_id, argv[12], primary_port, is_recovering);
+    }
 
 #ifdef MEMORY_TRACKING
     atomic_set(&device->num_bio_data_not_freed, 0);
