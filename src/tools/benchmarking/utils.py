@@ -20,8 +20,8 @@ def is_installed(ssh: SSHClient, command: str) -> bool:
     return path != ''
 
 class SSH():
-    def __init__(self, system_type: System, benchmark_name: str):
-        self.output_file = f"{benchmark_name}-{system_type}-stdout.txt"
+    def __init__(self, system_type: System, benchmark_name: str, unique_str: str):
+        self.output_file = f"{benchmark_name}-{system_type}-{unique_str}-stdout.txt"
         self.system_type = system_type
 
     def clear_output_file(self,):

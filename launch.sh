@@ -40,9 +40,9 @@ VM_SIZE_TEMP_DISK=Standard_DC16ads_v5
 # Get the highest-performing managed disk possible (P80), according to this: https://learn.microsoft.com/en-us/azure/virtual-machines/disks-types#premium-ssd-v2
 MANAGED_DISK_SIZE=20000
 USERNAME=$(whoami)
-STORAGE_FILE=$BENCHMARK-$SYSTEM-storage.json
-VM1_FILE=$BENCHMARK-$SYSTEM-vm1.json
-VM2_FILE=$BENCHMARK-$SYSTEM-vm2.json
+STORAGE_FILE=$NAME-storage.json
+VM1_FILE=$NAME-vm1.json
+VM2_FILE=$NAME-vm2.json
 
 echo "Creating resource group: "$NAME"-group"
 az group create \
@@ -114,14 +114,14 @@ launch_vm () {
     --enable-secure-boot false \
     --enable-vtpm $COUNT $4 > $3
 
-    ((UNIQUE_ID++))
+    ((UNIQUE_ID = UNIQUE_ID + 1))
 }
 
 # Launch the right number of VMs with temp/managed disk
-if [ $SYSTEM = "ROLLBACCINE" ]; then
-    launch_vm $NUM_DISK_VMS $VM_SIZE_TEMP_DISK $VM1_FILE
-elif [ $SYSTEM = "REPLICATED" ]; then
+if [ $SYSTEM = "REPLICATED" ]; then
     launch_vm $NUM_DISK_VMS $VM_SIZE $VM1_FILE "--data-disk-sizes-gb $MANAGED_DISK_SIZE --data-disk-caching None"
+else 
+    launch_vm $NUM_DISK_VMS $VM_SIZE_TEMP_DISK $VM1_FILE
 fi
 
 # Launch remaining VMs without any disk

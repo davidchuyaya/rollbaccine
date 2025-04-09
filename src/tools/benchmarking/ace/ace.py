@@ -20,7 +20,7 @@ def run():
     BENCHMARK_NAME = "fio"
     SYSTEM = System.UNREPLICATED
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system, because we just want a single VM.")
-    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 1 -m 0"])
+    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 1 -m 0 -e ace"])
     ssh_executor = SSH(SYSTEM, BENCHMARK_NAME)
 
     print("Connecting to VMs and setting up main VMs")
@@ -105,7 +105,7 @@ def run():
     ssh.close()
 
     print("Benchmark completed, deleting resources")
-    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM}"])
+    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e ace"])
 
 if __name__ == "__main__":
     run()

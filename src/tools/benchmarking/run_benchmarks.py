@@ -152,13 +152,13 @@ def ssh_vm_json(vm_json) -> Tuple[List[SSHClient], List[str]]:
             private_ips.append(vm['privateIps'])
     return connections, private_ips
 
-def args_to_unique_str(args: argparse.Namespace) -> str:
-    if args.system_type == System.ROLLBACCINE:
+def args_to_unique_str(system_type: System, args: argparse.Namespace) -> str:
+    if system_type == System.ROLLBACCINE:
         return f"{args.rollbaccine_f}_{args.rollbaccine_num_hash_disk_pages}_{args.rollbaccine_sync_mode}_{args.rollbaccine_only_replicate_checksums}"
     elif args.benchmark_name == "nimble_hdfs":
         return f"{args.nimble_batch_size}_{args.nimble_storage}"
     else:
-        return ""
+        return "normal"
 
 def run_everything():
     """
@@ -175,29 +175,28 @@ def run_everything():
     parser.add_argument("--rollbaccine_only_replicate_checksums", action='store_true', help="Flag to only replicate checksums for Rollbaccine")
     args = parser.parse_args()
 
+    system_type = System[args.system_type]
     benchmark = name_to_benchmark(args.benchmark_name, args.nimble_batch_size, args.nimble_storage)
 
-    if args.system_type == System.ROLLBACCINE:
+    if system_type == System.ROLLBACCINE:
         num_disk_vms = args.rollbaccine_f + 1
-    elif args.system_type == System.REPLICATED:
-        num_disk_vms = 1
     else:
-        num_disk_vms = 0
+        num_disk_vms = 1
     num_non_disk_vms = benchmark.num_vms() - 1
 
     # Create a unique string for the benchmark so resource groups can be deleted independently of tests and experiment result files can be distinguished
-    unique_str = args_to_unique_str(args)
+    unique_str = args_to_unique_str(system_type, args)
     
     # Create resources
-    subprocess_execute([f"./launch.sh -b {args.benchmark_name} -s {args.system_type} -n {num_disk_vms} -m {num_non_disk_vms} -e {unique_str}"])
+    subprocess_execute([f"./launch.sh -b {args.benchmark_name} -s {system_type} -n {num_disk_vms} -m {num_non_disk_vms} -e {unique_str}"])
 
-    ssh_executor = SSH(args.system_type, args.benchmark_name)
+    ssh_executor = SSH(system_type, args.benchmark_name, unique_str)
     
     storage_name = "rollbaccinenimble" # Must match storage name in ./launch.sh
     storage_key = ""
     if benchmark.needs_storage():
         print("Extracting storage key")
-        with open (f'{args.benchmark_name}-{args.system_type}-storage.json') as f:
+        with open (f'{args.benchmark_name}-{system_type}-{unique_str}.json') as f:
             storage_data = json.load(f)
             storage_key = storage_data[0].get("value")
             print(f"Found storage key: {storage_key}")
@@ -208,19 +207,19 @@ def run_everything():
     ssh_executor.clear_output_file()
     connections = []
     private_ips = []
-    with open(f'{args.benchmark_name}-{args.system_type}-vm1.json') as f:
+    with open(f'{args.benchmark_name}-{system_type}-{unique_str}-vm1.json') as f:
         vm_json = json.load(f)
         connections, private_ips = ssh_vm_json(vm_json)
-        mount_point = setup_main_nodes(ssh_executor, args.system_type, args, connections, private_ips)
+        mount_point = setup_main_nodes(ssh_executor, system_type, args, connections, private_ips)
 
-        if args.system_type == System.ROLLBACCINE:
+        if system_type == System.ROLLBACCINE:
             # Disconnect from the backup
             connections[-1].close()
             connections = connections[:-1]
             private_ips = private_ips[:-1]
 
-    if os.path.isfile(f'{args.benchmark_name}-{args.system_type}-vm2.json'):
-        with open(f'{args.benchmark_name}-{args.system_type}-vm2.json') as f:
+    if os.path.isfile(f'{args.benchmark_name}-{system_type}-{unique_str}-vm2.json'):
+        with open(f'{args.benchmark_name}-{system_type}-{unique_str}-vm2.json') as f:
             vm_json = json.load(f)
             vm2_connections, vm2_private_ips = ssh_vm_json(vm_json)
             connections += vm2_connections
@@ -228,7 +227,7 @@ def run_everything():
             
     # Install everything the benchmark needs on the VM
     print(f"Installing {args.benchmark_name} on the main VM")
-    benchmark_install_success = benchmark.install(ssh_executor, connections, private_ips, args.system_type, storage_name, storage_key)
+    benchmark_install_success = benchmark.install(ssh_executor, connections, private_ips, system_type, storage_name, storage_key)
     if not benchmark_install_success:
         print(f"Failed to install {args.benchmark_name} on the VM")
         return False
@@ -257,15 +256,15 @@ def run_everything():
         return False
     
     print("Running benchmark")
-    if args.system_type == System.ROLLBACCINE:
+    if system_type == System.ROLLBACCINE:
         extra_args = unique_str
     elif args.benchmark_name == "nimble_hdfs":
         extra_args = f"{args.nimble_batch_size} {args.nimble_storage}"
     else:
-        extra_args = ""
+        extra_args = "normal"
     success = ssh_executor.exec(ssh, [
         f"cd rollbaccine/src/tools/benchmarking",
-        f"python3 {benchmark.filename()} {args.system_type} {mount_point} {OUTPUT_DIR} {extra_args}"
+        f"python3 {benchmark.filename()} {system_type} {mount_point} {OUTPUT_DIR} {extra_args}"
     ])
     if not success:
         return False
@@ -276,7 +275,7 @@ def run_everything():
     ssh.close()
     print("Benchmark completed, deleting resources")
 
-    subprocess_execute([f"./cleanup.sh -b {args.benchmark_name} -s {args.system_type} -e {unique_str}"])
+    subprocess_execute([f"./cleanup.sh -b {args.benchmark_name} -s {system_type} -e {unique_str}"])
 
 if __name__ == "__main__":
     run_everything()

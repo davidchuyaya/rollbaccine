@@ -267,9 +267,8 @@ For those who are curious, none of the other folders in `src` are used in `rollb
 
 ## Running on Azure
 
-If you haven't already, install the Azure CLI and log in. The instructions below are for Linux; [install the right one for your OS architecture](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli):
+If you haven't already, [install the Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) and log in:
 ```bash
-curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 az login
 ```
 
@@ -289,18 +288,13 @@ Note that each time you restart the terminal, you will need to reactivate the ve
 
 ### Launching VMs and cleaning up
 
-To launch VMs, run the following command **from the root of this directory**:
-```bash
-python3 src/tools/benchmarking/run_benchmarks.py <system type> <benchmark name>
-```
-`<system type>` is one of `UNREPLICATED`, `DM`, `REPLICATED`, or `ROLLBACCINE`.  
-`<benchmark name>` is one of `fio`, `filebench`, `postgres`, `hdfs`, or `nimble_hdfs`.  
-Outputs will be saved to the root of this directory.
+To launch VMs, see [Evaluation](#evaluation). Results will be saved to `results/`.
 
 If the script does not complete successfully, you will have to manually clean up resources when you are done debugging. To do so, run the following command:
 ```bash
-./cleanup.h -s <system type> -b <benchmark name> 
+./cleanup.h -s <system type> -b <benchmark name> -e <extra args>
 ```
+The parameters for `<system type>`, `<benchmark name>`, and `<extra args>` can be found in the beginning of the output of the launch command.
 
 ### Testing against ACE
 
