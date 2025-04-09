@@ -297,7 +297,6 @@ struct merkle_bio_data {
     int layer;
     int page_num;
     bool hashed; // True if this page has been loaded into memory and "hash" has been populated
-    bool is_empty; // True if this page is all zeros
     bool verified;
     bool dirtied;
     
@@ -573,33 +572,19 @@ void write_hash_end_io(struct bio *bio) {
 
 // Note: Assumes that merkle_tree_lock is held, and that if the node has a parent, the parent has been verified
 void verify_merkle_node(struct merkle_bio_data *bio_data) {
-    struct merkle_bio_data *parent = bio_data->parent;
     int res;
 
-    if (parent == NULL) {
+    if (bio_data->parent == NULL) {
         // Verify against root
-        // printk(KERN_INFO "Expected hash: %s", bio_data->hash);
         res = memcmp(bio_data->hash, merkle_root_hash_offset(bio_data->device, bio_data), SHA256_SIZE);
-        // printk(KERN_INFO "Actual hash: %s", bio_data->hash);
-        if (res != 0) {
-            printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d", bio_data->page_num);
-            // Note: Should crash the system and enter recovery
-        }
     }
     else {
-        if (bio_data->is_empty) {
-            if (!parent->is_empty) {
-                printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, parent: %d, child is all zeros but parent is not", bio_data->page_num, bio_data->parent->page_num);
-                // Note: Should crash the system and enter recovery
-            }
-        }
-        else {
-            res = memcmp(bio_data->hash, bio_data->parent->page_addr + bio_data->parent_page_offset, SHA256_SIZE);
-            if (res != 0) {
-                printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, parent: %d", bio_data->page_num, bio_data->parent->page_num);
-                // Note: Should crash the system and enter recovery
-            }
-        }
+        res = memcmp(bio_data->hash, bio_data->parent->page_addr + bio_data->parent_page_offset, SHA256_SIZE);
+    }
+
+    if (res != 0) {
+        printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, we are all zeros: %d", bio_data->page_num, mem_is_zero(bio_data->hash, SHA256_SIZE));
+        // Note: Should crash the system and enter recovery
     }
 }
 
@@ -700,9 +685,11 @@ void read_hash_end_io_task(struct work_struct *work) {
     bio_data->page_addr = kmap(bio_page(bio));
 
     // 1. Hash ourselves (unless this page is all zeros, in which case the hash should also be all zeros)
-    bio_data->is_empty = mem_is_zero(bio_data->page_addr, PAGE_SIZE);
-    if (!bio_data->is_empty) {
-        // printk(KERN_INFO "Page is non-empty: %d", bio_data->page_num);
+    if (mem_is_zero(bio_data->page_addr, PAGE_SIZE)) {
+        // Set the hash to be all 0s manually, in case the last write changed the hash
+        memset(bio_data->hash, 0, SHA256_SIZE);
+    }
+    else {
         hash_merkle_page(device, bio_data);
     }
 
