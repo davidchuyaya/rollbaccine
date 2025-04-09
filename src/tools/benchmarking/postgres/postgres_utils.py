@@ -76,24 +76,26 @@ class PostgresBenchmark(Benchmark):
                 return False
         return True
 
-    def run(self, system_type: System, mount_point: str, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str, extra_args: str):
         print("Running TPCC, may take a few minutes")
-        success = subprocess_execute([
-            "cd ~/benchbase-2023/target/benchbase-postgres",
-            f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {output_dir} --clear=true --create=true --load=true --execute=true"
-        ])
-        if success:
-            print(f"TPCC benchmark completed successfully")
-        else:
-            print(f"TPCC benchmark failed")
-            sys.exit(1)
+        for i in range(0, NUM_REPETITIONS):
+            print(f"Round {i}")
+            success = subprocess_execute([
+                "cd ~/benchbase-2023/target/benchbase-postgres",
+                f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {output_dir} --clear=true --create=true --load=true --execute=true"
+            ])
+            if success:
+                print(f"TPCC benchmark completed successfully")
+            else:
+                print(f"TPCC benchmark failed")
+                sys.exit(1)
 
         # Remove everything from the output_dir except summary.json, and rename summary.json
         success = subprocess_execute([
             f"cd {output_dir}",
             "rm -rf *.xml *.csv *.metrics.json *.params.json",
-            f"mv *.summary.json {system_type}_postgres_summary.json"
+            f"ls | xargs -I {{}} mv {{}} {system_type}_{extra_args}_{{}}"
         ])
 
 if __name__ == "__main__":
-    PostgresBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
+    PostgresBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3], sys.argv[4])

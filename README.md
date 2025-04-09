@@ -13,28 +13,38 @@ Set up your Azure account by following instructions [here](#running-on-azure). Y
 Here is the full list of commands to evaluate each benchmark. Be mindful of your quota limits per region, which may affect whether you are able to launch the VMs necessary. Most experiments only use 1-2 VMs; Nimble HDFS uses 5, each with 16 cores, so that's 80 vCPUs. I suggest running at most 2 experiments concurrently. Each experiment should take at most 2 hours, so be prepared to allocate a day or two.
 
 ```bash
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED fio
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED filebench
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED postgres
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED hdfs
-python3 src/tools/benchmarking/run_benchmarks.py DM fio
-python3 src/tools/benchmarking/run_benchmarks.py DM filebench
-python3 src/tools/benchmarking/run_benchmarks.py DM postgres
-python3 src/tools/benchmarking/run_benchmarks.py DM hdfs
-python3 src/tools/benchmarking/run_benchmarks.py REPLICATED fio
-python3 src/tools/benchmarking/run_benchmarks.py REPLICATED filebench
-python3 src/tools/benchmarking/run_benchmarks.py REPLICATED postgres
-python3 src/tools/benchmarking/run_benchmarks.py REPLICATED hdfs
-python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE fio
-python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE filebench
-python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE postgres
-python3 src/tools/benchmarking/run_benchmarks.py ROLLBACCINE hdfs
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name fio
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name filebench
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name postgres
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name hdfs
+python3 src/tools/benchmarking/run_benchmarks.py --system_type DM --benchmark_name fio
+python3 src/tools/benchmarking/run_benchmarks.py --system_type DM --benchmark_name filebench
+python3 src/tools/benchmarking/run_benchmarks.py --system_type DM --benchmark_name postgres
+python3 src/tools/benchmarking/run_benchmarks.py --system_type DM --benchmark_name hdfs
+python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benchmark_name fio
+python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benchmark_name filebench
+python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benchmark_name postgres
+python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benchmark_name hdfs
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name fio
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name filebench
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name hdfs
+# Nimble tests
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 1 --nimble_storage
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 100 --nimble_storage
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 1
+python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 100
+# Rollbaccine parameter tests
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_f 0
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_f 2
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_sync_mode sync
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_sync_mode async
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_only_replicate_checksums
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 614400
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 619200
+# Recovery
 python3 src/tools/benchmarking/recovery/recovery.py True
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 1 true
-python3 src/tools/benchmarking/recovery/recovery.py False # Don't immediately run after the previous recovery, since the resource group names are the same, and shutting down a group takes time.
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 100 true
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 1 false
-python3 src/tools/benchmarking/run_benchmarks.py UNREPLICATED nimble_hdfs 100 false
+python3 src/tools/benchmarking/recovery/recovery.py False
 ```
 
 Each experiment, upon completion, will download files to the root directory (except for `recovery`, which directly puts the files in `results/recovery`). Move the files to the `results` folder under the right benchmark name (`nimble_hdfs` is put in `hdfs`), then run the following command to generate the graphs:

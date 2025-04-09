@@ -9,6 +9,8 @@ COLOR_END = '\033[0m'
 MOUNT_DIR = '/mnt/newfs'
 DATA_DIR = f"{MOUNT_DIR}/data"
 
+NUM_REPETITIONS = 3
+
 def is_installed(ssh: SSHClient, command: str) -> bool:
     """
     Returns whether the given command produces an output or not
@@ -103,7 +105,7 @@ def subprocess_execute(commands: List[str], silent=False) -> bool:
 
     separator = " && "
     combined_commands = separator.join(commands)
-    process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(combined_commands, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if not silent:
         for line in process.stdout:
             print(line.decode().strip())

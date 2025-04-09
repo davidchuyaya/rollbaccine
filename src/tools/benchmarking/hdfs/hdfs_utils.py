@@ -48,7 +48,7 @@ class HDFSBenchmark(Benchmark):
             print(f"Finished installing HDFS")
         return True
 
-    def run(self, system_type: System, mount_point: str, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str, extra_args: str):
         THREADS = 16
         FILES = 500000
         DIRS = 500000
@@ -59,19 +59,21 @@ class HDFSBenchmark(Benchmark):
             print("Failed to format and start the namenode")
             sys.exit(1)
             return
+        
+        for i in range(0, NUM_REPETITIONS):
+            print(f"Round {i}")
+            for op in ["create", "open", "delete", "fileStatus", "rename"]:
+                print(f"Running {op}")
+                success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_{extra_args}_{op}_{i}.txt"])
+                if not success:
+                    sys.exit(1)
+                    return
+                
+            print(f"Running mkdirs")
+            subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op mkdirs -threads {THREADS} -dirs {DIRS} 2>&1 | tee {output_dir}/{system_type}_{extra_args}_mkdirs_{i}.txt"])
 
-        for op in ["create", "open", "delete", "fileStatus", "rename"]:
-            print(f"Running {op}")
-            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/{system_type}_{op}.txt"])
-            if not success:
-                sys.exit(1)
-                return
-            
-        print(f"Running mkdirs")
-        subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op mkdirs -threads {THREADS} -dirs {DIRS} 2>&1 | tee {output_dir}/{system_type}_mkdirs.txt"])
-
-        print(f"Cleaning up")
-        subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
+            print(f"Cleaning up")
+            subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
 
 if __name__ == "__main__":
-    HDFSBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
+    HDFSBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3], sys.argv[4])

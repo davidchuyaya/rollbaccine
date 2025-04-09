@@ -37,7 +37,7 @@ class FioBenchmark(Benchmark):
             return True
         return False
 
-    def build_fio_commands(self, system_type: System, mount_point: str, output_dir: str):
+    def build_fio_commands(self, system_type: System, mount_point: str, output_dir: str, extra_args: str, iteration: int):
         filename = mount_point
 
         # Possible values for each parameter. Most intense options first so we see errors early
@@ -83,8 +83,8 @@ class FioBenchmark(Benchmark):
                 continue
 
             rw = sequentiality + io_direction
-            job_name = f"{system_type}_{rw}_direct{direct}_fsync{fsync}_threads_{num_jobs}_{str(uuid.uuid4())[:4]}"
-            output_file = os.path.join(output_dir, f'{job_name}_fio_results.json')
+            job_name = f"{system_type}_{rw}_direct{direct}_fsync{fsync}_threads_{num_jobs}_{extra_args}"
+            output_file = os.path.join(output_dir, f'{job_name}_fio_results_{iteration}.json')
 
             fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --fsync={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 | tee {output_file}'
             fio_commands.append(fio_command)
@@ -111,33 +111,36 @@ class FioBenchmark(Benchmark):
             ])
         return True
 
-    def run(self, system_type: System, mount_point: str, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str, extra_args: str):
         success = subprocess_execute([f"sudo umount {MOUNT_DIR}"])
         if not success:
             print("Failed to unmount the mount point")
             return
         
-        fio_commands = self.build_fio_commands(system_type, mount_point, output_dir)
-        total_benchmarks = len(fio_commands)
-        current_benchmark = 0
-        print(f"Running {total_benchmarks} FIO benchmarks locally")
+        for i in range(0, NUM_REPETITIONS):
+            print(f"Round {i}")
 
-        for fio_command in fio_commands:
-            print(f"Running FIO command: {fio_command}")
+            fio_commands = self.build_fio_commands(system_type, mount_point, output_dir, extra_args, i)
+            total_benchmarks = len(fio_commands)
+            current_benchmark = 0
+            print(f"Running {total_benchmarks} FIO benchmarks locally")
 
-            start_time = time.time()
-            # Execute the FIO command locally
-            success = subprocess_execute([fio_command])
-            if success:
-                print(f"FIO benchmark '{fio_command}' completed successfully")
-            else:
-                print(f"FIO benchmark '{fio_command}' failed")
-                sys.exit(1)
-                return
+            for fio_command in fio_commands:
+                print(f"Running FIO command: {fio_command}")
 
-            current_benchmark += 1
-            end_time = time.time()
-            print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time) / 60:.2f} minutes, completed {current_benchmark} of {total_benchmarks} benchmarks***")
+                start_time = time.time()
+                # Execute the FIO command locally
+                success = subprocess_execute([fio_command])
+                if success:
+                    print(f"FIO benchmark '{fio_command}' completed successfully")
+                else:
+                    print(f"FIO benchmark '{fio_command}' failed")
+                    sys.exit(1)
+                    return
+
+                current_benchmark += 1
+                end_time = time.time()
+                print(f"***Elapsed time: {end_time - start_time:.2f} seconds, estimated remaining time: {(total_benchmarks - current_benchmark) * (end_time - start_time) / 60:.2f} minutes, completed {current_benchmark} of {total_benchmarks} benchmarks***")
 
 if __name__ == "__main__":
-    FioBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
+    FioBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3], sys.argv[4])

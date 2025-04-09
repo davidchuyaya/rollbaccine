@@ -44,24 +44,26 @@ class FileBenchmark(Benchmark):
                 return False
         return True
 
-    def run(self, system_type: System, mount_point: str, output_dir: str):
+    def run(self, system_type: System, mount_point: str, output_dir: str, extra_args: str):
         # See issue: https://github.com/filebench/filebench/issues/112
         subprocess_execute(["echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"])
 
-        for file_system in ['ext4', 'xfs']:
-            unmount_then_mount = [f"sudo umount -q {MOUNT_DIR}"] + mount_commands(file_system, mount_point, MOUNT_DIR)
+        for i in range(0, NUM_REPETITIONS):
+            print(f"Round {i}")
+            for file_system in ['ext4', 'xfs']:
+                unmount_then_mount = [f"sudo umount -q {MOUNT_DIR}"] + mount_commands(file_system, mount_point, MOUNT_DIR)
 
-            print(f"Unmounting then remounting {file_system}")
-            subprocess_execute(unmount_then_mount, silent=True)
+                print(f"Unmounting then remounting {file_system}")
+                subprocess_execute(unmount_then_mount, silent=True)
 
-            print(f"Running Filebench varmail over {file_system}, will take 60 seconds")
-            subprocess_execute([rf"sudo filebench -f /home/{getuser()}/rollbaccine/src/tools/benchmarking/filebench/varmail.f 2>&1 | tee {output_dir}/{system_type}_{file_system}_varmail.txt"])
+                print(f"Running Filebench varmail over {file_system}, will take 60 seconds")
+                subprocess_execute([rf"sudo filebench -f /home/{getuser()}/rollbaccine/src/tools/benchmarking/filebench/varmail.f 2>&1 | tee {output_dir}/{system_type}_{file_system}_{extra_args}_varmail_{i}.txt"])
 
-            print("Unmounting and remounting before next experiment")
-            subprocess_execute(unmount_then_mount, silent=True)
+                print("Unmounting and remounting before next experiment")
+                subprocess_execute(unmount_then_mount, silent=True)
 
-            print(f"Running Filebench webserver over {file_system}, will take 60 seconds")
-            subprocess_execute([rf"sudo filebench -f /home/{getuser()}/rollbaccine/src/tools/benchmarking/filebench/webserver.f 2>&1 | tee {output_dir}/{system_type}_{file_system}_webserver.txt"])
+                print(f"Running Filebench webserver over {file_system}, will take 60 seconds")
+                subprocess_execute([rf"sudo filebench -f /home/{getuser()}/rollbaccine/src/tools/benchmarking/filebench/webserver.f 2>&1 | tee {output_dir}/{system_type}_{file_system}_{extra_args}_webserver_{i}.txt"])
 
 if __name__ == "__main__":
-    FileBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
+    FileBenchmark().run(System[sys.argv[1]], sys.argv[2], sys.argv[3], sys.argv[4])

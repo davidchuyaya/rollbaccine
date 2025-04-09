@@ -20,7 +20,7 @@ def run():
     BENCHMARK_NAME = "fio"
     SYSTEM = System.UNREPLICATED
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system, because we just want a single VM.")
-    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 1"])
+    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 1 -m 0"])
     ssh_executor = SSH(SYSTEM, BENCHMARK_NAME)
 
     print("Connecting to VMs and setting up main VMs")
@@ -40,8 +40,8 @@ def run():
         "sudo modprobe brd rd_nr=2 rd_size=10485760",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        'echo "0 $(sudo blockdev --getsz /dev/ram0) rollbaccine /dev/ram0 1 2 0 true 250000 abcdefghijklmnop 12340" | sudo dmsetup create rollbaccine1',
-        'echo "0 $(sudo blockdev --getsz /dev/ram1) rollbaccine /dev/ram1 1 2 1 false 250000 abcdefghijklmnop 12350 127.0.0.1 12340" | sudo dmsetup create rollbaccine2'
+        'echo "0 $(sudo blockdev --getsz /dev/ram0) rollbaccine /dev/ram0 1 1 true abcdefghijklmnop 1 0 default 12340 false false 2" | sudo dmsetup create rollbaccine1',
+        'echo "0 $(sudo blockdev --getsz /dev/ram1) rollbaccine /dev/ram1 2 1 false abcdefghijklmnop 1 0 default 12350 false false 1 127.0.0.1 12340" | sudo dmsetup create rollbaccine2'
     ])
     if not success:
         return False

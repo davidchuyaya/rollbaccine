@@ -116,7 +116,8 @@ class NimbleHDFSBenchmark(Benchmark):
         
         return True
 
-    def run(self, system_type: System, mount_point: str, output_dir: str):
+    # Note: We ignore extra_args in this function since it's only used for Rollbaccine, which is not compatible with NimbleHDFS
+    def run(self, system_type: System, mount_point: str, output_dir: str, extra_args: str):
         THREADS = 16
         # Use fewer files and directories since Nimble is very slow
         if self.batch_size == 1:
@@ -133,19 +134,22 @@ class NimbleHDFSBenchmark(Benchmark):
             sys.exit(1)
             return
 
-        for op in ["create", "open", "delete", "fileStatus", "rename"]:
-            print(f"Running {op}")
-            success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/NIMBLE_HDFS_{self.batch_size}_{op}.txt"])
-            if not success:
-                sys.exit(1)
-                return
-            
-        print(f"Running mkdirs")
-        subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op mkdirs -threads {THREADS} -dirs {DIRS} 2>&1 | tee {output_dir}/NIMBLE_HDFS_{self.batch_size}_mkdirs.txt"])
+        for i in range(0, NUM_REPETITIONS):
+            print(f"Round {i}")
+            for op in ["create", "open", "delete", "fileStatus", "rename"]:
+                print(f"Running {op}")
+                success = subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op {op} -threads {THREADS} -files {FILES} 2>&1 | tee {output_dir}/NIMBLE_HDFS_{self.batch_size}_{self.storage}_{op}_{i}.txt"])
+                if not success:
+                    sys.exit(1)
+                    return
+                
+            print(f"Running mkdirs")
+            subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op mkdirs -threads {THREADS} -dirs {DIRS} 2>&1 | tee {output_dir}/NIMBLE_HDFS_{self.batch_size}_{self.storage}_mkdirs_{i}.txt"])
 
-        print(f"Cleaning up")
-        subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
+            print(f"Cleaning up")
+            subprocess_execute([f"hadoop org.apache.hadoop.hdfs.server.namenode.NNThroughputBenchmark -op clean"])
 
 if __name__ == "__main__":
-    # The storage parameter doesn't matter once this is launched
-    NimbleHDFSBenchmark(int(sys.argv[4]), True).run(System[sys.argv[1]], sys.argv[2], sys.argv[3])
+    batch_size = int(sys.argv[4])
+    storage = sys.argv[5] == "True"
+    NimbleHDFSBenchmark(batch_size, storage).run(System[sys.argv[1]], sys.argv[2], sys.argv[3], "")

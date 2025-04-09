@@ -78,7 +78,7 @@ def run(recover_primary: bool):
     BENCHMARK_NAME = "postgres"
     SYSTEM = System.ROLLBACCINE
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system.")
-    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 3"])
+    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 2 -m 1 -e recoverPrimary{recover_primary}"])
     ssh_executor = SSH(SYSTEM, BENCHMARK_NAME)
 
     print("Connecting to VMs and setting up main VMs")
@@ -107,7 +107,7 @@ def run(recover_primary: bool):
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 1 true abcdefghijklmnop 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine1'
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 1 true abcdefghijklmnop 1 0 default 12340 false false 2" | sudo dmsetup create rollbaccine1',
     ])
     if not success:
         return False
@@ -117,7 +117,7 @@ def run(recover_primary: bool):
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 12350 1 {primary_ip} 12340" | sudo dmsetup create rollbaccine2'
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 1 0 default 12350 false false 1 {primary_ip} 12340" | sudo dmsetup create rollbaccine2'
     ])
     if not success:
         return False
@@ -139,6 +139,9 @@ def run(recover_primary: bool):
         "sudo apt-get install -qq -y postgresql",
         # Listens to public addresses
         r"echo 'listen_addresses = '\'*\' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
+        # Fix out-of-memory error
+        "echo 'max_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
+        "echo 'max_pred_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
         # Trust all connections
         "echo 'host all all 0.0.0.0/0 trust' | sudo tee -a /etc/postgresql/*/main/pg_hba.conf",
         "sudo systemctl restart postgresql.service",
@@ -218,9 +221,9 @@ def run(recover_primary: bool):
 
     print("Recovering")
     if recover_primary:
-        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 3 3 true abcdefghijklmnop 12360 2 {backup_ip} 12350 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine1'
+        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 3 3 true abcdefghijklmnop 1 0 default 12360 false true 2 {backup_ip} 12350 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine1'
     else:
-        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 3 3 false abcdefghijklmnop 12360 1 {primary_ip} 12340 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine2'
+        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 3 3 false abcdefghijklmnop 1 0 default 12360 false true 1 {primary_ip} 12340 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine2'
     success = ssh_executor.exec(main_ssh, [
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
@@ -255,7 +258,7 @@ def run(recover_primary: bool):
     primary_ssh.close()
     backup_ssh.close()
     benchmark_ssh.close()
-    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM}"])
+    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e recoverPrimary{recover_primary}"])
 
 if __name__ == "__main__":
     # True = recover primary, False = recover backup
