@@ -360,7 +360,7 @@ void read_hash_end_io(struct bio *bio);
 
 void free_merkle_bio(struct merkle_bio_data *bio_data);
 struct merkle_bio_data *create_and_submit_merkle_bio(struct rollbaccine_device *device, int layer, int page_num, int page_offset);
-void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset);
+void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bio_data *child, int layer, int parent_page_num);
 void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_checksum_op *pending_checksum_op, int parent_page_num);
 void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data, int data_dir);
 
@@ -585,7 +585,7 @@ void verify_merkle_node(struct merkle_bio_data *bio_data) {
     }
 
     if (res != 0) {
-        printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, we are all zeros: %d", bio_data->page_num, mem_is_zero(bio_data->hash, SHA256_SIZE));
+        printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, layer: %d, we are all zeros: %d", bio_data->page_num, bio_data->layer, mem_is_zero(bio_data->hash, SHA256_SIZE));
         // Note: Should crash the system and enter recovery
     }
 }
@@ -608,6 +608,7 @@ void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool rec
         if (bio_data->parent != NULL) {
             // Modify parent's page
             memcpy(bio_data->parent->page_addr + bio_data->parent_page_offset, bio_data->hash, SHA256_SIZE);
+            // printk(KERN_INFO "Child %d dirtying parent %d", bio_data->page_num, bio_data->parent->page_num);
             bio_data->parent->dirtied = true;
         } else {
             // Modify in-memory checksum
@@ -622,6 +623,7 @@ void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool rec
         kunmap(bio_page(bio));
 
         // Write to disk
+        // printk(KERN_INFO "Writing hash to disk: %d, hash: %s", bio_data->page_num, bio_data->hash);
         start_sector = bio->bi_iter.bi_sector;
         bio_reset(bio, device->dev->bdev, REQ_OP_WRITE);
         bio->bi_iter.bi_sector = start_sector;
@@ -639,7 +641,7 @@ void recursive_evict_merkle_ancestors(struct merkle_bio_data *bio_data, bool rec
 void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
     struct rollbaccine_device *device = bio_data->device;
     struct pending_checksum_op *pending_checksum_op, *next_pending_checksum_op;
-    struct merkle_bio_data *merkle_child;
+    struct merkle_bio_data *merkle_child, *next_merkle_child;
 
     // 1. Verify self
     verify_merkle_node(bio_data);
@@ -647,6 +649,7 @@ void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
 
     // 2. Process children
     if (bio_data->layer == device->merkle_tree_height - 1) {
+        // printk(KERN_INFO "Merkle leaf checking children: %d", bio_data->page_num);
         // This is a leaf, children are pending_checksum_ops
         list_for_each_entry_safe(pending_checksum_op, next_pending_checksum_op, &bio_data->pending_children, list) {
             if (pending_checksum_op->read_bio_data != NULL) {
@@ -657,7 +660,7 @@ void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
                 try_read_bio(pending_checksum_op->read_bio_data);
             } else {
                 // Write
-                // printk(KERN_INFO "Processing pending write, offset: %d", pending_checksum_op->parent_page_offset);
+                // printk(KERN_INFO "Processing pending write to page: %d, offset: %d", bio_data->page_num, pending_checksum_op->parent_page_offset);
                 memcpy(bio_data->page_addr + pending_checksum_op->parent_page_offset, pending_checksum_op->checksum, AES_GCM_AUTH_SIZE);
                 bio_data->dirtied = true;
             }
@@ -666,9 +669,11 @@ void recursive_process_merkle_descendants(struct merkle_bio_data *bio_data) {
         }
     } else {
         // This is a node, children are merkle_bio_data
-        list_for_each_entry(merkle_child, &bio_data->pending_children, list) {
+        // printk(KERN_INFO "Merkle node checking children: %d", bio_data->page_num);
+        list_for_each_entry_safe(merkle_child, next_merkle_child, &bio_data->pending_children, list) {
             // Process children once they have been read from disk
             if (merkle_child->hashed) {
+                // printk(KERN_INFO "Merkle node %d child hashed: %d", bio_data->page_num, merkle_child->page_num);
                 recursive_process_merkle_descendants(merkle_child);
 
                 // 3. See if the child should be evicted (not recursively, since we're already recusively walking down the tree)
@@ -693,6 +698,7 @@ void read_hash_end_io_task(struct work_struct *work) {
     }
     else {
         hash_merkle_page(device, bio_data);
+        // printk(KERN_INFO "Hashed page: %d, hash: %s", bio_data->page_num, bio_data->hash);
     }
 
     mutex_lock(&device->merkle_tree_lock);
@@ -701,6 +707,7 @@ void read_hash_end_io_task(struct work_struct *work) {
     // 2. Check if the parent was verified
     if (bio_data->parent != NULL) {
         if (!bio_data->parent->verified) {
+            // printk(KERN_INFO "Parent not verified yet, waiting: %d", bio_data->page_num);
             goto unlock_and_exit;
         }
     }
@@ -764,10 +771,11 @@ struct merkle_bio_data *create_and_submit_merkle_bio(struct rollbaccine_device *
     return bio_data;
 }
 
-void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bio_data *child, int layer, int parent_page_num, int parent_page_offset) {
+void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bio_data *child, int layer, int parent_page_num) {
     struct rb_node **tree_node_location;
     struct rb_node *tree_node;
     struct merkle_bio_data *merkle_node;
+    int parent_page_offset;
 
     tree_node_location = &(device->merkle_tree_layers[layer].rb_node);
 
@@ -791,17 +799,19 @@ void add_merkle_node_request(struct rollbaccine_device *device, struct merkle_bi
 
     // Page hasn't been requested, add it
     // printk(KERN_INFO "Creating new merkle node: %d", parent_page_num);
+    parent_page_offset = (parent_page_num - device->disk_pages_above_merkle_tree_layer[layer]) % HASHES_PER_PAGE * SHA256_SIZE;
     merkle_node = create_and_submit_merkle_bio(device, layer, parent_page_num, parent_page_offset);
     rb_link_node(&merkle_node->tree_node, tree_node, tree_node_location);
     rb_insert_color(&merkle_node->tree_node, &device->merkle_tree_layers[layer]);
 
+    list_add_tail(&child->list, &merkle_node->pending_children);
     child->parent = merkle_node;
 
     // Iterate through all ancestors to fetch the pages if necessary
     if (layer - 1 > 0) {
         parent_page_num -= device->disk_pages_above_merkle_tree_layer[layer];  // Remove padding
         // printk(KERN_INFO "Recursively requesting new merkle parent: %d", parent_page_num);
-        add_merkle_node_request(device, merkle_node, layer - 1, parent_page_num / SHA256_SIZE + device->disk_pages_above_merkle_tree_layer[layer - 1], parent_page_num % SHA256_SIZE);
+        add_merkle_node_request(device, merkle_node, layer - 1, parent_page_num / HASHES_PER_PAGE + device->disk_pages_above_merkle_tree_layer[layer - 1]);
     }
 }
 
@@ -811,6 +821,7 @@ void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_c
     struct rb_node *tree_node;
     struct merkle_bio_data *merkle_leaf;
     struct pending_checksum_op *other_pending_checksum_op;
+    int parent_page_offset;
 
     // See if the parent page has already been requested
     while (*tree_node_location != NULL) {
@@ -868,7 +879,8 @@ void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_c
 
     // Page hasn't been requested, add it
     // printk(KERN_INFO "Creating new merkle leaf: %d", parent_page_num);
-    merkle_leaf = create_and_submit_merkle_bio(device, layer, parent_page_num, pending_checksum_op->parent_page_offset);
+    parent_page_offset = (parent_page_num - device->disk_pages_above_merkle_tree_layer[layer]) % HASHES_PER_PAGE * SHA256_SIZE;
+    merkle_leaf = create_and_submit_merkle_bio(device, layer, parent_page_num, parent_page_offset);
     rb_link_node(&merkle_leaf->tree_node, tree_node, tree_node_location);
     rb_insert_color(&merkle_leaf->tree_node, &device->merkle_tree_layers[layer]);
 
@@ -878,8 +890,8 @@ void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_c
     // Iterate through all ancestors to fetch the pages if necessary
     if (layer - 1 > 0) {
         parent_page_num -= device->disk_pages_above_merkle_tree_layer[layer];  // Remove padding
-        // printk(KERN_INFO "Requesting new merkle parent: %d", parent_page_num);
-        add_merkle_node_request(device, merkle_leaf, layer - 1, parent_page_num / SHA256_SIZE + device->disk_pages_above_merkle_tree_layer[layer - 1], parent_page_num % SHA256_SIZE);
+        // printk(KERN_INFO "Requesting new merkle parent: %lu", parent_page_num / HASHES_PER_PAGE);
+        add_merkle_node_request(device, merkle_leaf, layer - 1, parent_page_num / HASHES_PER_PAGE + device->disk_pages_above_merkle_tree_layer[layer - 1]);
     }
 }
 
@@ -937,7 +949,7 @@ void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_
         parent_page_num = curr_page / AES_GCM_PER_PAGE + device->disk_pages_above_merkle_tree_layer[device->merkle_tree_height - 1];
 
         // Add to pending ops, check if the parent's parent also needs to be fetched
-        // printk(KERN_INFO "Requesting parent for read: %d, parent: %d", curr_sector, parent_page_num);
+        // printk(KERN_INFO "Requesting parent for sector: %llu, parent: %lu, offset: %d, write: %d", curr_sector, parent_page_num, pending_checksum_op->parent_page_offset, data_dir);
         add_merkle_leaf_request(device, pending_checksum_op, parent_page_num);
 
         checksum_offset += AES_GCM_AUTH_SIZE;
