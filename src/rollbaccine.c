@@ -1334,6 +1334,8 @@ void free_bio_data(struct bio_data *bio_data) {
             page_cache_free(device, bvec.bv_page);
             // __free_page(bvec.bv_page);
 #ifdef MEMORY_TRACKING
+            int num_deep_clones = atomic_dec_return(&device->num_deep_clones_not_freed);
+            atomic_max(&device->max_outstanding_num_deep_clones, num_deep_clones + 1);
             num_bio_pages = atomic_dec_return(&device->num_bio_pages_not_freed);
             atomic_max(&device->max_outstanding_num_bio_pages, num_bio_pages + 1);
 #endif
@@ -1344,8 +1346,8 @@ void free_bio_data(struct bio_data *bio_data) {
     // Free the shallow_clone
     if (bio_data->shallow_clone != NULL) {
 #ifdef MEMORY_TRACKING
-        int num_shallow_clones = atomic_dec_return(&bio_data->device->num_shallow_clones_not_freed);
-        atomic_max(&bio_data->device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
+        int num_shallow_clones = atomic_dec_return(&device->num_shallow_clones_not_freed);
+        atomic_max(&device->max_outstanding_num_shallow_clones, num_shallow_clones + 1);
 #endif
         bio_put(bio_data->shallow_clone);
     }
