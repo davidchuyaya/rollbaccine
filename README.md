@@ -41,7 +41,7 @@ python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --ben
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_sync_mode async
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_only_replicate_checksums
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 614400
-python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 619200
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 616774
 # Recovery
 python3 src/tools/benchmarking/recovery/recovery.py True
 python3 src/tools/benchmarking/recovery/recovery.py False
@@ -227,8 +227,7 @@ Here's the syntax, explained:
   - `num_sectors`: The number of sectors in the device. You can get the number of sectors of a device with `blockdev --getsz $1`, where `$1` is the device.
   - `target_type`: The name of the device mapper.
   - `target_args`: Device to map onto.
-The remaining parameters' purposes can be found in `src/rollbaccine.c`.  
-Briefly (this may become out-of-date), the parameters are: ID, seen_ballot, is_leader, password, listen_port, counterpart_id, counterpart_addr, counterpart_port. During reconfiguration, additional id, addr, port parameters are passed in.
+The remaining parameters' purposes can be found in the `rollbaccine_constructor` method of `src/rollbaccine.c`.  
 
 You can now write directly to `/dev/mapper/rollbaccine1`! You can also mount a file system over that directory.
 

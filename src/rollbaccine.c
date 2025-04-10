@@ -36,6 +36,7 @@
 #define ROLLBACCINE_METADATA_CHECKSUM_SIZE AES_GCM_AUTH_SIZE * ROLLBACCINE_AVG_HASHES_PER_WRITE
 #define ROLLBACCINE_PENDING_BIO_RING_SIZE 10000000 // Max "hole" between writes
 #define SHA256_SIZE 32
+#define HASHES_PER_PAGE (PAGE_SIZE / SHA256_SIZE)
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
 #define ROLLBACCINE_PLUG_NUM_BIOS 256 / 4  // Number of bios to allow between to calls to blk_plug for merging. 256K is the largest write we can send to disk, 4K is the size of individual writes
 #define ROLLBACCINE_HASHES_PER_MSG 100
@@ -483,7 +484,7 @@ void submit_merkle_bio_task(struct work_struct *work) {
 
 void init_merkle_tree(struct rollbaccine_device *device) {
     int i, j;
-    int total_checksum_pages = device->num_sectors / SECTORS_PER_PAGE / AES_GCM_PER_PAGE;
+    int total_checksum_pages = (device->num_sectors + SECTORS_PER_PAGE * AES_GCM_PER_PAGE - 1) / (SECTORS_PER_PAGE * AES_GCM_PER_PAGE);
     int pages_in_memory = total_checksum_pages;
     int pages_on_disk = 0;
 
@@ -491,7 +492,7 @@ void init_merkle_tree(struct rollbaccine_device *device) {
 
     while (pages_on_disk + pages_in_memory < device->disk_pages_for_merkle_tree && pages_in_memory > 1) {
         pages_on_disk += pages_in_memory;
-        pages_in_memory = (pages_in_memory + SHA256_SIZE - 1) / SHA256_SIZE;
+        pages_in_memory = (pages_in_memory + HASHES_PER_PAGE - 1) / HASHES_PER_PAGE;
         device->merkle_tree_height++;
     }
 
@@ -508,7 +509,7 @@ void init_merkle_tree(struct rollbaccine_device *device) {
     // Note: [0] = 0 since there is no layer above the root, and [1] = 0 since the root is in memory
     pages_in_memory = total_checksum_pages;
     for (i = device->merkle_tree_height - 1; i > 1; i--) {
-        pages_in_memory = (pages_in_memory + SHA256_SIZE - 1) / SHA256_SIZE;
+        pages_in_memory = (pages_in_memory + HASHES_PER_PAGE - 1) / HASHES_PER_PAGE;
         for (j = i; j < device->merkle_tree_height; j++) {
             device->disk_pages_above_merkle_tree_layer[j] += pages_in_memory;
         }

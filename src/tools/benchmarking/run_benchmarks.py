@@ -64,28 +64,40 @@ def download_rollbaccine(ssh_executor: SSH, ssh):
 def get_leader_commands(args: argparse.Namespace):
     """
     Returns the list of commands to execute on the leader VM.
+    Note: Even though we unmount sdb1, we mount over sdb. Unmounting sdb1 is necessary because it was already mounted. Mounting over sdb prevents the offset of sdb1 affecting Rollbaccine.
     """
+    if args.rollbaccine_num_hash_disk_pages == 0:
+        dd_clean_command = ""
+    else: # Wipe disk where the hashes are expected to be
+        dd_clean_command = f"sudo dd if=/dev/zero of=/dev/sdb bs=4K count={args.rollbaccine_num_hash_disk_pages}"
     commands = [
         "sudo umount /dev/sdb1",
+        dd_clean_command,
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        "ORIG_SIZE=$(sudo blockdev --getsz /dev/sdb1)",
+        "ORIG_SIZE=$(sudo blockdev --getsz /dev/sdb)",
         f"NEW_SIZE=$((ORIG_SIZE - {args.rollbaccine_num_hash_disk_pages} * 8))", # 8 = SECTORS_PER_PAGE
-        f'echo "0 $NEW_SIZE rollbaccine /dev/sdb1 1 1 true abcdefghijklmnop {args.rollbaccine_f} {args.rollbaccine_num_hash_disk_pages} {args.rollbaccine_sync_mode} 12340 {str(args.rollbaccine_only_replicate_checksums).lower()} false 2" | sudo dmsetup create rollbaccine1'
+        f'echo "0 $NEW_SIZE rollbaccine /dev/sdb 1 1 true abcdefghijklmnop {args.rollbaccine_f} {args.rollbaccine_num_hash_disk_pages} {args.rollbaccine_sync_mode} 12340 {str(args.rollbaccine_only_replicate_checksums).lower()} false 2" | sudo dmsetup create rollbaccine1'
     ]
     return commands
 
 def get_backup_commands(args: argparse.Namespace, primary_private_ip):
     """
     Returns the list of commands to execute on the backup.
+    Note: Even though we unmount sdb1, we mount over sdb. Unmounting sdb1 is necessary because it was already mounted. Mounting over sdb prevents the offset of sdb1 affecting Rollbaccine.
     """
+    if args.rollbaccine_num_hash_disk_pages == 0:
+        dd_clean_command = ""
+    else: # Wipe disk where the hashes are expected to be
+        dd_clean_command = f"sudo dd if=/dev/zero of=/dev/sdb bs=4K count={args.rollbaccine_num_hash_disk_pages}"
     commands = [
         "sudo umount /dev/sdb1",
+        dd_clean_command,
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        "ORIG_SIZE=$(sudo blockdev --getsz /dev/sdb1)",
+        "ORIG_SIZE=$(sudo blockdev --getsz /dev/sdb)",
         f"NEW_SIZE=$((ORIG_SIZE - {args.rollbaccine_num_hash_disk_pages} * 8))", # 8 = SECTORS_PER_PAGE
-        f'echo "0 $NEW_SIZE rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop {args.rollbaccine_f} {args.rollbaccine_num_hash_disk_pages} {args.rollbaccine_sync_mode} 12350 {str(args.rollbaccine_only_replicate_checksums).lower()} false 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
+        f'echo "0 $NEW_SIZE rollbaccine /dev/sdb 2 1 false abcdefghijklmnop {args.rollbaccine_f} {args.rollbaccine_num_hash_disk_pages} {args.rollbaccine_sync_mode} 12350 {str(args.rollbaccine_only_replicate_checksums).lower()} false 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
     ]
     return commands
 
@@ -125,7 +137,7 @@ def setup_main_nodes(ssh_executor: SSH, system_type: System, args: argparse.Name
                 if i == 0:
                     ssh_executor.exec(ssh, get_leader_commands(args))
                 elif i == 1:
-                   ssh_executor.exec(ssh, get_backup_commands(args, private_ips[0]))
+                    ssh_executor.exec(ssh, get_backup_commands(args, private_ips[0]))
 
             # If this isn't rollbaccine, then we're immediately to mount the file system.
             # If this is rollbaccine, we'll need to set up the backup first (so they can sync).

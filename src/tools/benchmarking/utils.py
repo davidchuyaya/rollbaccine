@@ -37,6 +37,7 @@ class SSH():
 
         # Make sure we source the environment variables placed in .profile first
         commands.insert(0, "source .profile")
+        commands = list(filter(None, commands))  # Remove empty commands
         # Join commands with "&&" so we can use "cd" correctly
         separator = " && "
         combined_commands = separator.join(commands)
