@@ -484,9 +484,10 @@ void submit_merkle_bio_task(struct work_struct *work) {
 
 void init_merkle_tree(struct rollbaccine_device *device) {
     int i, j;
-    int total_checksum_pages = (device->num_sectors + SECTORS_PER_PAGE * AES_GCM_PER_PAGE - 1) / (SECTORS_PER_PAGE * AES_GCM_PER_PAGE);
-    int pages_in_memory = total_checksum_pages;
-    int pages_on_disk = 0;
+    // Note: Instead of rounding up, we always add 1, since the disk may choose to start at a sector towards the end 
+    unsigned long total_checksum_pages = (device->num_sectors + SECTORS_PER_PAGE * AES_GCM_PER_PAGE - 1) / (SECTORS_PER_PAGE * AES_GCM_PER_PAGE);
+    unsigned long pages_in_memory = total_checksum_pages;
+    unsigned long pages_on_disk = 0;
 
     device->merkle_tree_height = 1;
 
@@ -496,7 +497,7 @@ void init_merkle_tree(struct rollbaccine_device *device) {
         device->merkle_tree_height++;
     }
 
-    printk(KERN_INFO "num_sectors: %llu, disk_pages_for_merkle_tree: %llu, pages_on_disk: %d, pages_in_memory: %d, height: %d", device->num_sectors, device->disk_pages_for_merkle_tree, pages_on_disk, pages_in_memory, device->merkle_tree_height);
+    printk(KERN_INFO "num_sectors: %llu, disk_pages_for_merkle_tree: %llu, pages_on_disk: %lu, pages_in_memory: %lu, height: %d", device->num_sectors, device->disk_pages_for_merkle_tree, pages_on_disk, pages_in_memory, device->merkle_tree_height);
 
     device->merkle_tree_root = vzalloc(pages_in_memory * PAGE_SIZE);
     if (!device->merkle_tree_root) {
@@ -885,7 +886,7 @@ void add_merkle_leaf_request(struct rollbaccine_device *device, struct pending_c
 void fetch_merkle_nodes(struct rollbaccine_device *device, struct bio_data *bio_data, int data_dir) {
     struct pending_checksum_op *pending_checksum_op;
     sector_t curr_sector;
-    int parent_page_num, curr_page, num_pages;
+    unsigned long parent_page_num, curr_page, num_pages;
     int checksum_offset = 0;
 
     // Don't need to do anything if the bio is empty
