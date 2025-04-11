@@ -9,6 +9,7 @@
     <password>password</password>
     <isolation>TRANSACTION_SERIALIZABLE</isolation>
     <batchsize>128</batchsize>
+    <retries>100</retries>
 
     <!-- Scale factor is the number of warehouses in TPCC -->
     <scalefactor>10</scalefactor>
@@ -16,18 +17,6 @@
     <!-- The workload -->
     <terminals>50</terminals>
     <works>
-        <work>
-            <warmup>30</warmup>
-            <time>60</time>
-            <rate>10000</rate>
-            <weights>45,43,4,4,4</weights>
-        </work>
-        <work>
-            <warmup>30</warmup>
-            <time>60</time>
-            <rate>10000</rate>
-            <weights>45,43,4,4,4</weights>
-        </work>
         <work>
             <warmup>30</warmup>
             <time>60</time>

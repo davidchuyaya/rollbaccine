@@ -81,7 +81,7 @@ def get_leader_commands(args: argparse.Namespace):
     ]
     return commands
 
-def get_backup_commands(args: argparse.Namespace, primary_private_ip):
+def get_backup_commands(args: argparse.Namespace, primary_private_ip, backup_id):
     """
     Returns the list of commands to execute on the backup.
     Note: Even though we unmount sdb1, we mount over sdb. Unmounting sdb1 is necessary because it was already mounted. Mounting over sdb prevents the offset of sdb1 affecting Rollbaccine.
@@ -97,7 +97,7 @@ def get_backup_commands(args: argparse.Namespace, primary_private_ip):
         "sudo insmod rollbaccine.ko",
         "ORIG_SIZE=$(sudo blockdev --getsz /dev/sdb)",
         f"NEW_SIZE=$((ORIG_SIZE - {args.rollbaccine_num_hash_disk_pages} * 8))", # 8 = SECTORS_PER_PAGE
-        f'echo "0 $NEW_SIZE rollbaccine /dev/sdb 2 1 false abcdefghijklmnop {args.rollbaccine_f} {args.rollbaccine_num_hash_disk_pages} {args.rollbaccine_sync_mode} 12350 {str(args.rollbaccine_only_replicate_checksums).lower()} false 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
+        f'echo "0 $NEW_SIZE rollbaccine /dev/sdb {backup_id} 1 false abcdefghijklmnop {args.rollbaccine_f} {args.rollbaccine_num_hash_disk_pages} {args.rollbaccine_sync_mode} 12350 {str(args.rollbaccine_only_replicate_checksums).lower()} false 1 {primary_private_ip} 12340" | sudo dmsetup create rollbaccine2'
     ]
     return commands
 
@@ -136,8 +136,8 @@ def setup_main_nodes(ssh_executor: SSH, system_type: System, args: argparse.Name
                 # Setup primary and backup
                 if i == 0:
                     ssh_executor.exec(ssh, get_leader_commands(args))
-                elif i == 1:
-                    ssh_executor.exec(ssh, get_backup_commands(args, private_ips[0]))
+                else:
+                    ssh_executor.exec(ssh, get_backup_commands(args, private_ips[0], i+1))
 
             # If this isn't rollbaccine, then we're immediately to mount the file system.
             # If this is rollbaccine, we'll need to set up the backup first (so they can sync).
@@ -225,10 +225,11 @@ def run_everything():
         mount_point = setup_main_nodes(ssh_executor, system_type, args, connections, private_ips)
 
         if system_type == System.ROLLBACCINE:
-            # Disconnect from the backup
-            connections[-1].close()
-            connections = connections[:-1]
-            private_ips = private_ips[:-1]
+            for i in range(0, args.rollbaccine_f):
+                # Disconnect from each backup
+                connections[-1].close()
+                connections = connections[:-1]
+                private_ips = private_ips[:-1]
 
     if os.path.isfile(f'{args.benchmark_name}-{system_type}-{unique_str}-vm2.json'):
         with open(f'{args.benchmark_name}-{system_type}-{unique_str}-vm2.json') as f:
