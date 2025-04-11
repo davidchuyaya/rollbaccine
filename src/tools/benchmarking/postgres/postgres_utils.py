@@ -37,6 +37,7 @@ class PostgresBenchmark(Benchmark):
                 # Listens to public addresses
                 r"echo 'listen_addresses = '\'*\' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
                 # Fix out-of-memory error
+                "echo 'max_connections = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
                 "echo 'max_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
                 "echo 'max_pred_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
                 # Trust all connections
