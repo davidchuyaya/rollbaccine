@@ -25,7 +25,7 @@ class NimbleHDFSBenchmark(Benchmark):
         return "nimble_hdfs/nimble_hdfs_utils.py"
     
     def num_vms(self):
-        return 5 # 1 namenode, 1 coordinator, 3 endorsers
+        return 4 # 1 namenode (colocated with the coordinator), 3 endorsers
     
     def benchmarking_vm(self):
         return 0
@@ -49,10 +49,10 @@ class NimbleHDFSBenchmark(Benchmark):
     def install(self, ssh_executor: SSH, connections: List[SSHClient], private_ips: List[str], system_type: System, storage_name: str, storage_key: str):
         name_node_ip = private_ips[self.benchmarking_vm()]
         name_node_ssh = connections[self.benchmarking_vm()]
-        coordinator_ip = private_ips[1]
-        coordinator_ssh = connections[1]
-        endorser_ips = private_ips[2:5]
-        endorser_sshs = connections[2:5]
+        coordinator_ip = name_node_ip
+        coordinator_ssh = name_node_ssh
+        endorser_ips = private_ips[1:4]
+        endorser_sshs = connections[1:4]
 
         print(f"Checking if namenode has HDFS")
         if not is_installed(name_node_ssh, 'which hdfs'):
@@ -75,8 +75,8 @@ class NimbleHDFSBenchmark(Benchmark):
             # Replace {namenodeip} in core-site with the actual namenode IP
             print("Replacing {namenodeip} in core-site.xml")
             ssh_executor.exec(name_node_ssh, [f"sed -i 's/{{namenodeip}}/{name_node_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
-            print("Replacing {nimbleip} in core-site.xml")
-            ssh_executor.exec(name_node_ssh, [f"sed -i 's/{{nimbleip}}/{coordinator_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
+            # print("Replacing {nimbleip} in core-site.xml")
+            # ssh_executor.exec(name_node_ssh, [f"sed -i 's/{{nimbleip}}/{coordinator_ip}/g' /home/{getuser()}/hadoop-3.3.3/etc/hadoop/core-site.xml"])
             print(f"Finished installing HDFS")
 
         print("Installing Nimble on the coordinator and endorsers (in parallel)")
@@ -105,13 +105,13 @@ class NimbleHDFSBenchmark(Benchmark):
             storage_params = "-s 'memory'"
         ssh_execute_background(coordinator_ssh, [
             "cd Nimble",
-            f"target/release/coordinator -t {coordinator_ip} -p {COORDINATOR_PORT} -e 'http://{endorser_ips[0]}:{ENDORSER_PORT},http://{endorser_ips[1]}:{ENDORSER_PORT},http://{endorser_ips[2]}:{ENDORSER_PORT}' {storage_params}",
+            f"target/release/coordinator -t 127.0.0.1 -p {COORDINATOR_PORT} -e 'http://{endorser_ips[0]}:{ENDORSER_PORT},http://{endorser_ips[1]}:{ENDORSER_PORT},http://{endorser_ips[2]}:{ENDORSER_PORT}' {storage_params}",
         ])
         
         print("Starting the endpoint (still on the coordinator)")
         success = ssh_execute_background(coordinator_ssh, [
             "cd Nimble",
-            f"target/release/endpoint_rest -t {coordinator_ip} -p {ENDPOINT_PORT} -c 'http://{coordinator_ip}:{COORDINATOR_PORT}'",
+            f"target/release/endpoint_rest -t 127.0.0.1 -p {ENDPOINT_PORT} -c 'http://127.0.0.1:{COORDINATOR_PORT}'",
         ])
         
         return True

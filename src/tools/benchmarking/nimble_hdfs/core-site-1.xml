@@ -7,7 +7,7 @@
     </property>
     <property>
 		<name>fs.nimbleURI</name>
-		<value>http://{nimbleip}:8082/</value>
+		<value>http://127.0.0.1:8082/</value>
 	</property>
 	<property>
 		<name>fs.nimble.batchSize</name>

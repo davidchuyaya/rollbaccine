@@ -59,9 +59,12 @@ az ppg create \
   --intent-vm-sizes $VM_SIZE $VM_SIZE_TEMP_DISK
 
 if [ $BENCHMARK = "nimble_hdfs" ]; then
-    echo "Creating storage account: rollbaccinenimble"
-    az storage account create -n rollbaccinenimble -g $NAME-group -l $LOCATION --sku Standard_LRS
-    az storage account keys list -n rollbaccinenimble -g $NAME-group > $STORAGE_FILE
+    # Only create the storage account if nimble_storage == "True" (so $EXTRA would contain "True")
+    if [[ $EXTRA == *"True"* ]]; then
+        echo "Creating storage account: rollbaccinenimble"
+        az storage account create -n rollbaccinenimble -g $NAME-group -l $LOCATION --sku Standard_LRS
+        az storage account keys list -n rollbaccinenimble -g $NAME-group > $STORAGE_FILE
+    fi
 fi
 
 # Append a unique int to the end of each VM's name. Incremented at the end of launch_vm.
