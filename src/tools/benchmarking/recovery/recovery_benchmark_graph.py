@@ -60,18 +60,13 @@ def extract_data(filename: str):
 
 # plot bar graphs
 def plot_time_series(filename, times, throughputs, crash_start, hash_receive_start, hash_receive_end, disk_scan_end):
-    fig, ax = plt.subplots(figsize=(5, 2))
+    fig, ax = plt.subplots(figsize=(3, 1.5))
     plt.plot(times, throughputs)
-    plt.ylabel("Writes per sec")
+    plt.ylabel("Writes/sec")
     plt.xlabel("Time (sec)")
-    plt.axvline(x=crash_start, color='black', ls=":")
-    plt.text(crash_start + 10, 0.99, 'Crash', rotation=90, ha='left', va='top', transform=ax.get_xaxis_transform())
-    plt.axvline(x=hash_receive_start, color='black', ls=":")
-    plt.text(hash_receive_start + 10, 0.99, 'Restarted', rotation=90, ha='left', va='top', transform=ax.get_xaxis_transform())
-    plt.axvline(x=hash_receive_end, color='black', ls=":")
-    plt.text(hash_receive_end + 10, 0.99, 'Hashes received', rotation=90, ha='left', va='top', transform=ax.get_xaxis_transform())
-    plt.axvline(x=disk_scan_end, color='black', ls=":")
-    plt.text(disk_scan_end + 10, 0.99, 'Disk scanned', rotation=90, ha='left', va='top', transform=ax.get_xaxis_transform())
+    plt.axvspan(crash_start, hash_receive_start, ymin=0.06, ymax=0.96, color='dimgray')
+    plt.axvspan(hash_receive_start, hash_receive_end, ymin=0.06, ymax=0.96, color='darkgray')
+    plt.axvspan(hash_receive_end, disk_scan_end, ymin=0.06, ymax=0.96, color='lightgray')
     plt.box(False)
     plt.tight_layout()
     plt.savefig(f"../../../../results/graphs/{filename}", bbox_inches='tight', pad_inches=0)

@@ -208,7 +208,7 @@ def run_everything():
     storage_key = ""
     if benchmark.needs_storage():
         print("Extracting storage key")
-        with open (f'{args.benchmark_name}-{system_type}-{unique_str}.json') as f:
+        with open (f'{args.benchmark_name}-{system_type}-{unique_str}-storage.json') as f:
             storage_data = json.load(f)
             storage_key = storage_data[0].get("value")
             print(f"Found storage key: {storage_key}")

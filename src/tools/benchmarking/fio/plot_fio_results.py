@@ -3,38 +3,44 @@ import json
 from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 import numpy as np
+import glob
 
-def read_fio_json_results(results_dir):
+def read_fio_json_results():
     """
     Reads all FIO JSON result files in the specified directory.
     Returns a list of tuples containing the job name, category, thread count, and the FIO result data.
     """
     results = []
-    for filename in os.listdir(results_dir):
-        if filename.endswith('.json'):
-            filepath = os.path.join(results_dir, filename)
-            # Example filename: DM_rand_read_direct0_fsync0_threads_16_8ef3_fio_results.json
-            filename_without_extension = filename[:-len('_fio_results.json')]
-            filename_parts = filename_without_extension.split('_')
-            # Extract the category (e.g., 'DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE')
-            category = filename_parts[0]
-            if category not in ['DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE']:
-                print(f"Unknown category '{category}' in filename '{filename}'. Skipping.")
-                continue
-            try:
-                threads_index = filename_parts.index('threads')
-                base_job_name_parts = filename_parts[1:threads_index]
-                base_job_name = '_'.join(base_job_name_parts)
-                thread_count = int(filename_parts[threads_index + 1])
-            except ValueError:
-                print(f"Error parsing filename {filename}")
-                continue
+    matched_files = glob.glob(f"../../../../results/*_fio_results_*.json")
+    for filename in matched_files:
+        # Example filename: REPLICATED_write_direct0_fsync1_threads_16_normal_fio_results_0.json
+        # Example filename for Rollbaccine: ROLLBACCINE_randread_direct0_fsync0_threads_4_1_0_default_False_fio_results_2.json
+        filename_parts = os.path.basename(filename).split('_')
+        # Extract the category (e.g., 'DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE')
+        category = filename_parts[0]
+        if category not in ['DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE']:
+            print(f"Unknown category '{category}' in filename '{filename}'. Skipping.")
+            continue
+        try:
+            threads_index = filename_parts.index('threads')
+            base_job_name_parts = filename_parts[1:threads_index]
+            base_job_name = '_'.join(base_job_name_parts)
+            thread_count = int(filename_parts[threads_index + 1])
+        except ValueError:
+            print(f"Error parsing filename {filename}")
+            continue
 
-            with open(filepath, 'r') as f:
-                data = json.load(f)
-                for job in data['jobs']:
-                    job_name = job['jobname']
-                    results.append((base_job_name, category, thread_count, job))
+        print(f"Reading FIO JSON result file: {filename}")
+        lines = []
+        with open(filename, 'r+') as f:
+            for line in f:
+                if not line.startswith("fio: "):
+                    lines.append(line)
+
+        data = json.loads(''.join(lines))
+        for job in data['jobs']:
+            job_name = job['jobname']
+            results.append((base_job_name, category, thread_count, job))
     return results
 
 def get_mean(data):
@@ -62,10 +68,13 @@ def extract_performance_data(results):
             performance_data[base_job_name] = {}
         if category not in performance_data[base_job_name]:
             performance_data[base_job_name][category] = {}
-        performance_data[base_job_name][category][thread_count] = {
-            'throughput_k': throughput_k,
-            'lat_ms': latency_ms
-        }
+        if thread_count not in performance_data[base_job_name][category]:
+            performance_data[base_job_name][category][thread_count] = {
+                'throughput_k': [],
+                'lat_ms': []
+            }
+        performance_data[base_job_name][category][thread_count]['throughput_k'].append(throughput_k)
+        performance_data[base_job_name][category][thread_count]['lat_ms'].append(latency_ms)
     return performance_data
 
 def plot_latency_vs_throughput_per_job(performance_data, output_dir):
@@ -84,24 +93,42 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
     }
 
     for base_job_name in performance_data:
-        plt.figure(figsize=(5, 3))
+        plt.figure(figsize=(5, 2))
         ax = plt.gca()
         for category in performance_data[base_job_name]:
             throughputs = []
+            bottom_throughputs = []
+            top_throughputs = []
             latencies = []
+            bottom_latencies = []
+            top_latencies = []
             thread_counts = []
             for thread_count in sorted(performance_data[base_job_name][category].keys()):
                 metrics = performance_data[base_job_name][category][thread_count]
-                throughputs.append(metrics['throughput_k'])
-                latencies.append(metrics['lat_ms'])
+                repeated_throughputs = metrics['throughput_k']
+                repeated_latencies = metrics['lat_ms']
+                
+                avg_throughput = sum(repeated_throughputs) / len(repeated_throughputs)
+                throughputs.append(avg_throughput)
+                bottom_throughputs.append(min(repeated_throughputs))
+                top_throughputs.append(max(repeated_throughputs))
+
+                avg_latency = sum(repeated_latencies) / len(repeated_latencies)
+                latencies.append(avg_latency)
+                bottom_latencies.append(min(repeated_latencies))
+                top_latencies.append(max(repeated_latencies))
+
                 thread_counts.append(thread_count)
             label = f"{category}"
             ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=3, label=label)
+            ax.fill_betweenx(latencies, bottom_throughputs, top_throughputs, color = colors.get(category, 'black'), alpha=0.25)
+            # ax.fill_between(throughputs, bottom_latencies, top_latencies, color = colors.get(category, 'black'), alpha=0.25)
+            
             # Annotate each data point with the number of threads
             for i in range(len(throughputs)):
                 ax.annotate(f"{thread_counts[i]}", (throughputs[i], latencies[i]), textcoords="offset points", xytext=(0,-5), ha='center')
-        ax.set_xlabel('Throughput (thousands of commands/sec)')
-        ax.set_ylabel('Average Latency (ms)')
+        ax.set_xlabel('Throughput (thousands of ops/sec)')
+        ax.set_ylabel('Avg Latency (ms)')
         # ax.legend()
         ax.grid(True)
         # log for y axis
@@ -114,7 +141,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
         print(f"Saved latency vs throughput graph to {output_file}")
     
     # Save the legend
-    fig_leg = plt.figure(figsize=(len(markers)*2, 0.5))
+    fig_leg = plt.figure(figsize=(len(markers)*1.5, 0.3))
     ax_leg = fig_leg.add_subplot(111)
     # add the legend from the previous axes
     ax_leg.legend(*ax.get_legend_handles_labels(), loc='center', ncol=len(config_names))
@@ -123,12 +150,8 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
     fig_leg.savefig('../../../../results/graphs/fio_legend.pdf')
 
 def main():
-    # Directory where the FIO JSON results are stored
-    results_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'results', 'fio')
-
     # Read the FIO JSON results
-    results = read_fio_json_results(results_dir)
-
+    results = read_fio_json_results()
     if not results:
         print("No FIO JSON result files found in the directory.")
         return

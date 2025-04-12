@@ -38,8 +38,6 @@ python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --be
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_f 0
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_f 2
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_sync_mode sync
-python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_sync_mode async
-python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_only_replicate_checksums
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 614400
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 616774
 # Recovery
@@ -185,9 +183,8 @@ Host localvm
 #### Setting up the VM
 To avoid having to type your password on sudo, execute the following:
 ```bash
-sudo passwd -d davidchu
+sudo passwd -d <vm_username>
 ```
-Replace `davidchu` with your username.
 
 Install the necessary packages:
 ```bash
