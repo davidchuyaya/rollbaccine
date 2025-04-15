@@ -14,8 +14,8 @@ from utils import *
 BENCHMARK_TIMEOUT = 100
 # How often to check if the primary/backup are done recovering
 CHECK_FREQUENCY = 5
-PRIMARY_OUTFILE = "results/recovery/crash_primary_out.txt"
-BACKUP_OUTFILE = "results/recovery/crash_backup_out.txt"
+PRIMARY_OUTFILE = "results/crash_primary_out.txt"
+BACKUP_OUTFILE = "results/crash_backup_out.txt"
 
 # Exist on either timeout or recovery complete
 def log_primary_or_backup(ssh: SSHClient, is_primary: bool, timeout=0, exit_on_recovery_complete=False):
@@ -78,8 +78,10 @@ def run(recover_primary: bool):
     BENCHMARK_NAME = "postgres"
     SYSTEM = System.ROLLBACCINE
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system.")
-    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 2 -m 1 -e recoverPrimary{recover_primary}"])
-    ssh_executor = SSH(SYSTEM, BENCHMARK_NAME)
+
+    unique_str = f"recoverPrimary{recover_primary}"
+    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 2 -m 1 -e {unique_str}"])
+    ssh_executor = SSH(SYSTEM, BENCHMARK_NAME, unique_str)
 
     print("Connecting to VMs and setting up main VMs")
     print(f"\033[92mPlease run `tail -f {ssh_executor.output_file}` to see the execution log on the servers.\033[0m")
@@ -88,12 +90,12 @@ def run(recover_primary: bool):
     main_outfile = PRIMARY_OUTFILE if recover_primary else BACKUP_OUTFILE
     open(main_outfile, 'w').close()
     
-    with open(f'{BENCHMARK_NAME}-{SYSTEM}-vm1.json') as f:
+    with open(f'{BENCHMARK_NAME}-{SYSTEM}-{unique_str}-vm1.json') as f:
         vm_json = json.load(f)
         connections, public_ips, private_ips, ids = ssh_vm_json_plus(vm_json)
         primary_ssh, primary_public_ip, primary_ip, primary_id = connections[0], public_ips[0], private_ips[0], ids[0]
         backup_ssh, backup_public_ip, backup_ip, backup_id = connections[1], public_ips[1], private_ips[1], ids[1]
-    with open(f'{BENCHMARK_NAME}-{SYSTEM}-vm2.json') as f:
+    with open(f'{BENCHMARK_NAME}-{SYSTEM}-{unique_str}-vm2.json') as f:
         vm_json = json.load(f)
         connections, public_ips, private_ips, ids = ssh_vm_json_plus(vm_json)
         benchmark_ssh, benchmark_public_ip, benchmark_ip, benchmark_id = connections[0], public_ips[0], private_ips[0], ids[0]
@@ -107,7 +109,7 @@ def run(recover_primary: bool):
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 1 1 true abcdefghijklmnop 1 0 default 12340 false false 2" | sudo dmsetup create rollbaccine1',
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb) rollbaccine /dev/sdb 1 1 true abcdefghijklmnop 1 0 default 12340 false false 2" | sudo dmsetup create rollbaccine1',
     ])
     if not success:
         return False
@@ -117,7 +119,7 @@ def run(recover_primary: bool):
         "sudo umount /dev/sdb1",
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
-        f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 2 1 false abcdefghijklmnop 1 0 default 12350 false false 1 {primary_ip} 12340" | sudo dmsetup create rollbaccine2'
+        f'echo "0 $(sudo blockdev --getsz /dev/sdb) rollbaccine /dev/sdb 2 1 false abcdefghijklmnop 1 0 default 12350 false false 1 {primary_ip} 12340" | sudo dmsetup create rollbaccine2'
     ])
     if not success:
         return False
@@ -140,6 +142,7 @@ def run(recover_primary: bool):
         # Listens to public addresses
         r"echo 'listen_addresses = '\'*\' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
         # Fix out-of-memory error
+        "echo 'max_connections = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
         "echo 'max_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
         "echo 'max_pred_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
         # Trust all connections
@@ -214,16 +217,16 @@ def run(recover_primary: bool):
     print("Messing up the disk with 10 MB of zeros")
     success = ssh_executor.exec(main_ssh, [
         "sudo umount /dev/sdb1",
-        "sudo dd if=/dev/zero of=/dev/sdb1 bs=1M count=10"
+        "sudo dd if=/dev/zero of=/dev/sdb bs=1M count=10"
     ])
     if not success:
         return False
 
     print("Recovering")
     if recover_primary:
-        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 3 3 true abcdefghijklmnop 1 0 default 12360 false true 2 {backup_ip} 12350 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine1'
+        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb) rollbaccine /dev/sdb 3 3 true abcdefghijklmnop 1 0 default 12360 false true 2 {backup_ip} 12350 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine1'
     else:
-        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb1) rollbaccine /dev/sdb1 3 3 false abcdefghijklmnop 1 0 default 12360 false true 1 {primary_ip} 12340 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine2'
+        dm_command = f'echo "0 $(sudo blockdev --getsz /dev/sdb) rollbaccine /dev/sdb 3 3 false abcdefghijklmnop 1 0 default 12360 false true 1 {primary_ip} 12340 1 {primary_ip} 12340 2 {backup_ip} 12350" | sudo dmsetup create rollbaccine2'
     success = ssh_executor.exec(main_ssh, [
         "cd rollbaccine/src",
         "sudo insmod rollbaccine.ko",
@@ -258,7 +261,7 @@ def run(recover_primary: bool):
     primary_ssh.close()
     backup_ssh.close()
     benchmark_ssh.close()
-    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e recoverPrimary{recover_primary}"])
+    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e {unique_str}"])
 
 if __name__ == "__main__":
     # True = recover primary, False = recover backup

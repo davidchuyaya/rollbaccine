@@ -2821,7 +2821,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
         about_to_complete = hash_msg->start_page + hashes_to_copy >= num_pages - 1;
 
 #ifdef MEMORY_TRACKING
-        device->num_hashes_received_during_recovery += hashes_to_copy;
+        device->num_hashes_received_during_recovery += hashes_to_copy * SECTORS_PER_PAGE;
 #endif
     }
     kfree(hash_msg);
