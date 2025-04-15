@@ -66,20 +66,20 @@ plt.xticks([pos + bar_width * (len(config_names)-1) / 2 for pos in x], operation
 plt.tick_params(axis='y', left=False)
 plt.box(False)
 plt.tight_layout()
-plt.xlim(-0.1, len(operations) - 0.25)
+plt.xlim(-0.1, len(operations) - 0.15)
 plt.savefig("../../../../results/graphs/hdfs_throughput_comparison.pdf", bbox_inches='tight', pad_inches=0)
 plt.close()
 
 # Save the legend, including configs from postgres that are not used in this benchmark
-config_names = ["Unreplicated", "DM", "Replicated", "Rollbaccine", "Rollbaccine-sync", "Rollbaccine-f=0", "Rollbaccine-f=2", "Rollbaccine-L=1", "Rollbaccine-L=2", "NimbleHDFS-100-Mem", "NimbleHDFS-100", "NimbleHDFS-1-Mem", "NimbleHDFS-1"]
-colors = ['red', 'cyan', 'lime', 'orange', 'peru', 'gold', 'yellow', 'khaki', 'navajowhite', 'blue', 'lightsteelblue', 'purple', 'thistle']
-patterns = ['/', '\\', 'x', '*', '*/', '\\*', 'x*', '*-', '', 'o', '/o', '\\o', 'o-']
+config_names = ["Unreplicated", "DM", "Replicated", "Rollbaccine", "Rollbaccine-sync", "", "Rollbaccine-f=0", "Rollbaccine-f=2", "Rollbaccine-L=1", "Rollbaccine-L=2", "NimbleHDFS-100-Mem", "NimbleHDFS-100", "NimbleHDFS-1-Mem", "NimbleHDFS-1"]
+colors = ['red', 'cyan', 'lime', 'orange', 'peru', (0,0,0,0), 'gold', 'yellow', 'khaki', 'navajowhite', 'blue', 'lightsteelblue', 'purple', 'thistle']
+patterns = ['/', '\\', 'x', '*', '*/', '', '\\*', 'x*', '*-', '*.', 'o', '/o', '\\o', 'o-']
 
-fig_leg = plt.figure(figsize=(len(config_names)*0.75, 1))
+fig_leg = plt.figure(figsize=(len(config_names)*0.75, 0.75))
 ax_leg = fig_leg.add_subplot(111)
 patches = [Patch(facecolor=color, label=label, hatch=pattern) for label, color, pattern in zip(config_names, colors, patterns)]
 # add the legend from the previous axes
-ax_leg.legend(patches, config_names, loc='center', ncol=len(config_names)/4 + 1)
+ax_leg.legend(patches, config_names, loc='center', ncol=len(config_names)/2)
 # hide the axes frame and the x/y labels
 ax_leg.axis('off')
 fig_leg.savefig('../../../../results/graphs/bar_graphs_legend.pdf', bbox_inches='tight', pad_inches=0)

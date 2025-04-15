@@ -52,7 +52,7 @@ def extract_data():
 # plot bar graphs
 def plot_bar_graph(avg, bottom, top, graph_title, performance_metric, filename):
     colors = ['red', 'cyan', 'lime', 'orange', 'peru', 'gold', 'yellow', 'khaki', 'navajowhite']  # Different colors for configurations
-    patterns = ['/', '\\', 'x', '*', '*/', '\\*', 'x*', '*-', '']  # Different patterns for configurations
+    patterns = ['/', '\\', 'x', '*', '*/', '\\*', 'x*', '*-', '*.']  # Different patterns for configurations
     plt.figure(figsize=(3, 2))
     plt.grid(axis='y', linestyle='-', alpha=0.3, zorder=0)
     plt.bar_label(plt.bar(configs, avg, yerr=(bottom, top), color=colors[:len(configs)], hatch=patterns[:len(configs)], width=1.0, zorder=5), avg, zorder=10, rotation=90)
