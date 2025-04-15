@@ -2845,6 +2845,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
         bio_data->start_sector = page * SECTORS_PER_PAGE;
         bio_data->end_sector = bio_data->start_sector + SECTORS_PER_PAGE;
         alloc_bio_checksum(device, bio_data);
+        memcpy(bio_data->checksum, device->merkle_tree_root + page * AES_GCM_AUTH_SIZE, AES_GCM_AUTH_SIZE);
         bio->bi_private = bio_data;
 
         bio_data->shallow_clone = shallow_bio_clone(device, bio);
