@@ -1628,7 +1628,7 @@ bool handle_disk_sector(struct rollbaccine_device *device, struct socket_data *s
 
     // Fill local checksum just for the VERIFY function
     // We can't use DECRYPT here because it decrypts in place, so we end up writing plaintext to disk
-    memcpy(checksum, device->merkle_tree_root + sector / SECTORS_PER_PAGE, AES_GCM_AUTH_SIZE);
+    memcpy(checksum, device->merkle_tree_root + (sector / SECTORS_PER_PAGE) * AES_GCM_AUTH_SIZE, AES_GCM_AUTH_SIZE);
     error = enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
     bio_data->checksum = NULL;
     if (error != 0) {
