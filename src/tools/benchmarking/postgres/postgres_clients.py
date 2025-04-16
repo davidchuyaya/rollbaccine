@@ -11,6 +11,12 @@ configs = ["UNREPLICATED_normal", "DM_normal", "REPLICATED_normal",
  "ROLLBACCINE_0_0_default_False", "ROLLBACCINE_2_0_default_False", # Different f
  "ROLLBACCINE_1_614400_default_False", "ROLLBACCINE_1_616774_default_False", # Different merkle tree heights
 ]
+config_pretty = [
+    "Unreplicated", "DM", "Replicated",
+    "Rollbaccine", "Rollbaccine-sync", 
+    "Rollbaccine-f=0", "Rollbaccine-f=2",
+    "Rollbaccine-L=1", "Rollbaccine-L=2"
+]
 
 def throughputs_latencies():
     avg_throughputs = dict()
@@ -60,9 +66,10 @@ def throughputs_latencies():
     return avg_throughputs, bottom_throughputs, top_throughputs, avg_latencies, bottom_latencies, top_latencies
 
 def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs, latencies, bottom_latencies, top_latencies):
-    colors = ['red', 'cyan', 'lime', 'orange', 'peru', 'gold', 'yellow', 'khaki', 'navajowhite']  # Different colors for configurations
+    colors = ['red', 'cyan', 'lime', 'orange', 'saddlebrown', 'peru', 'gold', 'khaki', 'navajowhite']  # Different colors for configurations
+    markers = ['^', 's', 'o', 'd', '$s$', '$f=0$', '$f=2$', '$L=1$', '$L=2$']  # Different markers for configurations
 
-    plt.figure(figsize=(5, 5))
+    plt.figure(figsize=(5, 4.2))
     ax = plt.gca()
     for i, config in enumerate(configs):
         cat_throughputs = []
@@ -77,14 +84,15 @@ def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs,
             sorted_top_throughputs.append(top_throughputs[config][num_clients])
 
             # Annotate each data point with the number of clients
-            ax.annotate(f"{num_clients}", (throughputs[config][num_clients], latencies[config][num_clients]), textcoords="offset points", xytext=(0,-5), ha='center')
+            # ax.annotate(f"{num_clients}", (throughputs[config][num_clients], latencies[config][num_clients]), textcoords="offset points", xytext=(0,-5), ha='center')
+        
+        markersize = 7 if i < 5 else 20
+        ax.plot(cat_throughputs, cat_latencies, label=config_pretty[i], marker=markers[i], markersize=markersize, color=colors[i], linestyle='-', linewidth=3)
+        # ax.fill_betweenx(cat_latencies, sorted_bottom_throughputs, sorted_top_throughputs, color=colors[i], alpha=0.25)
             
-        ax.plot(cat_throughputs, cat_latencies, marker=i, markersize=10, color=colors[i], linestyle='-', linewidth=3, label=config)
-        ax.fill_betweenx(cat_latencies, sorted_bottom_throughputs, sorted_top_throughputs, color=colors[i], alpha=0.25)
-            
-    ax.set_xlabel('Throughput (thousands of commands/sec)')
+    ax.set_xlabel('Throughput (ops/sec)')
     ax.set_ylabel('Average Latency (us)')
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.2), ncol=4)
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.3), ncol=3)
     ax.grid(True)
     plt.tight_layout()
     # Save the figure

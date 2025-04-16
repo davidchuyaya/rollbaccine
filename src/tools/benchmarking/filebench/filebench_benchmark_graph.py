@@ -75,7 +75,7 @@ for benchmark in benchmarks:
             plt.bar_label(plt.bar(
                 [pos + i * bar_width for pos in x],
                 df[config],
-                yerr=(bottom[config], top[config]),
+                # yerr=(bottom[config], top[config]),
                 width=bar_width,
                 label=config,
                 color=colors[i % len(colors)],

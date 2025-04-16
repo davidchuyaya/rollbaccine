@@ -79,6 +79,12 @@ def extract_performance_data(results):
 
 def plot_latency_vs_throughput_per_job(performance_data, output_dir):
     config_names = ["UNREPLICATED", "DM", "REPLICATED", "ROLLBACCINE"]
+    config_pretty = {
+        "UNREPLICATED": "Unreplicated",
+        "DM": "DM",
+        "REPLICATED": "Replicated",
+        "ROLLBACCINE": "Rollbaccine"
+    }
     markers = {
         'DM': 'o',
         'UNREPLICATED': '^',
@@ -119,8 +125,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
                 top_latencies.append(max(repeated_latencies))
 
                 thread_counts.append(thread_count)
-            label = f"{category}"
-            ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=3, label=label)
+            ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=3, label=config_pretty[category])
             # ax.fill_betweenx(latencies, bottom_throughputs, top_throughputs, color = colors.get(category, 'black'), alpha=0.25)
             # ax.fill_between(throughputs, bottom_latencies, top_latencies, color = colors.get(category, 'black'), alpha=0.25)
             

@@ -52,7 +52,7 @@ python3 plot_fio_results.py
 cd ../hdfs
 python3 hdfs_benchmark_graph.py
 cd ../postgres
-python3 postgres_benchmark_graph.py
+python3 postgres_clients.py
 cd ../filebench
 python3 filebench_benchmark_graph.py
 cd ../recovery
