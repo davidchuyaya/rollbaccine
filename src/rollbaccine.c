@@ -2756,7 +2756,7 @@ bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *mult
 
         // Copy hashes into the message
         hashes_to_send = min(num_pages - page, ROLLBACCINE_HASHES_PER_MSG);
-        memcpy(hash_msg->checksums, device->merkle_tree_root + page, hashes_to_send * AES_GCM_AUTH_SIZE);
+        memcpy(hash_msg->checksums, device->merkle_tree_root + page * AES_GCM_AUTH_SIZE, hashes_to_send * AES_GCM_AUTH_SIZE);
         page += hashes_to_send;
         
         hash_buffer(socket_data, (char *)hash_msg + SHA256_SIZE, sizeof(struct hash_msg) - SHA256_SIZE, hash_msg->msg_hash);
@@ -2817,7 +2817,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
 
         // Copy hashes into the global checksum
         hashes_to_copy = min(num_pages - hash_msg->start_page, ROLLBACCINE_HASHES_PER_MSG);
-        memcpy(device->merkle_tree_root + hash_msg->start_page, hash_msg->checksums, hashes_to_copy * AES_GCM_AUTH_SIZE);
+        memcpy(device->merkle_tree_root + hash_msg->start_page * AES_GCM_AUTH_SIZE, hash_msg->checksums, hashes_to_copy * AES_GCM_AUTH_SIZE);
         about_to_complete = hash_msg->start_page + hashes_to_copy >= num_pages - 1;
 
 #ifdef MEMORY_TRACKING
