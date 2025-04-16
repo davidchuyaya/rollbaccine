@@ -51,15 +51,14 @@ class PostgresBenchmark(Benchmark):
 
         # Install Benchbase on the benchmarking VM
         benchbase = connections[self.benchmarking_vm()]
-        if not is_installed(benchbase, "test -d benchbase-2023 && echo 1"):
+        if not is_installed(benchbase, "test -d benchbase && echo 1"):
             print("Installing Benchbase on benchmarking VM, may also take a few minutes")
             success = ssh_executor.exec(benchbase, [
-                "wget -nv https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz",
-                "tar -xzf v2023.tar.gz",
+                "git clone --depth 1 https://github.com/davidchuyaya/benchbase",
                 # Install Java
                 "sudo apt-get -qq update",
                 "sudo apt-get -y -qq install openjdk-21-jre",
-                "cd benchbase-2023",
+                "cd benchbase",
                 "./mvnw -q clean package -P postgres -DskipTests",
                 "cd target",
                 "tar xzf benchbase-postgres.tgz"
@@ -68,7 +67,7 @@ class PostgresBenchmark(Benchmark):
                 return False
             
             print("Copying config file to benchmarking VM")
-            REMOTE_CONFIG = "benchbase-2023/target/benchbase-postgres/config/tpcc_config.xml"
+            REMOTE_CONFIG = "benchbase/target/benchbase-postgres/config/tpcc_config.xml"
             upload(benchbase, "src/tools/benchmarking/postgres/tpcc_config.xml", REMOTE_CONFIG)
 
             print("Modifying config file")
@@ -80,18 +79,16 @@ class PostgresBenchmark(Benchmark):
     def run(self, system_type: System, mount_point: str, output_dir: str, extra_args: str):
         print("Running TPCC, may take a few minutes")
         for num_clients in range(20, 71, 10):
-            for i in range(0, NUM_REPETITIONS):
-                print(f"Round {i}")
-                success = subprocess_execute([
-                    "cd ~/benchbase-2023/target/benchbase-postgres",
-                    f"sed -i -E 's~<terminals>.*</terminals>~<terminals>{num_clients}</terminals>~g' config/tpcc_config.xml",
-                    f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {output_dir} --clear=true --create=true --load=true --execute=true"
-                ])
-                if success:
-                    print(f"TPCC benchmark completed successfully")
-                else:
-                    print(f"TPCC benchmark failed")
-                    sys.exit(1)
+            success = subprocess_execute([
+                "cd ~/benchbase/target/benchbase-postgres",
+                f"sed -i -E 's~<terminals>.*</terminals>~<terminals>{num_clients}</terminals>~g' config/tpcc_config.xml",
+                f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {output_dir} --clear=true --create=true --load=true --execute=true"
+            ])
+            if success:
+                print(f"TPCC benchmark completed successfully for {num_clients} clients")
+            else:
+                print(f"TPCC benchmark failed")
+                sys.exit(1)
 
         # Remove everything from the output_dir except summary.json, and rename summary.json
         success = subprocess_execute([
