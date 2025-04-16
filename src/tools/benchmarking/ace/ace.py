@@ -20,14 +20,15 @@ def run():
     BENCHMARK_NAME = "fio"
     SYSTEM = System.UNREPLICATED
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system, because we just want a single VM.")
-    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 1 -m 0 -e ace"])
-    ssh_executor = SSH(SYSTEM, BENCHMARK_NAME)
+    unique_str = "ace"
+    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 1 -m 0 -e {unique_str}"])
+    ssh_executor = SSH(SYSTEM, BENCHMARK_NAME, unique_str)
 
     print("Connecting to VMs and setting up main VMs")
     print(f"\033[92mPlease run `tail -f {ssh_executor.output_file}` to see the execution log on the servers.\033[0m")
     ssh_executor.clear_output_file()
     
-    with open(f'{BENCHMARK_NAME}-{SYSTEM}-vm1.json') as f:
+    with open(f'{BENCHMARK_NAME}-{SYSTEM}-{unique_str}-vm1.json') as f:
         vm_json = json.load(f)
         connections, private_ips = ssh_vm_json(vm_json)
         ssh = connections[0]
@@ -71,17 +72,18 @@ def run():
         libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
         uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 \
         libgdbm-compat-dev xfsdump xfslibs-dev exfatprogs",
-        "git clone -q git://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git",
-        "cd xfstests-dev",
-        "make --silent",
-        "sudo make --silent install"
+        "wget -nv https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git/snapshot/xfstests-dev-2024.12.08.tar.gz",
+        "tar xzf xfstests-dev-2024.12.08.tar.gz",
+        "cd xfstests-dev-2024.12.08",
+        "make -j16 --silent",
+        "sudo make -j16 --silent install"
     ])
     if not success:
         return False
     
     print("Setting up xfstests")
     success = ssh_executor.exec(ssh, [
-        "cd xfstests-dev/tests",
+        "cd xfstests-dev-2024.12.08/tests",
         "wget -nv https://github.com/davidchuyaya/crashmonkey/releases/download/rollbaccine/seq1_nested.tar.gz",
         "tar -xzf seq1_nested.tar.gz",
         "cd ..",
@@ -94,18 +96,18 @@ def run():
     OUTPUT_DIR = f"/home/{getuser()}/results"
     success = ssh_executor.exec(ssh, [
         f"mkdir -p {OUTPUT_DIR}",
-        "cd xfstests-dev",
+        "cd xfstests-dev-2024.12.08",
         f"sudo ./check -g seq1_nested/auto 2>&1 | tee {OUTPUT_DIR}/xfstests.txt"
     ])
     if not success:
         return False
 
     print("Downloading results")
-    download_dir(ssh, OUTPUT_DIR, ".")
+    download_dir(ssh, OUTPUT_DIR, "results")
     ssh.close()
 
     print("Benchmark completed, deleting resources")
-    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e ace"])
+    subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e {unique_str}"])
 
 if __name__ == "__main__":
     run()
