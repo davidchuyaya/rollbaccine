@@ -146,8 +146,6 @@ class FioBenchmark(Benchmark):
                 # ('write', 'rand', 0, 1, 16),
                 # ('write', 'rand', 0, 1, 32),
                 ('write', 'rand', 0, 1, 64),
-                ('write', 'rand', 0, 1, 128),
-                ('write', 'rand', 0, 1, 256),
                 # Rand write, fsync, direct
                 # ('write', 'rand', 1, 1, 1),
                 # ('write', 'rand', 1, 1, 4),
@@ -162,7 +160,6 @@ class FioBenchmark(Benchmark):
                 # ('write', '', 0, 1, 16),
                 ('write', '', 0, 1, 32),
                 ('write', '', 0, 1, 64),
-                ('write', '', 0, 1, 128),
                 # Write, fsync, direct
                 # ('write', '', 1, 1, 1),
                 # ('write', '', 1, 1, 4),
