@@ -18,19 +18,17 @@
     <terminals>50</terminals>
     <works>
         <work>
-            <warmup>30</warmup>
+            <warmup>90</warmup>
             <time>60</time>
             <rate>10000</rate>
             <weights>45,43,4,4,4</weights>
         </work>
         <work>
-            <warmup>30</warmup>
             <time>60</time>
             <rate>10000</rate>
             <weights>45,43,4,4,4</weights>
         </work>
         <work>
-            <warmup>30</warmup>
             <time>60</time>
             <rate>10000</rate>
             <weights>45,43,4,4,4</weights>
