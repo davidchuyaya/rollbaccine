@@ -8,9 +8,9 @@ Rollbaccine will:
 
 ## Evaluation
 
-Set up your Azure account by following instructions [here](#running-on-azure). You will have to modify `launch.sh` to use your own Azure subscription ID, which must be able to launch Standard_DC16ads_v5 machines in North Europe Zone 3.
+Set up your Azure account by following instructions [here](#running-on-azure). You will have to modify `launch.sh` to use your own Azure subscription ID, which must be able to launch Standard_DC16ads_v5 and Standard_DC16as_v5 machines in North Europe Zone 3.
 
-Here is the full list of commands to evaluate each benchmark. Be mindful of your quota limits per region, which may affect whether you are able to launch the VMs necessary. Most experiments only use 1-2 VMs; Nimble HDFS uses 5, each with 16 cores, so that's 80 vCPUs. I suggest running at most 2 experiments concurrently. Each experiment should take at most 2 hours, so be prepared to allocate a day or two.
+Here is the full list of commands to evaluate each benchmark. Be mindful of your quota limits per region, which may affect whether you are able to launch the VMs necessary. Most experiments only use 1-2 VMs; Nimble HDFS uses 4, each with 16 cores, so that's 80 vCPUs. I suggest running at most 2 experiments concurrently. Each experiment should take at most 4 hours, so be prepared to allocate a day or two.
 
 ```bash
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name fio
@@ -45,7 +45,7 @@ python3 src/tools/benchmarking/recovery/recovery.py True
 python3 src/tools/benchmarking/recovery/recovery.py False
 ```
 
-Each experiment, upon completion, will download files to the root directory (except for `recovery`, which directly puts the files in `results/recovery`). Move the files to the `results` folder under the right benchmark name (`nimble_hdfs` is put in `hdfs`), then run the following command to generate the graphs:
+Each experiment, upon completion, will download files to `results`. Run the following command to generate the graphs:
 ```bash
 cd src/tools/benchmarking/fio
 python3 plot_fio_results.py
@@ -58,7 +58,7 @@ python3 filebench_benchmark_graph.py
 cd ../recovery
 python3 recovery_benchmark_graph.py
 ```
-Graphs will be generated in `results/graphs`.
+Graphs will be generated in `graphs`.
 
 ## Development setup
 
