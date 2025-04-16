@@ -11,71 +11,321 @@ from benchmark import *
 from utils import *
 
 class FioBenchmark(Benchmark):
-    def discard_fio_command(self, system_type, io_direction, sequentiality, direct, fsync, num_jobs):
-        """
-        Returns which fio commands should be discarded based on the system config, in order to saturate individual configs (or stop after we've saturated)
-        """
-        if system_type == System.REPLICATED:
-            return False
-        if system_type == System.DM:
-            if io_direction == 'write':
-                if sequentiality == 'rand':
-                    if direct == 0:
-                        if fsync == 1:
-                            if num_jobs > 4:
-                                return True
-                    else: # direct = 1
-                        if num_jobs > 4:
-                            return True
-                else: # sequential
-                    if direct == 1 and fsync == 0:
-                        if num_jobs > 4:
-                            return True
-        if sequentiality == 'rand' and io_direction == 'write' and direct == 0 and fsync == 0 and num_jobs > 4:
-            return True
-        if sequentiality == '' and io_direction == 'read' and direct == 0 and fsync == 0 and num_jobs > 6:
-            return True
-        return False
+    def get_fio_commands(self, system_type: System):
+        if system_type == System.UNREPLICATED:
+            return [
+                # Rand read, buffered
+                ('read', 'rand', 0, 0, 1),
+                ('read', 'rand', 0, 0, 4),
+                ('read', 'rand', 0, 0, 8),
+                ('read', 'rand', 0, 0, 16),
+                ('read', 'rand', 0, 0, 32),
+                # Rand read, direct
+                ('read', 'rand', 1, 0, 1),
+                ('read', 'rand', 1, 0, 4),
+                ('read', 'rand', 1, 0, 8),
+                ('read', 'rand', 1, 0, 16),
+                ('read', 'rand', 1, 0, 32),
+                # Read, buffered
+                ('read', '', 0, 0, 1),
+                ('read', '', 0, 0, 4),
+                ('read', '', 0, 0, 6),
+                # Read, direct
+                ('read', '', 1, 0, 1),
+                ('read', '', 1, 0, 4),
+                ('read', '', 1, 0, 8),
+                ('read', '', 1, 0, 16),
+                ('read', '', 1, 0, 32),
+                # Rand write, buffered
+                ('write', 'rand', 0, 0, 1),
+                ('write', 'rand', 0, 0, 4),
+                # Rand write, direct
+                ('write', 'rand', 1, 0, 1),
+                ('write', 'rand', 1, 0, 4),
+                ('write', 'rand', 1, 0, 8),
+                ('write', 'rand', 1, 0, 16),
+                ('write', 'rand', 1, 0, 32),
+                # Write, buffered
+                ('write', '', 0, 0, 1),
+                ('write', '', 0, 0, 4),
+                ('write', '', 0, 0, 8),
+                ('write', '', 0, 0, 16),
+                ('write', '', 0, 0, 32),
+                ('write', '', 0, 0, 64),
+                ('write', '', 0, 0, 128),
+                # Write, direct
+                ('write', '', 1, 0, 1),
+                ('write', '', 1, 0, 4),
+                ('write', '', 1, 0, 8),
+                ('write', '', 1, 0, 16),
+                ('write', '', 1, 0, 32),
+                # Rand write, fsync, buffered
+                ('write', 'rand', 0, 1, 1),
+                ('write', 'rand', 0, 1, 4),
+                ('write', 'rand', 0, 1, 8),
+                ('write', 'rand', 0, 1, 16),
+                ('write', 'rand', 0, 1, 32),
+                # Rand write, fsync, direct
+                ('write', 'rand', 1, 1, 1),
+                ('write', 'rand', 1, 1, 4),
+                ('write', 'rand', 1, 1, 8),
+                ('write', 'rand', 1, 1, 16),
+                ('write', 'rand', 1, 1, 32),
+                # Write, fsync, buffered
+                ('write', '', 0, 1, 1),
+                ('write', '', 0, 1, 4),
+                ('write', '', 0, 1, 8),
+                ('write', '', 0, 1, 16),
+                # Write, fsync, direct
+                ('write', '', 1, 1, 1),
+                ('write', '', 1, 1, 4),
+                ('write', '', 1, 1, 8),
+                ('write', '', 1, 1, 16),
+                ('write', '', 1, 1, 32),
+            ]
+        elif system_type == System.REPLICATED:
+            return [
+                # Rand read, buffered
+                # ('read', 'rand', 0, 0, 1),
+                # ('read', 'rand', 0, 0, 4),
+                # ('read', 'rand', 0, 0, 8),
+                # ('read', 'rand', 0, 0, 16),
+                ('read', 'rand', 0, 0, 32),
+                ('read', 'rand', 0, 0, 64),
+                # Rand read, direct
+                # ('read', 'rand', 1, 0, 1),
+                # ('read', 'rand', 1, 0, 4),
+                # ('read', 'rand', 1, 0, 8),
+                # ('read', 'rand', 1, 0, 16),
+                ('read', 'rand', 1, 0, 32),
+                ('read', 'rand', 1, 0, 64),
+                # Read, buffered
+                # ('read', '', 0, 0, 1),
+                # ('read', '', 0, 0, 4),
+                # ('read', '', 0, 0, 8),
+                # Read, direct
+                # ('read', 'rand', 0, 0, 1),
+                # ('read', 'rand', 0, 0, 4),
+                # ('read', 'rand', 0, 0, 8),
+                ('read', 'rand', 0, 0, 16),
+                ('read', 'rand', 0, 0, 32),
+                ('read', 'rand', 0, 0, 64),
+                # Rand write, buffered
+                # ('write', 'rand', 0, 0, 1),
+                # ('write', 'rand', 0, 0, 4),
+                # ('write', 'rand', 0, 0, 8),
+                # Rand write, direct
+                # ('write', 'rand', 1, 0, 1),
+                # ('write', 'rand', 1, 0, 4),
+                # ('write', 'rand', 1, 0, 8),
+                ('write', 'rand', 1, 0, 16),
+                ('write', 'rand', 1, 0, 32),
+                ('write', 'rand', 1, 0, 64),
+                # Write, buffered
+                # ('write', '', 0, 0, 1),
+                # ('write', '', 0, 0, 4),
+                # ('write', '', 0, 0, 8),
+                # ('write', '', 0, 0, 16),
+                ('write', '', 0, 0, 32),
+                ('write', '', 0, 0, 64),
+                # Write, direct
+                # ('write', '', 1, 0, 1),
+                # ('write', '', 1, 0, 4),
+                # ('write', '', 1, 0, 8),
+                ('write', '', 1, 0, 16),
+                ('write', '', 1, 0, 32),
+                # Rand write, fsync, buffered
+                # ('write', 'rand', 0, 1, 1),
+                # ('write', 'rand', 0, 1, 4),
+                # ('write', 'rand', 0, 1, 8),
+                # ('write', 'rand', 0, 1, 16),
+                ('write', 'rand', 0, 1, 32),
+                # Rand write, fsync, direct
+                # ('write', 'rand', 1, 1, 1),
+                # ('write', 'rand', 1, 1, 4),
+                # ('write', 'rand', 1, 1, 8),
+                # ('write', 'rand', 1, 1, 16),
+                ('write', 'rand', 1, 1, 32),
+                ('write', 'rand', 1, 1, 64),
+                # Write, fsync, buffered
+                # ('write', '', 0, 1, 1),
+                # ('write', '', 0, 1, 4),
+                # ('write', '', 0, 1, 8),
+                # Write, fsync, direct
+                # ('write', '', 1, 1, 1),
+                # ('write', '', 1, 1, 4),
+                # ('write', '', 1, 1, 8),
+                # ('write', '', 1, 1, 16),
+                ('write', '', 1, 1, 32),
+                ('write', '', 1, 1, 64),
+            ]
+        elif system_type == System.DM:
+            return [
+                # Rand read, buffered
+                # ('read', 'rand', 0, 0, 1),
+                # ('read', 'rand', 0, 0, 4),
+                # ('read', 'rand', 0, 0, 8),
+                # ('read', 'rand', 0, 0, 16),
+                # ('read', 'rand', 0, 0, 32),
+                # Rand read, direct
+                # ('read', 'rand', 1, 0, 1),
+                # ('read', 'rand', 1, 0, 4),
+                # ('read', 'rand', 1, 0, 8),
+                # ('read', 'rand', 1, 0, 16),
+                # ('read', 'rand', 1, 0, 32),
+                # Read, buffered
+                # ('read', '', 0, 0, 1),
+                # ('read', '', 0, 0, 4),
+                # ('read', '', 0, 0, 6),
+                # Read, direct
+                # ('read', '', 1, 0, 1),
+                # ('read', '', 1, 0, 4),
+                # ('read', '', 1, 0, 8),
+                # ('read', '', 1, 0, 16),
+                # ('read', '', 1, 0, 32),
+                ('read', '', 1, 0, 64),
+                # Rand write, buffered
+                # ('write', 'rand', 0, 0, 1),
+                # ('write', 'rand', 0, 0, 4),
+                # Rand write, direct
+                # ('write', 'rand', 1, 0, 1),
+                # ('write', 'rand', 1, 0, 4),
+                # Write, buffered
+                # ('write', '', 0, 0, 1),
+                # ('write', '', 0, 0, 4),
+                # ('write', '', 0, 0, 8),
+                # ('write', '', 0, 0, 16),
+                # ('write', '', 0, 0, 32),
+                ('write', '', 0, 0, 64),
+                ('write', '', 0, 0, 128),
+                # Write, direct
+                # ('write', '', 1, 0, 1),
+                # ('write', '', 1, 0, 4),
+                # Rand write, fsync, buffered
+                # ('write', 'rand', 0, 1, 1),
+                # ('write', 'rand', 0, 1, 4),
+                # Rand write, fsync, direct
+                # ('write', 'rand', 1, 1, 1),
+                # ('write', 'rand', 1, 1, 4),
+                # Write, fsync, buffered
+                # ('write', '', 0, 1, 1),
+                # ('write', '', 0, 1, 4),
+                # ('write', '', 0, 1, 8),
+                # ('write', '', 0, 1, 16),
+                # ('write', '', 0, 1, 32),
+                # ('write', '', 0, 1, 64),
+                # ('write', '', 0, 1, 128),
+                # ('write', '', 0, 1, 256),
+                # ('write', '', 0, 1, 512),
+                # ('write', '', 0, 1, 1024),
+                # ('write', '', 0, 1, 2048),
+                # Write, fsync, direct
+                # ('write', '', 1, 1, 1),
+                # ('write', '', 1, 1, 4),
+                # ('write', '', 1, 1, 8),
+                # ('write', '', 1, 1, 16),
+                # ('write', '', 1, 1, 32),
+                # ('write', '', 1, 1, 64),
+                # ('write', '', 1, 1, 128),
+                # ('write', '', 1, 1, 256),
+                # ('write', '', 1, 1, 512),
+                # ('write', '', 1, 1, 1024),
+            ]
+        elif system_type == System.ROLLBACCINE:
+            return [
+                # Rand read, buffered
+                # ('read', 'rand', 0, 0, 1),
+                # ('read', 'rand', 0, 0, 4),
+                # ('read', 'rand', 0, 0, 8),
+                # ('read', 'rand', 0, 0, 16),
+                # ('read', 'rand', 0, 0, 32),
+                # ('read', 'rand', 0, 0, 64),
+                # Rand read, direct
+                # ('read', 'rand', 1, 0, 1),
+                # ('read', 'rand', 1, 0, 4),
+                # ('read', 'rand', 1, 0, 8),
+                # ('read', 'rand', 1, 0, 16),
+                # ('read', 'rand', 1, 0, 32),
+                # ('read', 'rand', 1, 0, 64),
+                # Read, buffered
+                # ('read', '', 0, 0, 1),
+                # ('read', '', 0, 0, 4),
+                # ('read', '', 0, 0, 6),
+                # Read, direct
+                # ('read', '', 1, 0, 1),
+                # ('read', '', 1, 0, 4),
+                # ('read', '', 1, 0, 8),
+                # ('read', '', 1, 0, 16),
+                # ('read', '', 1, 0, 32),
+                # ('read', '', 1, 0, 64),
+                # Rand write, buffered
+                # ('write', 'rand', 0, 0, 1),
+                # ('write', 'rand', 0, 0, 4),
+                # Rand write, direct
+                # ('write', 'rand', 1, 0, 1),
+                # ('write', 'rand', 1, 0, 4),
+                # ('write', 'rand', 1, 0, 8),
+                # ('write', 'rand', 1, 0, 16),
+                # ('write', 'rand', 1, 0, 32),
+                ('write', 'rand', 1, 0, 64),
+                # Write, buffered
+                ('write', '', 0, 0, 1),
+                # ('write', '', 0, 0, 4),
+                # ('write', '', 0, 0, 8),
+                # ('write', '', 0, 0, 16),
+                # ('write', '', 0, 0, 32),
+                # ('write', '', 0, 0, 64),
+                # ('write', '', 0, 0, 128),
+                # ('write', '', 0, 0, 256),
+                # Write, direct
+                # ('write', '', 1, 0, 1),
+                # ('write', '', 1, 0, 4),
+                # ('write', '', 1, 0, 8),
+                # ('write', '', 1, 0, 16),
+                # ('write', '', 1, 0, 32),
+                ('write', '', 1, 0, 64),
+                # Rand write, fsync, buffered
+                # ('write', 'rand', 0, 1, 1),
+                # ('write', 'rand', 0, 1, 4),
+                # ('write', 'rand', 0, 1, 8),
+                # ('write', 'rand', 0, 1, 16),
+                # ('write', 'rand', 0, 1, 32),
+                ('write', 'rand', 0, 1, 64),
+                # Rand write, fsync, direct
+                # ('write', 'rand', 1, 1, 1),
+                # ('write', 'rand', 1, 1, 4),
+                # ('write', 'rand', 1, 1, 8),
+                # ('write', 'rand', 1, 1, 16),
+                # ('write', 'rand', 1, 1, 32),
+                # ('write', 'rand', 1, 1, 64),
+                # ('write', 'rand', 1, 1, 128),
+                ('write', 'rand', 1, 1, 256),
+                # Write, fsync, buffered
+                # ('write', '', 0, 1, 1),
+                # ('write', '', 0, 1, 4),
+                # ('write', '', 0, 1, 8),
+                # ('write', '', 0, 1, 16),
+                # ('write', '', 0, 1, 32),
+                ('write', '', 0, 1, 64),
+                # Write, fsync, direct
+                # ('write', '', 1, 1, 1),
+                # ('write', '', 1, 1, 4),
+                # ('write', '', 1, 1, 8),
+                # ('write', '', 1, 1, 16),
+                # ('write', '', 1, 1, 32),
+                # ('write', '', 1, 1, 64),
+                ('write', 'rand', 1, 1, 64),
+                ('write', 'rand', 1, 1, 128),
+                # ('write', 'rand', 1, 1, 256),
+            ]
+        else:
+            print(f"Unknown system type: {system_type}")
+            return []
+        
 
     def build_fio_commands(self, system_type: System, mount_point: str, output_dir: str, extra_args: str, iteration: int):
         filename = mount_point
-
-        # Possible values for each parameter. Most intense options first so we see errors early
-        io_directions = ['write', 'read']
-        sequentialities = ['', 'rand'] # Empty string means sequential
-        bufferings = [0, 1]  # direct=1 (Direct I/O) or direct=0 (Buffered I/O)
-        persistences = [0, 1]  # fsync=1 (Synchronous) or fsync=0 (Asynchronous)
-        num_jobs_list = [32, 16, 8, 4, 1]
-
-        # Replicated disk saturates very quickly, don't run too many jobs
-        if system_type == System.REPLICATED:
-            num_jobs_list = [16, 8, 1]
-
-        # Generate all permutations
-        all_combinations = list(itertools.product(io_directions, sequentialities, bufferings, persistences, num_jobs_list))
-        all_combinations = [combo for combo in all_combinations if not (combo[0] == 'read' and combo[3] == 1)]
-
-        fio_commands = []
-        # Add additional commands
-        if system_type == System.DM:
-            # DM sequential writes with fsync do very well, add more
-            all_combinations.insert(0, ('write', '', 0, 1, 256))
-            all_combinations.insert(0, ('write', '', 0, 1, 1024))
-            all_combinations.insert(0, ('write', '', 0, 1, 2048))
-            all_combinations.insert(0, ('write', '', 1, 1, 256))
-            all_combinations.insert(0, ('write', '', 1, 1, 1024))
-        if system_type == System.ROLLBACCINE:
-            all_combinations.insert(0, ('write', '', 0, 0, 256))
-            all_combinations.insert(0, ('write', '', 1, 1, 256))
-            all_combinations.insert(0, ('write', 'rand', 0, 1, 128))
-            all_combinations.insert(0, ('write', 'rand', 1, 1, 256))
-            all_combinations.insert(0, ('read', '', 1, 0, 64))
-            all_combinations.insert(0, ('read', 'rand', 0, 0, 64))
-            all_combinations.insert(0, ('read', 'rand', 1, 0, 64))
-        if system_type == System.UNREPLICATED or system_type == System.ROLLBACCINE:
-            all_combinations.insert(0, ('write', '', 0, 0, 64))
-            all_combinations.insert(0, ('write', '', 0, 0, 128))
-        all_combinations.insert(0, ('read', '', 0, 0, 6))
+        all_combinations = get_fio_commands(system_type)
 
         for io_direction, sequentiality, direct, fsync, num_jobs in all_combinations:
             # Don't execute certain commands
