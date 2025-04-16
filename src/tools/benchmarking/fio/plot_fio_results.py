@@ -121,7 +121,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
                 thread_counts.append(thread_count)
             label = f"{category}"
             ax.plot(throughputs, latencies, marker=markers.get(category, 'o'), markersize=10, color=colors.get(category, 'black'), linestyle='-', linewidth=3, label=label)
-            ax.fill_betweenx(latencies, bottom_throughputs, top_throughputs, color = colors.get(category, 'black'), alpha=0.25)
+            # ax.fill_betweenx(latencies, bottom_throughputs, top_throughputs, color = colors.get(category, 'black'), alpha=0.25)
             # ax.fill_between(throughputs, bottom_latencies, top_latencies, color = colors.get(category, 'black'), alpha=0.25)
             
             # Annotate each data point with the number of threads
@@ -147,7 +147,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
     ax_leg.legend(*ax.get_legend_handles_labels(), loc='center', ncol=len(config_names))
     # hide the axes frame and the x/y labels
     ax_leg.axis('off')
-    fig_leg.savefig('../../../../results/graphs/fio_legend.pdf')
+    fig_leg.savefig('../../../../graphs/fio_legend.pdf')
 
 def main():
     # Read the FIO JSON results

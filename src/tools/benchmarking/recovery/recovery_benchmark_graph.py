@@ -69,7 +69,7 @@ def plot_time_series(filename, times, throughputs, crash_start, hash_receive_sta
     plt.axvspan(hash_receive_end, disk_scan_end, ymin=0.06, ymax=0.96, color='lightgray')
     plt.box(False)
     plt.tight_layout()
-    plt.savefig(f"../../../../results/graphs/{filename}", bbox_inches='tight', pad_inches=0)
+    plt.savefig(f"../../../../graphs/{filename}", bbox_inches='tight', pad_inches=0)
 
 
 if __name__ == "__main__":

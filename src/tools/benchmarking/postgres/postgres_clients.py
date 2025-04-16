@@ -49,17 +49,17 @@ def throughputs_latencies():
         for num_clients in config_throughputs.keys():
             avg_throughput = int(sum(config_throughputs[num_clients]) / len(config_throughputs[num_clients]))
             avg_throughputs[config][num_clients] = avg_throughput
-            bottom_throughputs[config][num_clients] = avg_throughput - min(config_throughputs[num_clients])
-            top_throughputs[config][num_clients] = max(config_throughputs[num_clients]) - avg_throughput
+            bottom_throughputs[config][num_clients] = min(config_throughputs[num_clients])
+            top_throughputs[config][num_clients] = max(config_throughputs[num_clients])
 
             avg_latency = int(sum(config_latencies[num_clients]) / len(config_latencies[num_clients]))
             avg_latencies[config][num_clients] = avg_latency
-            bottom_latencies[config][num_clients] = avg_latency - min(config_latencies[num_clients])
-            top_latencies[config][num_clients] = max(config_latencies[num_clients]) - avg_latency
+            bottom_latencies[config][num_clients] = min(config_latencies[num_clients])
+            top_latencies[config][num_clients] = max(config_latencies[num_clients])
 
     return avg_throughputs, bottom_throughputs, top_throughputs, avg_latencies, bottom_latencies, top_latencies
 
-def plot_latency_vs_throughput(throughputs, latencies):
+def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs, latencies, bottom_latencies, top_latencies):
     colors = ['red', 'cyan', 'lime', 'orange', 'peru', 'gold', 'yellow', 'khaki', 'navajowhite']  # Different colors for configurations
 
     plt.figure(figsize=(5, 5))
@@ -67,12 +67,20 @@ def plot_latency_vs_throughput(throughputs, latencies):
     for i, config in enumerate(configs):
         cat_throughputs = []
         cat_latencies = []
+        sorted_bottom_throughputs = []
+        sorted_top_throughputs = []
+
         for num_clients in sorted(throughputs[config].keys()):
             cat_throughputs.append(throughputs[config][num_clients])
             cat_latencies.append(latencies[config][num_clients])
+            sorted_bottom_throughputs.append(bottom_throughputs[config][num_clients])
+            sorted_top_throughputs.append(top_throughputs[config][num_clients])
+
             # Annotate each data point with the number of clients
             ax.annotate(f"{num_clients}", (throughputs[config][num_clients], latencies[config][num_clients]), textcoords="offset points", xytext=(0,-5), ha='center')
+            
         ax.plot(cat_throughputs, cat_latencies, marker=i, markersize=10, color=colors[i], linestyle='-', linewidth=3, label=config)
+        ax.fill_betweenx(cat_latencies, sorted_bottom_throughputs, sorted_top_throughputs, color=colors[i], alpha=0.25)
             
     ax.set_xlabel('Throughput (thousands of commands/sec)')
     ax.set_ylabel('Average Latency (us)')
@@ -81,9 +89,8 @@ def plot_latency_vs_throughput(throughputs, latencies):
     plt.tight_layout()
     # Save the figure
     output_file = os.path.join(".", f'postgres_latency_vs_throughput.pdf')
-    plt.savefig(output_file, bbox_inches='tight', pad_inches=0)
+    plt.savefig(f"../../../../graphs/{output_file}", bbox_inches='tight', pad_inches=0)
     # plt.close()
-    print(f"Saved latency vs throughput graph to {output_file}")
 
 def main():
     avg_throughputs, bottom_throughputs, top_throughputs, avg_latencies, bottom_latencies, top_latencies = throughputs_latencies()
@@ -91,7 +98,11 @@ def main():
     # Plot Latency vs Throughput per job
     plot_latency_vs_throughput(
         avg_throughputs,
+        bottom_throughputs,
+        top_throughputs,
         avg_latencies,
+        bottom_latencies,
+        top_latencies
     )
 
 if __name__ == "__main__":

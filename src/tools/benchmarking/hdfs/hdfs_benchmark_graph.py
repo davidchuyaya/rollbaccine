@@ -82,4 +82,4 @@ patches = [Patch(facecolor=color, label=label, hatch=pattern) for label, color, 
 ax_leg.legend(patches, config_names, loc='center', ncol=len(config_names)/2)
 # hide the axes frame and the x/y labels
 ax_leg.axis('off')
-fig_leg.savefig('../../../../results/graphs/bar_graphs_legend.pdf', bbox_inches='tight', pad_inches=0)
+fig_leg.savefig('../../../../graphs/bar_graphs_legend.pdf', bbox_inches='tight', pad_inches=0)
