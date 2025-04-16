@@ -78,7 +78,7 @@ class PostgresBenchmark(Benchmark):
 
     def run(self, system_type: System, mount_point: str, output_dir: str, extra_args: str):
         print("Running TPCC, may take a few minutes")
-        for num_clients in range(20, 71, 10):
+        for num_clients in range(20, 51, 10):
             success = subprocess_execute([
                 "cd ~/benchbase/target/benchbase-postgres",
                 f"sed -i -E 's~<terminals>.*</terminals>~<terminals>{num_clients}</terminals>~g' config/tpcc_config.xml",
