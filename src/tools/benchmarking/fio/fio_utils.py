@@ -326,6 +326,7 @@ class FioBenchmark(Benchmark):
     def build_fio_commands(self, system_type: System, mount_point: str, output_dir: str, extra_args: str, iteration: int):
         filename = mount_point
         all_combinations = self.get_fio_commands(system_type)
+        fio_commands = []
 
         for io_direction, sequentiality, direct, fsync, num_jobs in all_combinations:
             rw = sequentiality + io_direction
