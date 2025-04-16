@@ -214,10 +214,10 @@ def run(recover_primary: bool):
     with open(main_outfile, "a") as stdout_file:
         stdout_file.write(f"Recovery time: {end - start}\n")
 
-    print("Messing up the disk with 10 MB of zeros")
+    print("Messing up the disk with 100 MB of zeros")
     success = ssh_executor.exec(main_ssh, [
         "sudo umount /dev/sdb1",
-        "sudo dd if=/dev/zero of=/dev/sdb bs=1M count=10"
+        "sudo dd if=/dev/zero of=/dev/sdb bs=1M count=100"
     ])
     if not success:
         return False

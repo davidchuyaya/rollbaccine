@@ -23,7 +23,7 @@ def extract_data(filename: str):
     start_time = 0
     curr_time = 0
     prev_write_index = -1
-    with open(f"../../../../results/recovery/{filename}", 'r') as file:
+    with open(f"../../../../results/{filename}", 'r') as file:
         for line in file:
             line = line.strip()
 
@@ -45,7 +45,7 @@ def extract_data(filename: str):
                 throughputs.append(0)
                 crash_start = curr_time
                 mode = Mode.RECEIVING_HASHES
-            elif "Hashes received during recovery: 1258287104, total sectors: 1258287104" in line and hash_receive_end == 0:
+            elif "Hashes received during recovery: 1258291200, total sectors: 1258291200" in line and hash_receive_end == 0:
                 hash_receive_end = curr_time
                 mode = Mode.SCANNING_DISK
             elif "ballot 3, seen_ballot: 3" in line and disk_scan_end == 0:
