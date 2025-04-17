@@ -135,7 +135,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
         ax.set_xlabel('Throughput (thousands of ops/sec)')
         ax.set_ylabel('Avg Latency (ms)')
         # ax.legend()
-        ax.grid(True)
+        ax.grid(linestyle='-', alpha=0.3, zorder=0)
         # log for y axis
         ax.set_yscale('log')
         plt.tight_layout()
@@ -168,7 +168,7 @@ def main():
         print(f"{job_name}: {data}")
 
     # Create an output directory for graphs
-    output_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'results', 'graphs')
+    output_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'graphs')
     os.makedirs(output_dir, exist_ok=True)
 
     # Plot Latency vs Throughput per job

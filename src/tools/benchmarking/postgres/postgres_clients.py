@@ -66,8 +66,8 @@ def throughputs_latencies():
     return avg_throughputs, bottom_throughputs, top_throughputs, avg_latencies, bottom_latencies, top_latencies
 
 def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs, latencies, bottom_latencies, top_latencies):
-    colors = ['red', 'cyan', 'lime', 'orange', 'saddlebrown', 'peru', 'gold', 'khaki', 'navajowhite']  # Different colors for configurations
-    markers = ['^', 's', 'o', 'd', '$s$', '$f=0$', '$f=2$', '$L=1$', '$L=2$']  # Different markers for configurations
+    colors = ['red', 'cyan', 'lime', 'orange', 'saddlebrown', 'chocolate', 'peru', 'gold', 'darkkhaki', 'olive']  # Different colors for configurations
+    markers = ['^', 's', 'o', 'd', '$s$', 'p', 'H', 'P', 'X']  # Different markers for configurations
 
     plt.figure(figsize=(5, 4.2))
     ax = plt.gca()
@@ -87,7 +87,7 @@ def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs,
             # ax.annotate(f"{num_clients}", (throughputs[config][num_clients], latencies[config][num_clients]), textcoords="offset points", xytext=(0,-5), ha='center')
         
         markersize = 7 if i < 5 else 20
-        ax.plot(cat_throughputs, cat_latencies, label=config_pretty[i], marker=markers[i], markersize=markersize, color=colors[i], linestyle='-', linewidth=3)
+        ax.plot(cat_throughputs, cat_latencies, label=config_pretty[i], marker=markers[i], markersize=7, color=colors[i], linestyle='-', linewidth=2)
         # ax.fill_betweenx(cat_latencies, sorted_bottom_throughputs, sorted_top_throughputs, color=colors[i], alpha=0.25)
             
     ax.set_xlabel('Throughput (ops/sec)')
@@ -95,6 +95,7 @@ def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs,
     ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.3), ncol=3)
     ax.grid(True)
     plt.tight_layout()
+    plt.grid(linestyle='-', alpha=0.3, zorder=0)
     # Save the figure
     output_file = os.path.join(".", f'postgres_latency_vs_throughput.pdf')
     plt.savefig(f"../../../../graphs/{output_file}", bbox_inches='tight', pad_inches=0)
