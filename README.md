@@ -1,8 +1,8 @@
 # Rollbaccine
-A Linux device mapper that uses replication to prevent rollback attacks in VM-based TEEs.  
+A Linux device mapper that uses replication to detect and recover from rollback attacks in VM-based TEEs.  
 Rollbaccine will:
 1. Encrypt and decrypt all sectors.
-2. Check integrity on all sectors, forcing recovery on failure. The hashes are kept in memory.
+2. Check integrity on all sectors, forcing recovery on failure.
 3. Replicate all writes to backups and wait for an ACK before returning from a `REQ_FUA` or `REQ_PREFLUSH`.
 
 
@@ -10,9 +10,10 @@ Rollbaccine will:
 
 Set up your Azure account by following instructions [here](#running-on-azure). You will have to modify `launch.sh` to use your own Azure subscription ID, which must be able to launch Standard_DC16ads_v5 and Standard_DC16as_v5 machines in North Europe Zone 3.
 
-Here is the full list of commands to evaluate each benchmark. Be mindful of your quota limits per region, which may affect whether you are able to launch the VMs necessary. Most experiments only use 1-2 VMs; Nimble HDFS uses 4, each with 16 cores, so that's 80 vCPUs. I suggest running at most 2 experiments concurrently. Each experiment should take at most 4 hours, so be prepared to allocate a day or two.
+Here is the full list of commands to evaluate each benchmark. Be mindful of your vCPU quota limits per region, which may affect whether you are able to launch the VMs necessary; the comments above each experiment indicate how many VMs are necessary. I suggest running at most 2 experiments concurrently, waiting before the VMs from the previous experiment are deallocated before beginning the next one. Each experiment should take under an hour, except for `fio` experiments, so be prepared to allocate a day or two.
 
 ```bash
+# General tests, 1 VM per experiment except for postgres, which uses 2 VMs.
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name fio
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name filebench
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name postgres
@@ -25,22 +26,26 @@ python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benc
 python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benchmark_name filebench
 python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benchmark_name postgres
 python3 src/tools/benchmarking/run_benchmarks.py --system_type REPLICATED --benchmark_name hdfs
+# Rollbaccine tests, 2 VMs per experiment, except for postgres, which uses 3 VMs.
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name fio
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name filebench
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name hdfs
-# Nimble tests
+# Nimble tests. 4 VMs per experiment
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 1 --nimble_storage
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 100 --nimble_storage
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 1
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 100
 # Rollbaccine parameter tests
+# 2 VMs
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_f 0
+# 4 VMs
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_f 2
+# 3 VMs per experiment
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_sync_mode sync
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 614400
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 616774
-# Recovery
+# Recovery. 1 VM per experiment
 python3 src/tools/benchmarking/recovery/recovery.py True
 python3 src/tools/benchmarking/recovery/recovery.py False
 ```
