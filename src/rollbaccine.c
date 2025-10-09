@@ -449,7 +449,7 @@ inline struct additional_hash_msg *alloc_additional_hash_msg(struct rollbaccine_
     return kmalloc(additional_hash_msg_size(checksum_size), GFP_KERNEL);
 }
 
-inline bool mem_is_zero(void *addr, size_t size) { return memchr_inv(addr, 0, size) == NULL; }
+inline bool rollbaccine_mem_is_zero(void *addr, size_t size) { return memchr_inv(addr, 0, size) == NULL; }
 
 inline size_t bio_checksum_size(int num_sectors) {
     return num_sectors / SECTORS_PER_PAGE * AES_GCM_AUTH_SIZE;
@@ -585,7 +585,7 @@ void verify_merkle_node(struct merkle_bio_data *bio_data) {
     }
 
     if (res != 0) {
-        printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, layer: %d, we are all zeros: %d", bio_data->page_num, bio_data->layer, mem_is_zero(bio_data->hash, SHA256_SIZE));
+        printk_ratelimited(KERN_ERR "Hash mismatch, bio_data: %d, layer: %d, we are all zeros: %d", bio_data->page_num, bio_data->layer, rollbaccine_mem_is_zero(bio_data->hash, SHA256_SIZE));
         // Note: Should crash the system and enter recovery
     }
 }
@@ -692,7 +692,7 @@ void read_hash_end_io_task(struct work_struct *work) {
     bio_data->page_addr = kmap(bio_page(bio));
 
     // 1. Hash ourselves (unless this page is all zeros, in which case the hash should also be all zeros)
-    if (mem_is_zero(bio_data->page_addr, PAGE_SIZE)) {
+    if (rollbaccine_mem_is_zero(bio_data->page_addr, PAGE_SIZE)) {
         // Set the hash to be all 0s manually, in case the last write changed the hash
         memset(bio_data->hash, 0, SHA256_SIZE);
     }
@@ -2360,7 +2360,7 @@ int enc_or_dec_bio(struct bio_data *bio_data, enum EncDecType enc_or_dec) {
                 break;
             case ROLLBACCINE_DECRYPT:
                 // Skip decryption for any block that has not been written to
-                if (mem_is_zero(sector_checksum, AES_GCM_AUTH_SIZE)) {
+                if (rollbaccine_mem_is_zero(sector_checksum, AES_GCM_AUTH_SIZE)) {
                     goto enc_or_dec_next_sector;
                 }
                 break;
