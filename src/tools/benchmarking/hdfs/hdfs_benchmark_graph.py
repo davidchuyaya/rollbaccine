@@ -56,7 +56,8 @@ for i, config in enumerate(config_names):
         label=config,
         color=colors[i % len(colors)],
         hatch=patterns[i % len(patterns)],
-        zorder=5
+        zorder=5,
+        alpha=0.99 # Fix bug where hatches don't show up in pdf
     ), throughput_df[config], zorder=10, rotation=90, padding=5)
 
 # Add labels, title

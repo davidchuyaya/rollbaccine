@@ -5,7 +5,7 @@ import glob
 
 configs = ["UNREPLICATED", "DM", "REPLICATED", "ROLLBACCINE"]
 file_systems = ["ext4", "xfs"]
-benchmarks = ["varmail", "webserver"]
+benchmarks = ["varmail"] # Can add "webserver" if desired
 
 # Returns throughput, latency
 def extract_data(config, file_system, benchmark):
@@ -80,7 +80,8 @@ for benchmark in benchmarks:
                 label=config,
                 color=colors[i % len(colors)],
                 hatch=patterns[i % len(patterns)],
-                zorder=5
+                zorder=5,
+                alpha=0.99 # Fix bug where hatches don't show up in pdf
             ), df[config], zorder=10, rotation=90, padding=5)
 
         # Add labels, title
