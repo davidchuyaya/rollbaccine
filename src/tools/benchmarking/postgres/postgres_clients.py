@@ -7,13 +7,14 @@ import glob
 
 configs = ["UNREPLICATED_normal", "DM_normal", "REPLICATED_normal",
  "ROLLBACCINE_1_0_default_False", # Regular rollbaccine
+ "ROLLBACCINE_gcp", # Multicloud
  "ROLLBACCINE_1_0_sync_False", # All sync
  "ROLLBACCINE_0_0_default_False", "ROLLBACCINE_2_0_default_False", # Different f
  "ROLLBACCINE_1_614400_default_False", "ROLLBACCINE_1_616774_default_False", # Different merkle tree heights
 ]
 config_pretty = [
     "Unreplicated", "DM", "Replicated",
-    "Rollbaccine", "Rollbaccine-sync", 
+    "Rollbaccine", "Rollbaccine-multicloud", "Rollbaccine-sync", 
     "Rollbaccine-f=0", "Rollbaccine-f=2",
     "Rollbaccine-L=1", "Rollbaccine-L=2"
 ]
@@ -66,10 +67,10 @@ def throughputs_latencies():
     return avg_throughputs, bottom_throughputs, top_throughputs, avg_latencies, bottom_latencies, top_latencies
 
 def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs, latencies, bottom_latencies, top_latencies):
-    colors = ['red', 'cyan', 'lime', 'orange', 'saddlebrown', 'chocolate', 'peru', 'gold', 'darkkhaki', 'olive']  # Different colors for configurations
-    markers = ['^', 's', 'o', 'd', '$s$', 'p', 'H', 'P', 'X']  # Different markers for configurations
+    colors = ['red', 'cyan', 'lime', 'orange', 'brown', 'saddlebrown', 'chocolate', 'peru', 'gold', 'darkkhaki', 'olive']  # Different colors for configurations
+    markers = ['^', 's', 'o', 'd', '$m$', '$s$', 'p', 'H', 'P', 'X']  # Different markers for configurations
 
-    plt.figure(figsize=(5, 4.2))
+    plt.figure(figsize=(6, 4.2))
     ax = plt.gca()
     for i, config in enumerate(configs):
         cat_throughputs = []
@@ -92,10 +93,11 @@ def plot_latency_vs_throughput(throughputs, bottom_throughputs, top_throughputs,
             
     ax.set_xlabel('Throughput (ops/sec)')
     ax.set_ylabel('Average Latency (us)')
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.3), ncol=3)
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.5), ncol=3)
     ax.grid(True)
     plt.tight_layout()
     plt.grid(linestyle='-', alpha=0.3, zorder=0)
+    plt.yscale('log')
     # Save the figure
     output_file = os.path.join(".", f'postgres_latency_vs_throughput.pdf')
     plt.savefig(f"../../../../graphs/{output_file}", bbox_inches='tight', pad_inches=0)
