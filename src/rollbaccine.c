@@ -2001,6 +2001,7 @@ finish_sending_to_socket:
     }
     up_read(&device->connected_sockets_sem);
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
+    printk(KERN_INFO "Sent write with write_index: %llu, is fsync: %d", metadata.write_index, clone_bio_data->is_fsync);
 
     if (should_disconnect) {
         // printk_ratelimited(KERN_ERR "Disconnecting from misbehaving replica");
@@ -2968,6 +2969,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         if (bio_data->is_fsync) {
             atomic_max(&device->last_received_fsync_index, bio_data->write_index);
         }
+        printk(KERN_INFO "Received bio with write_index: %llu, is_fsync: %d", bio_data->write_index, bio_data->is_fsync);
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
 
         // Copy hash
