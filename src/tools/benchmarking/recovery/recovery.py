@@ -158,12 +158,11 @@ def run(recover_primary: bool):
 
     print("Installing Benchbase on benchmarking VM, may also take a few minutes")
     success = ssh_executor.exec(benchmark_ssh, [
-        "wget -nv https://github.com/cmu-db/benchbase/archive/refs/tags/v2023.tar.gz",
-        "tar -xzf v2023.tar.gz",
+        "git clone --depth 1 https://github.com/davidchuyaya/benchbase",
         # Install Java
         "sudo apt-get -qq update",
         "sudo apt-get -y -qq install openjdk-21-jre",
-        "cd benchbase-2023",
+        "cd benchbase",
         "./mvnw -q clean package -P postgres -DskipTests",
         "cd target",
         "tar xzf benchbase-postgres.tgz"
@@ -172,7 +171,7 @@ def run(recover_primary: bool):
         return False
     
     print("Copying config file to benchmarking VM")
-    REMOTE_CONFIG = "benchbase-2023/target/benchbase-postgres/config/tpcc_config.xml"
+    REMOTE_CONFIG = "benchbase/target/benchbase-postgres/config/tpcc_config.xml"
     upload(benchmark_ssh, "src/tools/benchmarking/postgres/tpcc_config.xml", REMOTE_CONFIG)
 
     print("Modifying config file")
@@ -184,7 +183,7 @@ def run(recover_primary: bool):
     OUTPUT_DIR = f"/home/{getuser()}/results"
     ssh_execute_background(benchmark_ssh, [
         f"mkdir -p {OUTPUT_DIR}",
-        "cd ~/benchbase-2023/target/benchbase-postgres",
+        "cd ~/benchbase/target/benchbase-postgres",
         f"timeout {BENCHMARK_TIMEOUT * 2} java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {OUTPUT_DIR} --clear=true --create=true --load=true --execute=true"
     ])
 
@@ -250,7 +249,7 @@ def run(recover_primary: bool):
 
     print(f"Running TPCC again for {BENCHMARK_TIMEOUT * 2} seconds")
     ssh_execute_background(benchmark_ssh, [
-        "cd ~/benchbase-2023/target/benchbase-postgres",
+        "cd ~/benchbase/target/benchbase-postgres",
         f"timeout {BENCHMARK_TIMEOUT * 2} java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {OUTPUT_DIR} --clear=true --create=true --load=true --execute=true"
     ])
     
