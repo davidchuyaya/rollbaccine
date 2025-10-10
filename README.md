@@ -48,8 +48,11 @@ python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --ben
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 614400
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 616774
 # Recovery. 1 VM per experiment
-python3 src/tools/benchmarking/recovery/recovery.py True
-python3 src/tools/benchmarking/recovery/recovery.py False
+python3 src/tools/benchmarking/recovery/recovery.py True 1
+python3 src/tools/benchmarking/recovery/recovery.py False 1
+python3 src/tools/benchmarking/recovery/recovery.py False 100
+python3 src/tools/benchmarking/recovery/recovery.py False 300
+python3 src/tools/benchmarking/recovery/recovery.py False 600
 ```
 
 Each experiment, upon completion, will download files to `results`. Run the following command to generate the graphs:

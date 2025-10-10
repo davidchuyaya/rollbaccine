@@ -14,17 +14,16 @@ from utils import *
 BENCHMARK_TIMEOUT = 100
 # How often to check if the primary/backup are done recovering
 CHECK_FREQUENCY = 5
-PRIMARY_OUTFILE = "results/crash_primary_out.txt"
-BACKUP_OUTFILE = "results/crash_backup_out.txt"
+
+def outfile(is_primary: bool, gb_to_corrupt: int) -> str:
+    if is_primary:
+        return f"results/crash_primary_out_{str(gb_to_corrupt)}.txt"
+    return f"results/crash_backup_out_{str(gb_to_corrupt)}.txt"
 
 # Exist on either timeout or recovery complete
-def log_primary_or_backup(ssh: SSHClient, is_primary: bool, timeout=0, exit_on_recovery_complete=False):
-    if is_primary:
-        filename = PRIMARY_OUTFILE
-        dm_name = "rollbaccine1"
-    else:
-        filename = BACKUP_OUTFILE
-        dm_name = "rollbaccine2"
+def log_primary_or_backup(ssh: SSHClient, is_primary: bool, gb_to_corrupt: int, timeout=0, exit_on_recovery_complete=False):
+    filename = outfile(is_primary, gb_to_corrupt)
+    dm_name = "rollbaccine1" if is_primary else "rollbaccine2"
 
     print(f"\033[92mPlease run `tail -f {filename}` to see how the {"primary" if is_primary else "backup"} is progressing.\033[0m")
     start = time.time()
@@ -73,13 +72,13 @@ def ssh_vm_json_plus(vm_json) -> Tuple[List[SSHClient], List[str], List[str], Li
     return connections, public_ips, private_ips, ids
 
 # Mostly copied from run_benchmarks:run_everything
-def run(recover_primary: bool):
+def run(recover_primary: bool, gb_to_corrupt: int):
     # Create resources
     BENCHMARK_NAME = "postgres"
     SYSTEM = System.ROLLBACCINE
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system.")
 
-    unique_str = f"recoverPrimary{recover_primary}"
+    unique_str = f"recoverPrimary{recover_primary}{str(gb_to_corrupt)}"
     subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 2 -m 1 -e {unique_str}"])
     ssh_executor = SSH(SYSTEM, BENCHMARK_NAME, unique_str)
 
@@ -87,7 +86,7 @@ def run(recover_primary: bool):
     print(f"\033[92mPlease run `tail -f {ssh_executor.output_file}` to see the execution log on the servers.\033[0m")
     ssh_executor.clear_output_file()
     # Only clear the file of the thing we're running
-    main_outfile = PRIMARY_OUTFILE if recover_primary else BACKUP_OUTFILE
+    main_outfile = outfile(recover_primary, gb_to_corrupt)
     open(main_outfile, 'w').close()
     
     with open(f'{BENCHMARK_NAME}-{SYSTEM}-{unique_str}-vm1.json') as f:
@@ -191,7 +190,7 @@ def run(recover_primary: bool):
     main_ssh = primary_ssh if recover_primary else backup_ssh
     main_public_ip = primary_public_ip if recover_primary else backup_public_ip
     main_id = primary_id if recover_primary else backup_id
-    log_primary_or_backup(main_ssh, recover_primary, BENCHMARK_TIMEOUT)
+    log_primary_or_backup(main_ssh, recover_primary, gb_to_corrupt, BENCHMARK_TIMEOUT)
 
     print("Restarting the VM")
     main_ssh.close()
@@ -213,10 +212,10 @@ def run(recover_primary: bool):
     with open(main_outfile, "a") as stdout_file:
         stdout_file.write(f"Recovery time: {end - start}\n")
 
-    print("Messing up the disk with 100 MB of zeros")
+    print(f"Messing up the disk with {gb_to_corrupt} GB of zeros")
     success = ssh_executor.exec(main_ssh, [
         "sudo umount /dev/sdb1",
-        "sudo dd if=/dev/zero of=/dev/sdb bs=1M count=100"
+        f"sudo dd if=/dev/zero of=/dev/sdb bs=1G count={gb_to_corrupt}"
     ])
     if not success:
         return False
@@ -236,7 +235,7 @@ def run(recover_primary: bool):
         
 
     print(f"Wait for recovery to complete")
-    log_primary_or_backup(main_ssh, recover_primary, 0, True)
+    log_primary_or_backup(main_ssh, recover_primary, gb_to_corrupt, 0, True)
 
     if recover_primary:
         print("Remounting the file system and restarting postgres")
@@ -254,7 +253,7 @@ def run(recover_primary: bool):
     ])
     
     print(f"Waiting {BENCHMARK_TIMEOUT} seconds for the benchmark to run")
-    log_primary_or_backup(main_ssh, recover_primary, BENCHMARK_TIMEOUT)
+    log_primary_or_backup(main_ssh, recover_primary, gb_to_corrupt, BENCHMARK_TIMEOUT)
 
     print("Benchmark completed, deleting resources")
     primary_ssh.close()
@@ -263,5 +262,6 @@ def run(recover_primary: bool):
     subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e {unique_str}"])
 
 if __name__ == "__main__":
-    # True = recover primary, False = recover backup
-    run(sys.argv[1] == "True")
+    # 1. True = recover primary, False = recover backup
+    # 2. How many GBs to corrupt
+    run(sys.argv[1] == "True", int(sys.argv[2]))
