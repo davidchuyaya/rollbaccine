@@ -111,7 +111,8 @@ struct socket_data {
     uint64_t waiting_for_msg_index; // the index of the last message received on this socket
     uint64_t sender_id;
     uint64_t sender_socket_id; // unique number for the sending socket. Otherwise an attacker could replay writes across sockets. Defaults to U64_MAX
-    struct shash_desc *hash_desc; // Hash scratch space for this socket to verify
+    struct shash_desc *send_hash_desc; // Hash scratch space for this socket to sign. Requires socket_mutex lock
+    struct shash_desc *recv_hash_desc; // Hash scratch space for this socket to verify. All reads from a socket are single-threaded so no lock required
 } ____cacheline_aligned; // Align to cacheline to allow multiple threads to access data without false sharing
 
 // A list of connections to different senders, where each sender is connected through 1 socket per NIC
@@ -415,7 +416,7 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, cha
                 uint64_t my_id, uint64_t msg_index);
 void hash_merkle_page(struct rollbaccine_device *device, struct merkle_bio_data *bio_data);
 void hash_metadata(struct socket_data *socket_data, struct metadata_msg *metadata);
-void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out);
+void hash_buffer(struct socket_data *socket_data, bool send, char *buffer, size_t len, char *out);
 // Returns array of checksums for writes, NULL for reads. Sets error = true if there's an error
 int enc_or_dec_bio(struct bio_data * bio_data, enum EncDecType type);
 int submit_pending_bio_ring_prefix(void *args);
@@ -1968,7 +1969,7 @@ void broadcast_bio(struct work_struct *work) {
             additional_hash_msg->sender_socket_id = socket_id;
             additional_hash_msg->recipient_id = multisocket->sender_id;
             additional_hash_msg->msg_index = socket_data->last_sent_msg_index++;
-            hash_buffer(socket_data, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
+            hash_buffer(socket_data, true, (char*) additional_hash_msg + SHA256_SIZE, additional_hash_msg_size(remaining_checksum_size) - SHA256_SIZE, additional_hash_msg->msg_hash);
 
             vec.iov_base = additional_hash_msg;
             vec.iov_len = additional_hash_msg_size(remaining_checksum_size);
@@ -2264,7 +2265,7 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, cha
     bool msg_index_matches;
 
     // If another thread is writing on this socket, then they will hash as well
-    hash_buffer(socket_data, msg, msg_size, calculated_hash);
+    hash_buffer(socket_data, false, msg, msg_size, calculated_hash);
     hash_matches = memcmp(calculated_hash, expected_hash, SHA256_SIZE) == 0;
     sender_matches = socket_data->sender_id == sender_id;
     thread_matches = socket_data->sender_socket_id == sender_socket_id;
@@ -2282,13 +2283,13 @@ bool verify_msg(struct socket_data *socket_data, char *msg, size_t msg_size, cha
 }
 
 void hash_metadata(struct socket_data *socket_data, struct metadata_msg *metadata) {
-    hash_buffer(socket_data, (char *)metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata->msg_hash);
+    hash_buffer(socket_data, true, (char *)metadata + SHA256_SIZE, sizeof(struct metadata_msg) - SHA256_SIZE, metadata->msg_hash);
 }
 
-// Note: Caller must hold socket_data->socket_mutex on the socket_data that owns the hash_desc
-void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out) {
+// Note: If send = true, caller must hold socket_data->socket_mutex on the socket_data
+void hash_buffer(struct socket_data *socket_data, bool send, char *buffer, size_t len, char *out) {
     cycles_t time = get_cycles_if_flag_on();
-    int ret = crypto_shash_digest(socket_data->hash_desc, buffer, len, out);
+    int ret = crypto_shash_digest(send ? socket_data->send_hash_desc : socket_data->recv_hash_desc, buffer, len, out);
     if (ret) {
         printk(KERN_ERR "Could not hash buffer");
     }
@@ -2758,7 +2759,7 @@ bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *mult
         memcpy(hash_msg->checksums, device->merkle_tree_root + page * AES_GCM_AUTH_SIZE, hashes_to_send * AES_GCM_AUTH_SIZE);
         page += hashes_to_send;
         
-        hash_buffer(socket_data, (char *)hash_msg + SHA256_SIZE, sizeof(struct hash_msg) - SHA256_SIZE, hash_msg->msg_hash);
+        hash_buffer(socket_data, true, (char *)hash_msg + SHA256_SIZE, sizeof(struct hash_msg) - SHA256_SIZE, hash_msg->msg_hash);
 
         vec.iov_base = hash_msg;
         vec.iov_len = sizeof(struct hash_msg);
@@ -3099,12 +3100,18 @@ void init_socket_data(struct rollbaccine_device *device, struct socket_data *soc
     socket_data->waiting_for_msg_index = 0;
     socket_data->sender_id = sender_id;
     socket_data->sender_socket_id = sender_socket_id;
-    socket_data->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->signed_hash_alg), GFP_KERNEL);
-    if (socket_data->hash_desc == NULL) {
-        printk(KERN_ERR "Error allocating hash desc");
+    socket_data->send_hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->signed_hash_alg), GFP_KERNEL);
+    if (socket_data->send_hash_desc == NULL) {
+        printk(KERN_ERR "Error allocating send hash desc");
         return;
     }
-    socket_data->hash_desc->tfm = device->signed_hash_alg;
+    socket_data->send_hash_desc->tfm = device->signed_hash_alg;
+    socket_data->recv_hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->signed_hash_alg), GFP_KERNEL);
+    if (socket_data->recv_hash_desc == NULL) {
+        printk(KERN_ERR "Error allocating recv hash desc");
+        return;
+    }
+    socket_data->recv_hash_desc->tfm = device->signed_hash_alg;
 }
 
 struct multisocket *create_connected_socket_list_if_null(struct rollbaccine_device *device, uint64_t sender_id) {
