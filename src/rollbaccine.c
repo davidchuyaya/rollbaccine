@@ -261,6 +261,7 @@ struct rollbaccine_device {
     atomic_t max_submit_bio_queue_size;
     atomic_t max_replica_disk_end_io_queue_size;
     atomic_t max_broadcast_queue_size;
+    atomic_t last_received_fsync_index;
     int last_acked_fsync_index;
     int num_hashes_received_during_recovery;
     atomic_t num_pages_requested_during_recovery;
@@ -2964,6 +2965,9 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         bio_data->start_sector = metadata.sector;
         bio_data->end_sector = metadata.sector + metadata.num_pages * SECTORS_PER_PAGE;
         bio_data->is_fsync = metadata.type == ROLLBACCINE_FSYNC;
+        if (bio_data->is_fsync) {
+            atomic_max(&device->last_received_fsync_index, bio_data->write_index);
+        }
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
 
         // Copy hash
@@ -3470,6 +3474,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Max number of conflicting operations: %d\n", device->max_outstanding_num_bio_sector_ranges);
     DMEMIT("Max number of fsyncs pending replication: %d\n", device->max_outstanding_fsyncs_pending_replication);
     DMEMIT("Max bios on submit queue: %d\n", atomic_read(&device->max_submit_bio_queue_size));
+    DMEMIT("Last received fsync index: %d\n", atomic_read(&device->last_received_fsync_index));
     DMEMIT("Last ACK'd fsync index: %d\n", device->last_acked_fsync_index);
     if (!device->is_leader) {
         DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
@@ -3843,6 +3848,7 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     atomic_set(&device->max_distance_between_bios_in_pending_bio_ring, 0);
     atomic_set(&device->max_submit_bio_queue_size, 0);
     atomic_set(&device->max_replica_disk_end_io_queue_size, 0);
+    atomic_set(&device->last_received_fsync_index, 0);
     device->last_acked_fsync_index = 0;
 #endif
 
