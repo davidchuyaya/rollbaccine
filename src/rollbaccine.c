@@ -3479,6 +3479,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Last received fsync index: %d\n", atomic_read(&device->last_received_fsync_index));
     DMEMIT("Last ACK'd fsync index: %d\n", device->last_acked_fsync_index);
     if (!device->is_leader) {
+        DMEMIT("Pending bio ring head: %d\n", atomic_read(&device->pending_bio_ring_head));
         DMEMIT("Max bios in pending bio ring: %d\n", atomic_read(&device->max_bios_in_pending_bio_ring));
         DMEMIT("Max distance between bios in pending bio ring: %d\n", atomic_read(&device->max_distance_between_bios_in_pending_bio_ring));
         DMEMIT("Max bios on replica disk end io queue: %d\n", atomic_read(&device->max_replica_disk_end_io_queue_size));
