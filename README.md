@@ -31,6 +31,8 @@ python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --ben
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name filebench
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name hdfs
+python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name hdfs --rollbaccine_sync_mode sync
+python3 src/tools/benchmarking/postgres/postgres_gcp.py # Rollbaccine postgres with backup on GCP
 # Nimble tests. 4 VMs per experiment
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 1 --nimble_storage
 python3 src/tools/benchmarking/run_benchmarks.py --system_type UNREPLICATED --benchmark_name nimble_hdfs --nimble_batch_size 100 --nimble_storage
