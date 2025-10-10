@@ -3,19 +3,21 @@
 #  Launch a Rollbaccine backup VM in GCP
 #
 print_usage() {
-    echo "Usage: $0 -i <IP address> -r <resource group> -p <project id>"
+    echo "Usage: $0 -i <IP address> -r <resource group> -p <project id> -z <zone>"
     echo "  -i: IP address of the Rollbaccine primary VM in Azure"
     echo "  -r: Name of the resource group in Azure, without the '-group' suffix"
     echo "  -p: Project ID in GCP"
+    echo "  -z: Zone in GCP"
 }
 
 set -x
 
-while getopts 'i:r:p:' flag; do
+while getopts 'i:r:p:z:' flag; do
   case ${flag} in
     i) PRIMARY_IP=${OPTARG} ;;
     r) AZURE_RESOURCE_GROUP=${OPTARG} ;;
     p) PROJECT_ID=${OPTARG} ;;
+    z) ZONE=${OPTARG} ;;
     *) print_usage
        exit 1;;
   esac
@@ -45,7 +47,7 @@ gcloud compute instances create rollbaccine-backup \
     --machine-type=n2d-standard-16 \
     --min-cpu-platform="AMD Milan" \
     --maintenance-policy=TERMINATE \
-    --zone=europe-west4-a \
+    --zone=$ZONE \
     --network=$NETWORK_NAME \
     --image-project=ubuntu-os-cloud \
     --image-family=ubuntu-2404-lts-amd64 \
@@ -70,3 +72,6 @@ az network nsg rule create \
     --priority 100 \
     --source-address-prefixes $GCP_VM_IP \
     --destination-port-ranges '*'
+
+echo "Sleeping for 120 seconds to make sure the VM is ready by the time this script finishes"
+sleep 120

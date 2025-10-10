@@ -62,7 +62,7 @@ def run():
     ssh_executor = SSH(SYSTEM, BENCHMARK_NAME, unique_str)
     
 
-    print("Connecting to VMs and setting up main VMs")
+    print("Connecting to Azure VMs")
     print(f"\033[92mPlease run `tail -f {ssh_executor.output_file}` to see the execution log on the servers.\033[0m")
     ssh_executor.clear_output_file()
     
@@ -76,12 +76,16 @@ def run():
         benchmark_ssh, benchmark_public_ip, benchmark_ip, benchmark_id = connections[0], public_ips[0], private_ips[0], ids[0]
 
     # NEW: Launch the backup on GCP
+    print("Launching the backup VM on GCP")
     PROJECT_ID="bigger-not-badder"
-    subprocess_execute([f"./launch_gcp.sh -i {primary_public_ip} -r {BENCHMARK_NAME}-{SYSTEM}-{unique_str} -p {PROJECT_ID}"])
-    backup_ssh = connect_gcp_ssh(f"rollbaccine-backup.europe-west4-a.{PROJECT_ID}")
-    
-    print("Installing rollbaccine")
+    ZONE="europe-west4-a"
+    subprocess_execute([f"./launch_gcp.sh -i {primary_public_ip} -r {BENCHMARK_NAME}-{SYSTEM}-{unique_str} -p {PROJECT_ID} -z {ZONE}"])
+    print("Connecting to the GCP VM")
+    backup_ssh = connect_gcp_ssh(f"rollbaccine-backup.{ZONE}.{PROJECT_ID}")
+
+    print("Installing rollbaccine on the primary")
     install_rollbaccine(ssh_executor, primary_ssh)
+    print("Installing rollbaccine on the backup")
     install_rollbaccine(ssh_executor, backup_ssh)
 
     print("Setting up rollbaccine primary")
@@ -161,7 +165,7 @@ def run():
     print("Running TPCC, may take a few minutes")
     OUTPUT_DIR = f"/home/{getuser()}/results"
     for num_clients in range(20, 51, 10):
-        success = subprocess_execute([
+        success = ssh_executor.exec(benchmark_ssh, [
             "cd ~/benchbase/target/benchbase-postgres",
             f"sed -i -E 's~<terminals>.*</terminals>~<terminals>{num_clients}</terminals>~g' config/tpcc_config.xml",
             f"java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {OUTPUT_DIR} --clear=true --create=true --load=true --execute=true"
@@ -173,7 +177,7 @@ def run():
             sys.exit(1)
 
     # Remove everything from the output_dir except summary.json, and rename summary.json
-    success = subprocess_execute([
+    success = ssh_executor.exec(benchmark_ssh, [
         f"cd {OUTPUT_DIR}",
         "rm -rf *.xml *.csv *.metrics.json *.params.json",
         f"ls | xargs -I {{}} mv {{}} {SYSTEM}_{unique_str}_{{}}"
