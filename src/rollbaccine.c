@@ -111,7 +111,6 @@ struct socket_data {
     uint64_t waiting_for_msg_index; // the index of the last message received on this socket
     uint64_t sender_id;
     uint64_t sender_socket_id; // unique number for the sending socket. Otherwise an attacker could replay writes across sockets. Defaults to U64_MAX
-    struct mutex hash_mutex; // To make sure no one else is using the hash's scratch space
     struct shash_desc *hash_desc; // Hash scratch space for this socket to verify
 } ____cacheline_aligned; // Align to cacheline to allow multiple threads to access data without false sharing
 
@@ -2001,7 +2000,7 @@ finish_sending_to_socket:
     }
     up_read(&device->connected_sockets_sem);
     // printk(KERN_INFO "Sent metadata message and bios, sector: %llu, num pages: %llu", metadata.sector, metadata.num_pages);
-    printk(KERN_INFO "Sent write with write_index: %llu, is fsync: %d", metadata.write_index, clone_bio_data->is_fsync);
+    // printk(KERN_INFO "Sent write with write_index: %llu, is fsync: %d", metadata.write_index, clone_bio_data->is_fsync);
 
     if (should_disconnect) {
         // printk_ratelimited(KERN_ERR "Disconnecting from misbehaving replica");
@@ -2289,9 +2288,7 @@ void hash_metadata(struct socket_data *socket_data, struct metadata_msg *metadat
 // Note: Caller must hold socket_data->socket_mutex on the socket_data that owns the hash_desc
 void hash_buffer(struct socket_data *socket_data, char *buffer, size_t len, char *out) {
     cycles_t time = get_cycles_if_flag_on();
-    mutex_lock(&socket_data->hash_mutex);
     int ret = crypto_shash_digest(socket_data->hash_desc, buffer, len, out);
-    mutex_unlock(&socket_data->hash_mutex);
     if (ret) {
         printk(KERN_ERR "Could not hash buffer");
     }
@@ -2969,7 +2966,7 @@ void blocking_read(struct rollbaccine_device *device, struct multisocket *multis
         if (bio_data->is_fsync) {
             atomic_max(&device->last_received_fsync_index, bio_data->write_index);
         }
-        printk(KERN_INFO "Received bio with write_index: %llu, is_fsync: %d", bio_data->write_index, bio_data->is_fsync);
+        // printk(KERN_INFO "Received bio with write_index: %llu, is_fsync: %d", bio_data->write_index, bio_data->is_fsync);
         INIT_WORK(&bio_data->submit_bio_work, submit_bio_task);
 
         // Copy hash
@@ -3102,7 +3099,6 @@ void init_socket_data(struct rollbaccine_device *device, struct socket_data *soc
     socket_data->waiting_for_msg_index = 0;
     socket_data->sender_id = sender_id;
     socket_data->sender_socket_id = sender_socket_id;
-    mutex_init(&socket_data->hash_mutex);
     socket_data->hash_desc = kmalloc(sizeof(struct shash_desc) + crypto_shash_descsize(device->signed_hash_alg), GFP_KERNEL);
     if (socket_data->hash_desc == NULL) {
         printk(KERN_ERR "Error allocating hash desc");
