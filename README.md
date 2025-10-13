@@ -323,10 +323,10 @@ If you haven't already, [install the gcloud CLI](https://cloud.google.com/sdk/do
 gcloud auth login
 ```
 
-You will need to [enable the Compute Engine APIP](https://console.cloud.google.com/apis/library) to allow the creation of VM instances, networks, and firewall rules.
+You will need to [enable the Compute Engine API](https://console.cloud.google.com/apis/library) to allow the creation of VM instances, networks, and firewall rules.
 
 The script for launching VMs is [launch_gcp.sh](launch_gcp.sh). Do not run it individually, as it requires knowing the IP address of the Azure VM running Rollbaccine primary.
-If the script does not complete successfully, you can manually cleanup by running:
+If the script does not complete successfully, you can manually clean up by running:
 ```bash
 ./cleanup_gcp.sh
 ```

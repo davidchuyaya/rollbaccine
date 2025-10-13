@@ -122,10 +122,15 @@ def run(recover_primary: bool, gb_to_corrupt: int):
     print("Waiting 10 seconds for rollbaccine to finish setup")
     sleep(10)
 
-    print(f"Writing random bits to all 600GBs of /dev/sdb on the primary")
-    ssh_execute_background(primary_ssh, [
-        f"sudo dd if=/dev/urandom of=/dev/sdb bs=1G count=600"
+    print(f"Writing random bits to {gb_to_corrupt}GBs of /dev/mapper/rollbaccine1 on the primary, may take {4 * gb_to_corrupt} seconds")
+    start = time.time()
+    success = ssh_executor.exec(primary_ssh, [
+        f"sudo dd if=/dev/urandom of=/dev/mapper/rollbaccine1 bs=1G count={gb_to_corrupt}"
     ])
+    if not success:
+        return False
+    end = time.time()
+    print(f"Took {end - start} seconds to write {gb_to_corrupt}GBs of random data to Rollbaccine")
 
     main_ssh = primary_ssh if recover_primary else backup_ssh
     main_public_ip = primary_public_ip if recover_primary else backup_public_ip
@@ -151,13 +156,16 @@ def run(recover_primary: bool, gb_to_corrupt: int):
     with open(main_outfile, "a") as stdout_file:
         stdout_file.write(f"Recovery time: {end - start}\n")
 
-    print(f"Messing up the disk with {gb_to_corrupt} GB of zeros")
+    print(f"Messing up the disk with {gb_to_corrupt}GBs of zeros")
+    start = time.time()
     success = ssh_executor.exec(main_ssh, [
         "sudo umount /dev/sdb1",
         f"sudo dd if=/dev/zero of=/dev/sdb bs=1G count={gb_to_corrupt}"
     ])
     if not success:
         return False
+    end = time.time()
+    print(f"Took {end - start} seconds to write {gb_to_corrupt}GBs of zeros to /dev/sdb")
 
     print("Recovering")
     if recover_primary:
