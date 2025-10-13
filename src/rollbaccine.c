@@ -1776,7 +1776,7 @@ void verify_disk_end_io_task(struct work_struct *work) {
     struct bio_data *bio_data = container_of(work, struct bio_data, submit_bio_work);
     struct rollbaccine_device *device = bio_data->device;
     
-    int error = enc_or_dec_bio(bio_data, ROLLBACCINE_DECRYPT);
+    int error = enc_or_dec_bio(bio_data, ROLLBACCINE_VERIFY);
     if (error != 0)
         send_disk_req(device, bio_data->start_sector);
     else
