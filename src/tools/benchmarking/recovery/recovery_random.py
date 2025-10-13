@@ -17,8 +17,8 @@ CHECK_FREQUENCY = 5
 
 def outfile(is_primary: bool, gb_to_corrupt: int) -> str:
     if is_primary:
-        return f"results/crash_primary_out_{str(gb_to_corrupt)}.txt"
-    return f"results/crash_backup_out_{str(gb_to_corrupt)}.txt"
+        return f"results/crash_primary_out_random{str(gb_to_corrupt)}.txt"
+    return f"results/crash_backup_out_random{str(gb_to_corrupt)}.txt"
 
 # Exist on either timeout or recovery complete
 def log_primary_or_backup(ssh: SSHClient, is_primary: bool, gb_to_corrupt: int, timeout=0, exit_on_recovery_complete=False):
@@ -78,8 +78,8 @@ def run(recover_primary: bool, gb_to_corrupt: int):
     SYSTEM = System.ROLLBACCINE
     print(f"Creating a VM under '{BENCHMARK_NAME}' benchmark and '{SYSTEM}' system.")
 
-    unique_str = f"recoverPrimary{recover_primary}{str(gb_to_corrupt)}"
-    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 2 -m 1 -e {unique_str}"])
+    unique_str = f"recoverPrimary{recover_primary}Random{str(gb_to_corrupt)}"
+    subprocess_execute([f"./launch.sh -b {BENCHMARK_NAME} -s {SYSTEM} -n 2 -m 0 -e {unique_str}"])
     ssh_executor = SSH(SYSTEM, BENCHMARK_NAME, unique_str)
 
     print("Connecting to VMs and setting up main VMs")
@@ -94,10 +94,6 @@ def run(recover_primary: bool, gb_to_corrupt: int):
         connections, public_ips, private_ips, ids = ssh_vm_json_plus(vm_json)
         primary_ssh, primary_public_ip, primary_ip, primary_id = connections[0], public_ips[0], private_ips[0], ids[0]
         backup_ssh, backup_public_ip, backup_ip, backup_id = connections[1], public_ips[1], private_ips[1], ids[1]
-    with open(f'{BENCHMARK_NAME}-{SYSTEM}-{unique_str}-vm2.json') as f:
-        vm_json = json.load(f)
-        connections, public_ips, private_ips, ids = ssh_vm_json_plus(vm_json)
-        benchmark_ssh, benchmark_public_ip, benchmark_ip, benchmark_id = connections[0], public_ips[0], private_ips[0], ids[0]
     
     print("Installing rollbaccine")
     install_rollbaccine(ssh_executor, primary_ssh)
@@ -126,71 +122,14 @@ def run(recover_primary: bool, gb_to_corrupt: int):
     print("Waiting 10 seconds for rollbaccine to finish setup")
     sleep(10)
 
-    print("Mounting ext4 on the primary")
-    mount_point = ssh_executor.mount_point(primary_ssh)
-    install_ext4(ssh_executor, primary_ssh, mount_point)
-
-    print("Installing Postgres on primary, may take a few minutes")
-    success = ssh_executor.exec(primary_ssh, [
-        "sudo apt-get -qq update",
-        "sudo apt-get install -qq -y postgresql-common",
-        # Install to our custom directory
-        rf"echo 'data_directory = '\'{DATA_DIR}\' | sudo tee -a /etc/postgresql-common/createcluster.conf",
-        f"sudo chown -R postgres:postgres {DATA_DIR}",
-        "sudo apt-get install -qq -y postgresql",
-        # Listens to public addresses
-        r"echo 'listen_addresses = '\'*\' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
-        # Fix out-of-memory error
-        "echo 'max_connections = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
-        "echo 'max_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
-        "echo 'max_pred_locks_per_transaction = 1024' | sudo tee -a /etc/postgresql/*/main/postgresql.conf",
-        # Trust all connections
-        "echo 'host all all 0.0.0.0/0 trust' | sudo tee -a /etc/postgresql/*/main/pg_hba.conf",
-        "sudo systemctl restart postgresql.service",
-        "sudo -u postgres /usr/lib/postgresql/*/bin/createuser -s -i -d -r -l -w admin",
-        "sudo -u postgres /usr/lib/postgresql/*/bin/createdb benchbase",
-        # NEW: Don't let postgres automatically start on boot, because we need to recover disk first
-        "sudo systemctl disable postgresql.service"
-    ])
-    if not success:
-        return False
-
-    print("Installing Benchbase on benchmarking VM, may also take a few minutes")
-    success = ssh_executor.exec(benchmark_ssh, [
-        "git clone --depth 1 https://github.com/davidchuyaya/benchbase",
-        # Install Java
-        "sudo apt-get -qq update",
-        "sudo apt-get -y -qq install openjdk-21-jre",
-        "cd benchbase",
-        "./mvnw -q clean package -P postgres -DskipTests",
-        "cd target",
-        "tar xzf benchbase-postgres.tgz"
-    ])
-    if not success:
-        return False
-    
-    print("Copying config file to benchmarking VM")
-    REMOTE_CONFIG = "benchbase/target/benchbase-postgres/config/tpcc_config.xml"
-    upload(benchmark_ssh, "src/tools/benchmarking/postgres/tpcc_config.xml", REMOTE_CONFIG)
-
-    print("Modifying config file")
-    success = ssh_executor.exec(benchmark_ssh, [f"sed -i 's/localhost/{primary_ip}/g' {REMOTE_CONFIG}"])
-    if not success:
-        return False
-
-    print(f"Running TPCC in the background, killing it after {BENCHMARK_TIMEOUT * 2} seconds")
-    OUTPUT_DIR = f"/home/{getuser()}/results"
-    ssh_execute_background(benchmark_ssh, [
-        f"mkdir -p {OUTPUT_DIR}",
-        "cd ~/benchbase/target/benchbase-postgres",
-        f"timeout {BENCHMARK_TIMEOUT * 2} java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {OUTPUT_DIR} --clear=true --create=true --load=true --execute=true"
+    print(f"Writing random bits to all 600GBs of /dev/sdb on the primary")
+    ssh_execute_background(primary_ssh, [
+        f"sudo dd if=/dev/urandom of=/dev/sdb bs=1G count=600"
     ])
 
-    print(f"Waiting {BENCHMARK_TIMEOUT} seconds for the benchmark to run")
     main_ssh = primary_ssh if recover_primary else backup_ssh
     main_public_ip = primary_public_ip if recover_primary else backup_public_ip
     main_id = primary_id if recover_primary else backup_id
-    log_primary_or_backup(main_ssh, recover_primary, gb_to_corrupt, BENCHMARK_TIMEOUT)
 
     print("Restarting the VM")
     main_ssh.close()
@@ -232,33 +171,13 @@ def run(recover_primary: bool, gb_to_corrupt: int):
     ])
     if not success:
         return False
-        
 
     print(f"Wait for recovery to complete")
     log_primary_or_backup(main_ssh, recover_primary, gb_to_corrupt, 0, True)
 
-    if recover_primary:
-        print("Remounting the file system and restarting postgres")
-        success = ssh_executor.exec(main_ssh, [
-            f"sudo mount {mount_point} {MOUNT_DIR}",
-            "sudo systemctl start postgresql.service"
-        ])
-        if not success:
-            return False
-
-    print(f"Running TPCC again for {BENCHMARK_TIMEOUT * 2} seconds")
-    ssh_execute_background(benchmark_ssh, [
-        "cd ~/benchbase/target/benchbase-postgres",
-        f"timeout {BENCHMARK_TIMEOUT * 2} java -jar benchbase.jar -b tpcc -c config/tpcc_config.xml -d {OUTPUT_DIR} --clear=true --create=true --load=true --execute=true"
-    ])
-    
-    print(f"Waiting {BENCHMARK_TIMEOUT} seconds for the benchmark to run")
-    log_primary_or_backup(main_ssh, recover_primary, gb_to_corrupt, BENCHMARK_TIMEOUT)
-
     print("Benchmark completed, deleting resources")
     primary_ssh.close()
     backup_ssh.close()
-    benchmark_ssh.close()
     subprocess_execute([f"./cleanup.sh -b {BENCHMARK_NAME} -s {SYSTEM} -e {unique_str}"])
 
 if __name__ == "__main__":

@@ -47,12 +47,13 @@ python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --ben
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_sync_mode sync
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 614400
 python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --benchmark_name postgres --rollbaccine_num_hash_disk_pages 616774
-# Recovery. 1 VM per experiment
-python3 src/tools/benchmarking/recovery/recovery.py True 1
-python3 src/tools/benchmarking/recovery/recovery.py False 1
-python3 src/tools/benchmarking/recovery/recovery.py False 100
-python3 src/tools/benchmarking/recovery/recovery.py False 300
-python3 src/tools/benchmarking/recovery/recovery.py False 600
+# Recovery (postgres). 3 VMs per experiment
+python3 src/tools/benchmarking/recovery/recovery_postgres.py True
+python3 src/tools/benchmarking/recovery/recovery_postgres.py False
+# Recovery (random). 2 VMs per experiment
+python3 src/tools/benchmarking/recovery/recovery_random.py False 100
+python3 src/tools/benchmarking/recovery/recovery_random.py False 300
+python3 src/tools/benchmarking/recovery/recovery_random.py False 600
 ```
 
 Each experiment, upon completion, will download files to `results`. Run the following command to generate the graphs:
@@ -310,4 +311,22 @@ To run the tests yourself, run the following command:
 
 ```bash
 python3 src/tools/benchmarking/ace/ace.py
+```
+
+## Running on GCP
+
+Google Cloud is used for the multi-cloud experiment, where the VM on Google Cloud is used as the Rollbaccine backup.
+The experiment can be found in [postgres_gcp.py](src/tools/benchmarking/postgres/postgres_gcp.py).
+
+If you haven't already, [install the gcloud CLI](https://cloud.google.com/sdk/docs/install) and log in:
+```bash
+gcloud auth login
+```
+
+You will need to [enable the Compute Engine APIP](https://console.cloud.google.com/apis/library) to allow the creation of VM instances, networks, and firewall rules.
+
+The script for launching VMs is [launch_gcp.sh](launch_gcp.sh). Do not run it individually, as it requires knowing the IP address of the Azure VM running Rollbaccine primary.
+If the script does not complete successfully, you can manually cleanup by running:
+```bash
+./cleanup_gcp.sh
 ```
