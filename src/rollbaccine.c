@@ -40,6 +40,7 @@
 #define NUM_NICS 4 // Number of sockets we should use for networking to maximize bandwidth
 #define ROLLBACCINE_PLUG_NUM_BIOS 256 / 4  // Number of bios to allow between to calls to blk_plug for merging. 256K is the largest write we can send to disk, 4K is the size of individual writes
 #define ROLLBACCINE_HASHES_PER_MSG 100
+#define ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY 1000000 // Throttle disk scanning so only this many pages are ever in-flight during recovery
 #define MODULE_NAME "rollbaccine"
 
 #define MEMORY_TRACKING  // Check the number of mallocs/frees and see if we're leaking memory
@@ -168,6 +169,8 @@ struct rollbaccine_device {
     uint64_t reconfig_complete_ballot;
     uint64_t reconfig_complete_write_index;
     wait_queue_head_t ballot_mismatch_wait_queue;
+    atomic_t num_inflight_pages_during_recovery; // Number of pages on recovering node that have not been verified or recovered from the other node
+    wait_queue_head_t disk_throttle_wait_queue; // Wait queue when num_inflight_pages_during_recovery > ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY
 
     int write_index;
     struct mutex index_lock;  // Must be obtained for any operation modifying write_index
@@ -1539,6 +1542,10 @@ void inc_verified_pages(struct rollbaccine_device *device) {
     struct multisocket *counterpart;
     int num_verified_sectors = atomic_add_return(SECTORS_PER_PAGE, &device->num_verified_sectors);
 
+    // Decrement inflight pages, wake up wait queue if necessary
+    atomic_dec(&device->num_inflight_pages_during_recovery);
+    wake_up_interruptible(&device->disk_throttle_wait_queue);
+
     // Tell the counterpart that we're ready to start!
     if (num_verified_sectors >= device->num_sectors) {
         printk(KERN_INFO "All sectors verified!");
@@ -2785,6 +2792,7 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
     struct bio *bio;
     struct blk_plug plug;
     int bios_between_plug = 0;
+    int num_inflight_pages;
 
     hash_msg = kmalloc(sizeof(struct hash_msg), GFP_KERNEL);
 
@@ -2860,6 +2868,10 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
             blk_start_plug(&plug);
             bios_between_plug = 0;
         }
+
+        // Wait if num_inflight_pages_during_recovery > ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY
+        num_inflight_pages = atomic_inc_return(&device->num_inflight_pages_during_recovery);
+        wait_event_interruptible(device->disk_throttle_wait_queue, atomic_read(&device->num_inflight_pages_during_recovery) <= ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY);
     }
     blk_finish_plug(&plug);
     printk(KERN_INFO "Finished submitting scans to disk");
@@ -3451,6 +3463,7 @@ static void rollbaccine_status(struct dm_target *ti, status_type_t type, unsigne
     DMEMIT("Num pages requested during recovery: %d\n", atomic_read(&device->num_pages_requested_during_recovery));
     DMEMIT("Num pages received during recovery: %d\n", atomic_read(&device->num_pages_received_during_recovery));
     DMEMIT("Hashes received during recovery: %d, total sectors: %llu\n", device->num_hashes_received_during_recovery, device->num_sectors);
+    DMEMIT("Num inflight pages during recovery: %d\n", atomic_read(&device->num_inflight_pages_during_recovery));
     DMEMIT("Num total operations: %d\n", atomic_read(&device->num_total_ops));
     DMEMIT("Num fsyncs: %d\n", atomic_read(&device->num_fsyncs));
     DMEMIT("Num bio pages not freed: %d\n", atomic_read(&device->num_bio_pages_not_freed));
@@ -3540,6 +3553,8 @@ static int rollbaccine_constructor(struct dm_target *ti, unsigned int argc, char
     atomic_set(&device->next_socket_id, 0);
 
     init_waitqueue_head(&device->ballot_mismatch_wait_queue);
+    atomic_set(&device->num_inflight_pages_during_recovery, 0);
+    init_waitqueue_head(&device->disk_throttle_wait_queue);
 
     device->broadcast_bio_queue = alloc_workqueue("broadcast bio queue", 0, NUM_NICS);
     if (!device->broadcast_bio_queue) {
