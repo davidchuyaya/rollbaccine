@@ -427,6 +427,7 @@ int ack_fsync(void *args);
 bool handle_p1a(struct rollbaccine_device *device, struct multisocket *multisocket, struct metadata_msg p1a);
 bool handle_p1b(struct rollbaccine_device *device, struct metadata_msg p1b);
 bool handle_hash_req(struct rollbaccine_device *device, struct multisocket *multisocket);
+int scan_disk(void *args);
 bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data);
 void blocking_read(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data);
 void init_socket_data(struct rollbaccine_device *device, struct socket_data *socket_data, struct socket *sock, uint64_t sender_id, uint64_t sender_socket_id);
@@ -2783,16 +2784,63 @@ unlock_and_return:
     return success;
 }
 
-bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data) {
-    struct hash_msg *hash_msg;
-    struct kvec vec;
-    bool success, about_to_complete = false;
-    sector_t hashes_to_copy, num_pages, page;
+int scan_disk(void *args) {
+    struct rollbaccine_device *device = args;
+    sector_t num_pages, page;
     struct bio_data *bio_data;
     struct bio *bio;
     struct blk_plug plug;
     int bios_between_plug = 0;
-    int num_inflight_pages;
+    num_pages = device->num_sectors / SECTORS_PER_PAGE;
+
+    atomic_set(&device->num_verified_sectors, 0);
+    blk_start_plug(&plug);
+    for (page = 0; page < num_pages; page++) {
+        bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
+        bio->bi_iter.bi_sector = page * SECTORS_PER_PAGE;
+        __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
+#ifdef MEMORY_TRACKING
+        atomic_inc(&device->num_bio_pages_not_freed);
+#endif
+
+        bio_data = alloc_bio_data(device);
+        bio_data->device = device;
+        bio_data->bio_src = bio;
+        bio_data->deep_clone = bio;
+        bio_data->start_sector = page * SECTORS_PER_PAGE;
+        bio_data->end_sector = bio_data->start_sector + SECTORS_PER_PAGE;
+        alloc_bio_checksum(device, bio_data);
+        memcpy(bio_data->checksum, device->merkle_tree_root + page * AES_GCM_AUTH_SIZE, AES_GCM_AUTH_SIZE);
+        bio->bi_private = bio_data;
+
+        bio_data->shallow_clone = shallow_bio_clone(device, bio);
+        bio_data->shallow_clone->bi_end_io = verify_disk_end_io;
+        bio_data->shallow_clone->bi_private = bio_data;
+
+        submit_bio_noacct(bio_data->shallow_clone);
+
+        bios_between_plug++;
+        if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
+            blk_finish_plug(&plug);
+            blk_start_plug(&plug);
+            bios_between_plug = 0;
+        }
+
+        // Wait if num_inflight_pages_during_recovery > ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY
+        atomic_inc(&device->num_inflight_pages_during_recovery);
+        wait_event_interruptible(device->disk_throttle_wait_queue, atomic_read(&device->num_inflight_pages_during_recovery) <= ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY);
+    }
+    blk_finish_plug(&plug);
+    printk(KERN_INFO "Finished submitting scans to disk");
+    return 0;
+}
+
+bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisocket, struct socket_data *socket_data) {
+    struct hash_msg *hash_msg;
+    struct kvec vec;
+    bool success, about_to_complete = false;
+    sector_t hashes_to_copy, num_pages;
+    struct task_struct *scan_disk_thread;
 
     hash_msg = kmalloc(sizeof(struct hash_msg), GFP_KERNEL);
 
@@ -2835,46 +2883,12 @@ bool handle_hash(struct rollbaccine_device *device, struct multisocket *multisoc
     kfree(hash_msg);
     printk(KERN_INFO "Finished receiving hashes, beginning disk scan");
 
-    // 2. Scan the disk to verify the hashes
-    atomic_set(&device->num_verified_sectors, 0);
-    blk_start_plug(&plug);
-    for (page = 0; page < num_pages; page++) {
-        bio = bio_alloc_bioset(device->dev->bdev, 1, REQ_OP_READ, GFP_NOIO, &device->bs);
-        bio->bi_iter.bi_sector = page * SECTORS_PER_PAGE;
-        __bio_add_page(bio, page_cache_alloc(device), PAGE_SIZE, 0);
-#ifdef MEMORY_TRACKING
-        atomic_inc(&device->num_bio_pages_not_freed);
-#endif
-
-        bio_data = alloc_bio_data(device);
-        bio_data->device = device;
-        bio_data->bio_src = bio;
-        bio_data->deep_clone = bio;
-        bio_data->start_sector = page * SECTORS_PER_PAGE;
-        bio_data->end_sector = bio_data->start_sector + SECTORS_PER_PAGE;
-        alloc_bio_checksum(device, bio_data);
-        memcpy(bio_data->checksum, device->merkle_tree_root + page * AES_GCM_AUTH_SIZE, AES_GCM_AUTH_SIZE);
-        bio->bi_private = bio_data;
-
-        bio_data->shallow_clone = shallow_bio_clone(device, bio);
-        bio_data->shallow_clone->bi_end_io = verify_disk_end_io;
-        bio_data->shallow_clone->bi_private = bio_data;
-
-        submit_bio_noacct(bio_data->shallow_clone);
-
-        bios_between_plug++;
-        if (bios_between_plug == ROLLBACCINE_PLUG_NUM_BIOS) {
-            blk_finish_plug(&plug);
-            blk_start_plug(&plug);
-            bios_between_plug = 0;
-        }
-
-        // Wait if num_inflight_pages_during_recovery > ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY
-        num_inflight_pages = atomic_inc_return(&device->num_inflight_pages_during_recovery);
-        wait_event_interruptible(device->disk_throttle_wait_queue, atomic_read(&device->num_inflight_pages_during_recovery) <= ROLLBACCINE_MAX_INFLIGHT_PAGES_DURING_RECOVERY);
+    // 2. Scan the disk to verify the hashes on a separate thread so it doesn't block receiving the disks on network
+    scan_disk_thread = kthread_run(scan_disk, device, "scan disk");
+    if (IS_ERR(scan_disk_thread)) {
+        printk(KERN_ERR "Could not start scan disk thread");
+        return false;
     }
-    blk_finish_plug(&plug);
-    printk(KERN_INFO "Finished submitting scans to disk");
     return true;
 }
 
