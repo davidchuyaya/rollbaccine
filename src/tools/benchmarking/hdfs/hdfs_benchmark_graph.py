@@ -1,10 +1,11 @@
+import math
 from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 import pandas as pd
 import glob
 
 # Configuration and operations
-config_names = ["UNREPLICATED_normal", "DM_normal", "REPLICATED_normal", "ROLLBACCINE_1_0_default_False", "NIMBLE_HDFS_100_False", "NIMBLE_HDFS_100_True", "NIMBLE_HDFS_1_False", "NIMBLE_HDFS_1_True"]
+config_names = ["UNREPLICATED_normal", "DM_normal", "REPLICATED_normal", "ROLLBACCINE_1_0_default_False", "ROLLBACCINE_1_0_sync_False", "NIMBLE_HDFS_100_False", "NIMBLE_HDFS_100_True", "NIMBLE_HDFS_1_False", "NIMBLE_HDFS_1_True"]
 operations = ["create", "mkdirs", "open", "delete", "fileStatus", "rename"]
 
 # Initialize a dictionary to hold throughput data
@@ -46,8 +47,8 @@ x = range(len(operations))
 plt.grid(axis='y', linestyle='-', alpha=0.3, zorder=0)
 
 # Generate bars for each configuration
-colors = ['red', 'cyan', 'lime', 'orange', 'blue', 'lightsteelblue', 'purple', 'thistle']  # Different colors for configurations
-patterns = ['/', '\\', 'x', '*', 'o', '/o', '\\o', 'o-']  # Different patterns for configurations
+colors = ['red', 'cyan', 'lime', 'orange', 'saddlebrown', 'blue', 'lightsteelblue', 'purple', 'thistle']  # Different colors for configurations
+patterns = ['/', '\\', 'x', '*', '**', 'o', '/o', '\\o', 'o-']  # Different patterns for configurations
 for i, config in enumerate(config_names):
     plt.bar_label(plt.bar(
         [pos + i * bar_width for pos in x],
@@ -71,15 +72,15 @@ plt.savefig("../../../../graphs/hdfs_throughput_comparison.pdf", bbox_inches='ti
 plt.close()
 
 # Save the legend, including configs from postgres that are not used in this benchmark
-config_names = ["Unreplicated", "DM", "Replicated", "Rollbaccine", "NimbleHDFS-100-Mem", "NimbleHDFS-100", "NimbleHDFS-1-Mem", "NimbleHDFS-1"]
-colors = ['red', 'cyan', 'lime', 'orange', 'blue', 'lightsteelblue', 'purple', 'thistle']
-patterns = ['/', '\\', 'x', '*', 'o', '/o', '\\o', 'o-']
+config_names = ["Unreplicated", "NimbleHDFS-100-Mem", "DM", "NimbleHDFS-100", "Replicated", "NimbleHDFS-1-Mem", "Rollbaccine", "NimbleHDFS-1", "Rollbaccine-sync"]
+colors = ['red', 'blue', 'cyan', 'lightsteelblue', 'lime', 'purple', 'orange', 'thistle', 'saddlebrown']
+patterns = ['/', 'o', '\\', '/o', 'x', '\\o', '*', 'o-', '**']
 
 fig_leg = plt.figure(figsize=(len(config_names)*0.75, 0.4))
 ax_leg = fig_leg.add_subplot(111)
-patches = [Patch(facecolor=color, label=label, hatch=pattern) for label, color, pattern in zip(config_names, colors, patterns)]
+patches = [Patch(facecolor=color, label=label, hatch=pattern, alpha=0.99) for label, color, pattern in zip(config_names, colors, patterns)]
 # add the legend from the previous axes
-ax_leg.legend(patches, config_names, loc='center', ncol=len(config_names))
+ax_leg.legend(patches, config_names, loc='center', ncol=math.ceil(len(config_names)/2))
 # hide the axes frame and the x/y labels
 ax_leg.axis('off')
 fig_leg.savefig('../../../../graphs/bar_graphs_legend.pdf', bbox_inches='tight', pad_inches=0)
