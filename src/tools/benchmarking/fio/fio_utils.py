@@ -380,10 +380,7 @@ class FioBenchmark(Benchmark):
             output_file = os.path.join(output_dir, f'{job_name}_fio_results_{iteration}.json')
 
             fio_command = f'sudo fio --name={job_name} --rw={rw} --direct={direct} --filename={filename} --numjobs={num_jobs} --fsync={fsync} --bs=4k --ramp_time=30 --runtime=60 --time_based --output-format=json --iodepth=1 --group_reporting --end_fsync=1 {high_contention_param} | tee {output_file}'
-
-            # TEMP: Only re-run high contention tests, remove after getting stats
-            if high_contention:
-                fio_commands.append(fio_command)
+            fio_commands.append(fio_command)
         return fio_commands
     
     def filename(self):
