@@ -13,8 +13,9 @@ def read_fio_json_results():
     results = []
     matched_files = glob.glob(f"../../../../results/*_fio_results_*.json")
     for filename in matched_files:
-        # Example filename: REPLICATED_write_direct0_fsync1_threads_16_normal_fio_results_0.json
-        # Example filename for Rollbaccine: ROLLBACCINE_randread_direct0_fsync0_threads_4_1_0_default_False_fio_results_2.json
+        # Example filename: REPLICATED_write_direct0_fsync1__threads_16_normal_fio_results_0.json
+        # Example filename for Rollbaccine: ROLLBACCINE_randread_direct0__fsync0_threads_4_1_0_default_False_fio_results_2.json
+        # Example filename with contention: DM_write_direct1_fsync0_contention_threads_1_normal_fio_results_0.json
         filename_parts = os.path.basename(filename).split('_')
         # Extract the category (e.g., 'DM', 'UNREPLICATED', 'REPLICATED', 'ROLLBACCINE')
         category = filename_parts[0]
@@ -136,6 +137,9 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
         ax.set_ylabel('Avg Latency (ms)')
         # ax.legend()
         ax.grid(linestyle='-', alpha=0.3, zorder=0)
+        # log for x axis if high contention graph
+        if 'contention' in base_job_name:
+            ax.set_xscale('log')
         # log for y axis
         ax.set_yscale('log')
         plt.tight_layout()
