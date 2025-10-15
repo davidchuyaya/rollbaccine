@@ -50,7 +50,7 @@ python3 src/tools/benchmarking/run_benchmarks.py --system_type ROLLBACCINE --ben
 # Recovery (postgres). 3 VMs per experiment
 python3 src/tools/benchmarking/recovery/recovery_postgres.py True
 python3 src/tools/benchmarking/recovery/recovery_postgres.py False
-# Recovery (random). 2 VMs per experiment
+# Recovery (random, no graphs). 2 VMs per experiment
 python3 src/tools/benchmarking/recovery/recovery_random.py False 100
 python3 src/tools/benchmarking/recovery/recovery_random.py False 300
 python3 src/tools/benchmarking/recovery/recovery_random.py False 600
