@@ -100,7 +100,7 @@ def plot_latency_vs_throughput_per_job(performance_data, output_dir):
     }
 
     for base_job_name in performance_data:
-        plt.figure(figsize=(5, 2))
+        plt.figure(figsize=(4, 2))
         ax = plt.gca()
         for category in performance_data[base_job_name]:
             throughputs = []
