@@ -68,8 +68,10 @@ def plot_time_series(filename, times, throughputs, crash_start, hash_receive_sta
     plt.xlabel("Time (sec)")
      # Fix bug where hatches don't show up in pdf with alpha=0.99
     plt.axvspan(crash_start, hash_receive_start, ymin=0.06, ymax=0.96, facecolor='lightskyblue', hatch='/', alpha=0.99)
+    ax.text((crash_start + hash_receive_start) / 2, ax.get_ylim()[1] * 1.02, f'{int(hash_receive_start - crash_start)}', ha='center', va='bottom', fontsize=10)
     plt.axvspan(hash_receive_start, hash_receive_end, ymin=0.06, ymax=0.96, facecolor='dimgray', alpha=0.99)
     plt.axvspan(hash_receive_end, disk_scan_end, ymin=0.06, ymax=0.96, facecolor='lightcyan', hatch='\\', alpha=0.99)
+    ax.text((hash_receive_end + disk_scan_end) / 2, ax.get_ylim()[1] * 1.02, f'{int(disk_scan_end - hash_receive_end)}', ha='center', va='bottom', fontsize=10)
     plt.box(False)
     plt.tight_layout()
     plt.savefig(f"../../../../graphs/{filename}", bbox_inches='tight', pad_inches=0)
