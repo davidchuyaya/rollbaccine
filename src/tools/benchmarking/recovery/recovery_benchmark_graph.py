@@ -1,4 +1,6 @@
 import json
+import math
+from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 from enum import Enum
 
@@ -77,3 +79,16 @@ if __name__ == "__main__":
     for name in ["primary", "backup"]:
         times, throughputs, crash_start, hash_receive_start, hash_receive_end, disk_scan_end = extract_data(f"crash_{name}_out.txt")
         plot_time_series(f"{name}_recovery.pdf", times, throughputs, crash_start, hash_receive_start, hash_receive_end, disk_scan_end)
+
+    # Save the legend
+    fig_leg = plt.figure(figsize=(4.5, 0.3))
+    ax_leg = fig_leg.add_subplot(111)
+    config_names = ["Startup time", "Hash transfer", "Disk verification"]
+    colors = ['lightskyblue', 'dimgray', 'lightcyan']
+    patterns = ['/', '', '\\']
+    patches = [Patch(facecolor=color, label=label, hatch=pattern, alpha=0.99) for label, color, pattern in zip(config_names, colors, patterns)]
+    # add the legend from the previous axes
+    ax_leg.legend(patches, config_names, loc='center', ncol=3)
+    # hide the axes frame and the x/y labels
+    ax_leg.axis('off')
+    fig_leg.savefig('../../../../graphs/recovery_legend.pdf', bbox_inches='tight', pad_inches=0)
