@@ -62,6 +62,7 @@ dkms.conf
 
 # device_tester
 device_tester
+high_contention
 
 # C library stuff
 compile_commands.json
