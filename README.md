@@ -1,4 +1,10 @@
-# Rollbaccine
+# [Rollbaccine: Herd Immunity Against Rollbacks for TEEs](https://dl.acm.org/doi/10.1145/3786693)
+David C. Y. Chu, Aditya Balasubramanian, Dee Bao, Natacha Crooks, Heidi Howard, Lucky Katahanas, Soujanya Ponnapalli  
+_SIGMOD '26_  
+[`Technical Report`](https://arxiv.org/abs/2505.04014)
+
+---
+
 A Linux device mapper that uses replication to detect and recover from rollback attacks in VM-based TEEs.  
 Rollbaccine will:
 1. Encrypt and decrypt all sectors.
